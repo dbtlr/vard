@@ -1,0 +1,29 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# "all" flags unmaintained advisories on transitive dependencies too;
+# "workspace" would only check direct dependencies of workspace crates.
+unmaintained = "all"
+
+[licenses]
+# The workspace is MIT; this is the permissive set its dependency tree needs.
+# Trimmed to the licenses actually present — add to this list (with review) as
+# new dependencies land rather than pre-allowing licenses that never appear.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# vard-core is a pure path dependency (no version until it is published, see
+# VRD-29), which cargo-deny reports as a wildcard. Keep this at "warn" so the
+# build does not fail on it.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

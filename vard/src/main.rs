@@ -1,19 +1,22 @@
+mod cli;
+
+// `paths` is validated XDG base-directory scaffolding that the CLI subcommands
+// landing in VRD-15+ consume. It is not wired to a command yet, so it stays
+// dead-code-allowed rather than being deleted and re-added.
+#[allow(dead_code)]
 mod paths;
 
-/// The CLI surface is not built yet; until it lands the binary identifies
-/// itself and reports where it will keep its files.
+use clap::{CommandFactory, Parser};
+
+use cli::Cli;
+
+/// Parse the CLI, then — with no subcommands defined yet (VRD-15+) — fall back
+/// to printing help. clap handles `--help` and `--version` during parsing.
 fn main() {
-    if let Err(err) = run() {
+    let Cli {} = Cli::parse();
+    if let Err(err) = Cli::command().print_long_help() {
         eprintln!("vard: {err}");
         std::process::exit(2);
     }
-}
-
-fn run() -> Result<(), paths::HomeNotFound> {
-    println!("vard {}", env!("CARGO_PKG_VERSION"));
-    println!("config  {}", paths::config_file()?.display());
-    println!("state   {}", paths::state_dir()?.display());
-    println!("data    {}", paths::data_dir()?.display());
-    println!("logs    {}", paths::log_dir()?.display());
-    Ok(())
+    println!();
 }

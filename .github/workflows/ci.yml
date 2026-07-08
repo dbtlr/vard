@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly cargo audit / cargo deny refresh
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # OS-independent gates run once, on the cheap runner.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned toolchain: keep in lockstep with rust-toolchain.toml and mise.toml.
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      # --- `just check` gates (must match the Justfile exactly, no drift) ---
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --workspace --all-targets -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # --- supply-chain gates (`just audit` / `just deny`) ---
+      - name: cargo audit
+        run: cargo audit
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  # OS-sensitive gates: the test suite plus install and artifact smokes.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned toolchain: keep in lockstep with rust-toolchain.toml and mise.toml.
+      - uses: dtolnay/rust-toolchain@1.96.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+      # --- install + artifact smokes ---
+      - name: cargo build -p vard --release --locked
+        run: cargo build -p vard --release --locked
+
+      - name: vard --version
+        run: ./target/release/vard --version
+
+      - name: vard --help
+        run: ./target/release/vard --help
+
+      # build.rs generates these on every build profile; the release build
+      # above has already run it for this job's target dir.
+      - name: completions + manpage artifacts exist and are non-empty
+        run: |
+          test -s target/completions/vard.bash
+          test -s target/completions/_vard
+          test -s target/completions/vard.fish
+          test -s target/completions/vard.nu
+          test -s target/man/vard.1
