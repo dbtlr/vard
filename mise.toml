@@ -1,3 +1,6 @@
+# Keep the rust version in lockstep with rust-toolchain.toml and
+# .github/workflows/ci.yml. mise does not read rust-toolchain.toml, and its
+# RUSTUP_TOOLCHAIN env overrides that file in local mise shells.
 [tools]
 rust = "1.96.1"
 just = "latest"

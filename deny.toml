@@ -3,7 +3,9 @@ all-features = true
 
 [advisories]
 yanked = "deny"
-unmaintained = "workspace"
+# "all" flags unmaintained advisories on transitive dependencies too;
+# "workspace" would only check direct dependencies of workspace crates.
+unmaintained = "all"
 
 [licenses]
 # The workspace is MIT; this is the permissive set its dependency tree needs.
@@ -17,9 +19,9 @@ allow = [
 
 [bans]
 multiple-versions = "warn"
-# vard-core is a path dependency pinned to an explicit version, so it is not a
-# wildcard. Keep this at "warn" to surface any future bare-path deps without
-# failing the build on them.
+# vard-core is a pure path dependency (no version until it is published, see
+# VRD-29), which cargo-deny reports as a wildcard. Keep this at "warn" so the
+# build does not fail on it.
 wildcards = "warn"
 
 [sources]

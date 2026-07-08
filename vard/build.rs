@@ -22,8 +22,7 @@ mod cli;
 
 fn main() -> std::io::Result<()> {
     // CARGO_MANIFEST_DIR is the `vard` package dir (`<workspace>/vard`); its
-    // parent is the workspace root, where the shared `target/` lives and where
-    // dist-workspace.toml's `include` paths are anchored.
+    // parent is the workspace root.
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR must be set by cargo when running build.rs"),
@@ -33,8 +32,24 @@ fn main() -> std::io::Result<()> {
         .expect("vard package directory must have a workspace-root parent")
         .to_path_buf();
 
-    let completions_dir = workspace_root.join("target").join("completions");
-    let man_dir = workspace_root.join("target").join("man");
+    // Honor CARGO_TARGET_DIR (absolute, or relative to the workspace root per
+    // cargo's contract); default to the workspace `target/`. dist builds use
+    // the default target dir, which is what dist-workspace.toml's `include`
+    // paths point at — those stay anchored at `target/` deliberately.
+    let target_dir = match env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                workspace_root.join(dir)
+            }
+        }
+        None => workspace_root.join("target"),
+    };
+
+    let completions_dir = target_dir.join("completions");
+    let man_dir = target_dir.join("man");
 
     std::fs::create_dir_all(&completions_dir)?;
     std::fs::create_dir_all(&man_dir)?;
@@ -52,5 +67,9 @@ fn main() -> std::io::Result<()> {
 
     println!("cargo:rerun-if-changed=src/cli.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    // The manpage and completions embed CARGO_PKG_VERSION / DESCRIPTION, which
+    // come from the manifests — a version bump must regenerate the artifacts.
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=../Cargo.toml");
     Ok(())
 }

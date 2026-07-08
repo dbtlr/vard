@@ -14,7 +14,8 @@ name = "vard"
 path = "src/main.rs"
 
 [dependencies]
-vard-core = { path = "../vard-core", version = "0.1.0" }
+# Pure path dependency until vard-core is published; VRD-29 restores the version requirement.
+vard-core = { path = "../vard-core" }
 clap = { workspace = true }
 
 [build-dependencies]

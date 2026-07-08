@@ -1,0 +1,10 @@
+# Pins the Rust toolchain for every rustup-driven build — including the
+# cargo-dist release workflow's hosted runners and musl containers, which
+# would otherwise build with whatever stable is current (a compiler CI never
+# validated).
+#
+# Keep the version in lockstep with mise.toml and .github/workflows/ci.yml:
+# mise does NOT read this file, and its RUSTUP_TOOLCHAIN env overrides it in
+# local mise shells.
+[toolchain]
+channel = "1.96.1"
