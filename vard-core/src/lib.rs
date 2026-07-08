@@ -14,8 +14,14 @@
 //!
 //! The API is unstable (0.x) until published with semver guarantees.
 
+pub mod config;
 pub mod event;
 
+pub use config::{
+    ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SYNC,
+    DEFAULT_SYNC_INTERVAL, DEFAULT_TRIGGER, TriggerMode, WatchSpec, WatchSpecBuilder,
+    parse_duration,
+};
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
     WatchState,
