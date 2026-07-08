@@ -1,8 +1,13 @@
 mod cli;
 
-// `paths` is validated XDG base-directory scaffolding that the CLI subcommands
-// landing in VRD-15+ consume. It is not wired to a command yet, so it stays
-// dead-code-allowed rather than being deleted and re-added.
+// `config` and `paths` are the file-config layer and its path resolution. Both
+// are fully built and tested, but main does not wire them into runtime behavior
+// yet — the CLI subcommands that consume them land in VRD-14/15/17. Until then
+// they are unreachable from `main`, so a module-level allow keeps the strict
+// dead-code lint quiet without scattering per-item allows. Remove each allow
+// when its consuming command lands.
+#[allow(dead_code)]
+mod config;
 #[allow(dead_code)]
 mod paths;
 
