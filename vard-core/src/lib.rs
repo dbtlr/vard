@@ -13,3 +13,7 @@
 //! subscribers on the event stream.
 //!
 //! The API is unstable (0.x) until published with semver guarantees.
+
+pub mod event;
+
+pub use event::{Event, EventBus, EventReceiver, Resolver, Trigger, WatchState};
