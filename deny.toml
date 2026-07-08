@@ -1,0 +1,27 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+# The workspace is MIT; this is the permissive set its dependency tree needs.
+# Trimmed to the licenses actually present — add to this list (with review) as
+# new dependencies land rather than pre-allowing licenses that never appear.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# vard-core is a path dependency pinned to an explicit version, so it is not a
+# wildcard. Keep this at "warn" to surface any future bare-path deps without
+# failing the build on them.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
