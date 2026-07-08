@@ -8,3 +8,6 @@ edition = "2024"
 license = "MIT"
 authors = ["Drew Butler <hi@dbtlr.com>"]
 repository = "https://github.com/dbtlr/vard"
+
+[workspace.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
