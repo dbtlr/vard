@@ -7,6 +7,18 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "vard"
+path = "src/main.rs"
 
 [dependencies]
 vard-core = { path = "../vard-core", version = "0.1.0" }
+clap = { workspace = true }
+
+[build-dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_complete_nushell = { workspace = true }
+clap_mangen = { workspace = true }
