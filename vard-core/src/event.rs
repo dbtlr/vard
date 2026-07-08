@@ -26,13 +26,16 @@
 //! ```
 //! use vard_core::{Event, EventBus};
 //!
-//! # async fn run() {
+//! # fn main() {
+//! # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+//! # rt.block_on(async {
 //! let bus = EventBus::default();
 //! let mut rx = bus.subscribe();
 //!
 //! bus.emit(Event::DaemonStarted);
 //!
 //! assert_eq!(rx.recv().await.unwrap().name(), "daemon.started");
+//! # });
 //! # }
 //! ```
 
@@ -74,6 +77,9 @@ pub enum Event {
     SnapshotFailed {
         /// Stable name of the watch.
         watch: String,
+        /// Why the snapshot was attempted, so reactors can tell a failed
+        /// manual snapshot from a failed background one.
+        trigger: Trigger,
         /// Human-readable description of the failure.
         error: String,
     },
@@ -254,10 +260,17 @@ impl fmt::Display for Resolver {
 ///
 /// This is [`tokio::sync::broadcast::Receiver`]. Call `recv().await` to take
 /// the next event. A subscriber that falls more than the bus's `capacity`
-/// behind receives [`broadcast::error::RecvError::Lagged`] carrying the number
-/// of events it skipped, after which it resumes from the oldest event still
-/// buffered — it never blocks the engine.
+/// behind receives [`RecvError::Lagged`] carrying the number of events it
+/// skipped, after which it resumes from the oldest event still buffered — it
+/// never blocks the engine.
 pub type EventReceiver = broadcast::Receiver<Event>;
+
+/// The errors [`EventReceiver`]'s `recv` and `try_recv` return: lag, closure,
+/// and (for `try_recv`) an empty buffer.
+///
+/// Re-exported so subscribers can match on them through this crate rather
+/// than naming tokio's error paths directly.
+pub use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 /// The engine's reporting spine: a bounded, multi-subscriber broadcast channel.
 ///
@@ -276,6 +289,12 @@ impl EventBus {
     ///
     /// A subscriber that falls further than `capacity` behind will observe a
     /// lag signal and skip missed events (see [`EventReceiver`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero. A bus that buffers nothing can deliver
+    /// nothing, so a zero capacity is a programming error, not a runtime
+    /// condition to handle.
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self { sender }
@@ -301,11 +320,6 @@ impl EventBus {
     pub fn subscribe(&self) -> EventReceiver {
         self.sender.subscribe()
     }
-
-    /// Returns the number of active subscribers.
-    pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
-    }
 }
 
 impl Default for EventBus {
@@ -318,14 +332,18 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-    #[tokio::test]
-    async fn emit_with_no_subscribers_does_not_panic() {
+    #[test]
+    fn emit_with_no_subscribers_does_not_panic() {
         let bus = EventBus::default();
-        assert_eq!(bus.subscriber_count(), 0);
-        // Must not panic or otherwise fail.
+        // No subscribe() calls: emitting must still succeed silently.
         bus.emit(Event::DaemonStarted);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_with_zero_capacity_panics() {
+        let _ = EventBus::new(0);
     }
 
     #[tokio::test]
@@ -400,7 +418,8 @@ mod tests {
 
     #[test]
     fn name_maps_every_variant_to_its_catalog_string() {
-        // Exhaustive, wildcard-free: a new variant forces this list to grow.
+        // One case per variant. The compile-time exhaustiveness guard is the
+        // wildcard-free match inside `Event::name` itself.
         let cases = [
             (
                 Event::SnapshotCompleted {
@@ -414,6 +433,7 @@ mod tests {
             (
                 Event::SnapshotFailed {
                     watch: "w".to_string(),
+                    trigger: Trigger::Interval,
                     error: "e".to_string(),
                 },
                 "snapshot.failed",
@@ -480,23 +500,7 @@ mod tests {
         ];
 
         for (event, expected) in cases {
-            // Re-match without a wildcard so an unnamed new variant fails to
-            // compile here as well as in `Event::name`.
-            let matched = match event {
-                Event::SnapshotCompleted { .. }
-                | Event::SnapshotFailed { .. }
-                | Event::SyncPushed { .. }
-                | Event::SyncPulled { .. }
-                | Event::SyncConflict { .. }
-                | Event::SyncResolved { .. }
-                | Event::SyncFailed { .. }
-                | Event::RestoreCompleted { .. }
-                | Event::WatchStateChanged { .. }
-                | Event::DaemonStarted
-                | Event::DaemonStopped
-                | Event::UpdateAvailable { .. } => event.name(),
-            };
-            assert_eq!(matched, expected);
+            assert_eq!(event.name(), expected);
         }
     }
 

@@ -16,4 +16,7 @@
 
 pub mod event;
 
-pub use event::{Event, EventBus, EventReceiver, Resolver, Trigger, WatchState};
+pub use event::{
+    DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
+    WatchState,
+};
