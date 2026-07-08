@@ -1,0 +1,12 @@
+[package]
+name = "vard"
+description = "Watch directories and automatically snapshot them into version control"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+vard-core = { path = "../vard-core", version = "0.1.0" }

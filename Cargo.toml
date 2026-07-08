@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["vard-core", "vard"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Drew Butler <hi@dbtlr.com>"]
+repository = "https://github.com/dbtlr/vard"
