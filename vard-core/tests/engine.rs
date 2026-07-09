@@ -8,8 +8,12 @@
 //! watcher, spawns per-watch workers, and turns a real filesystem write into a
 //! [`Event::SnapshotCompleted`] — and that two watches make progress
 //! independently. Most use a fake [`VcsBackend`] (so no git is required); one
-//! exercises a real [`GitBackend`](vard_core::GitBackend) end to end to prove
-//! self-suppression (vard's own commit does not loop). Generous timeouts keep
+//! exercises a real [`GitBackend`](vard_core::GitBackend) end to end to show
+//! that vard's own commit does not loop into a second snapshot. That the mute
+//! is what prevents the loop is pinned by the unit test
+//! `worker_is_muted_across_the_operation_and_released_after`; end to end the
+//! clean post-commit tree would also converge, so this test demonstrates the
+//! wired-up behavior rather than isolating the mute. Generous timeouts keep
 //! them robust, in the style of `tests/watcher.rs`.
 
 use std::path::Path;
@@ -237,9 +241,13 @@ async fn assert_no_snapshot(events: &mut EventReceiver, watch: &str, window: Dur
 
 #[tokio::test]
 async fn vards_own_commit_does_not_retrigger_a_snapshot() {
-    // A real git repository proves self-suppression end to end: after the
-    // snapshot commits, the writes it makes under `.git/` (and the muted window)
-    // must not feed back as fresh activity and loop.
+    // A real git repository exercises self-suppression end to end: after the
+    // snapshot commits, the writes it makes under `.git/` must not feed back as
+    // fresh activity and loop. Note this does not isolate the mute — the
+    // watcher drops `.git/` unconditionally and the post-commit tree is clean,
+    // so the pass would converge without the mute too. The mute's necessity is
+    // pinned by the unit test
+    // `worker_is_muted_across_the_operation_and_released_after`.
     let dir = tempfile::tempdir().unwrap();
     git_ok(dir.path(), &["init", "-b", "main"]);
     git_ok(
@@ -264,7 +272,7 @@ async fn vards_own_commit_does_not_retrigger_a_snapshot() {
     std::fs::write(dir.path().join("notes.md"), b"hello vard").unwrap();
     expect_completed(&mut events, "repo").await;
 
-    // No second snapshot: vard's own commit is self-suppressed.
+    // No second snapshot: vard's own commit does not loop.
     assert_no_snapshot(&mut events, "repo", Duration::from_millis(1500)).await;
 
     // The commit really landed, tagged with its trigger trailer.
