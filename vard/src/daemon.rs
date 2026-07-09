@@ -37,8 +37,15 @@
 //! - `kind = "sync"` is accepted but not yet implemented (VRD-19); it is logged
 //!   and dropped.
 //!
-//! Every file is deleted after it is consumed — including a malformed one, which
-//! is logged and removed so a single poison file cannot wedge the queue.
+//! Every consumed file is deleted — including a malformed one, which is logged
+//! and removed so a single poison file cannot wedge the queue.
+//!
+//! Writers MUST create a request atomically: write the payload to a temporary
+//! name in the same directory (a leading-dot or `.tmp` name) and `rename(2)` it
+//! to its final `*.toml` name — atomic on POSIX. The daemon consumes only
+//! *settled* names (plain `*.toml`, not hidden, no temp suffix) and leaves
+//! everything else in place, so a request mid-write is never half-read or
+//! deleted.
 //!
 //! # Config and request watching: mtime polling, not a notifier
 //!
@@ -174,7 +181,7 @@ pub(crate) fn run() -> ExitCode {
         let shutdown = Arc::new(Notify::new());
         let reload = Arc::new(Notify::new());
         install_signal_handlers(Arc::clone(&shutdown), Arc::clone(&reload));
-        run_daemon(paths, shutdown, reload, DEFAULT_POLL_INTERVAL).await
+        run_daemon(paths, config, shutdown, reload, DEFAULT_POLL_INTERVAL).await
     });
 
     // Wind the runtime down, then release the instance lock explicitly so its
@@ -251,10 +258,20 @@ fn log_level_to_tracing(level: LogLevel) -> tracing::Level {
     }
 }
 
+/// Exit code for a hard exit forced by a second termination signal: the
+/// conventional `128 + SIGINT(2)` "killed by Ctrl-C".
+const SECOND_SIGNAL_EXIT_CODE: i32 = 130;
+
 /// Spawns background tasks that translate OS signals into the supervisor's
 /// [`Notify`] handles: SIGINT/SIGTERM request shutdown, SIGHUP requests a
 /// reload. Each `notify_one` collapses into a single wakeup, which is exactly
 /// the debounce we want for a burst of SIGHUPs.
+///
+/// The termination handler keeps listening after the first signal: a *second*
+/// SIGINT/SIGTERM during a slow graceful drain hard-exits the process
+/// immediately (code [`SECOND_SIGNAL_EXIT_CODE`]) so a user can always
+/// escalate a hung shutdown — tokio's installed handler would otherwise
+/// swallow the repeat and leave no way out short of SIGKILL.
 fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -273,11 +290,23 @@ fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
                 return;
             }
         };
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
+        let mut already_asked = false;
+        loop {
+            let received = tokio::select! {
+                sig = sigint.recv() => sig,
+                sig = sigterm.recv() => sig,
+            };
+            if received.is_none() {
+                // The signal stream closed; nothing more to translate.
+                return;
+            }
+            if already_asked {
+                eprintln!("vard: received a second termination signal; exiting immediately");
+                std::process::exit(SECOND_SIGNAL_EXIT_CODE);
+            }
+            already_asked = true;
+            shutdown.notify_one();
         }
-        shutdown.notify_one();
     });
 
     tokio::spawn(async move {
@@ -328,16 +357,18 @@ impl std::error::Error for StartupError {
 }
 
 /// Runs the daemon: recovers stale locks, builds the initial engine, and
-/// supervises it until `shutdown` fires. Factored out of [`run`] so tests can
-/// drive it against injected paths with a cancellation `Notify` in place of a
-/// real SIGTERM. `reload` stands in for SIGHUP.
+/// supervises it until `shutdown` fires. Takes the already-loaded startup
+/// [`Config`] ([`run`] loads it once, for validation and the log level) rather
+/// than re-reading the file; reloads always re-read from disk. Factored out of
+/// [`run`] so tests can drive it against injected paths with a cancellation
+/// `Notify` in place of a real SIGTERM. `reload` stands in for SIGHUP.
 async fn run_daemon(
     paths: DaemonPaths,
+    config: Config,
     shutdown: Arc<Notify>,
     reload: Arc<Notify>,
     poll_interval: Duration,
 ) -> Result<(), StartupError> {
-    let config = Config::load(&paths.config_file).map_err(StartupError::Config)?;
     let specs = config.resolve().map_err(StartupError::Config)?;
     if specs.is_empty() {
         return Err(StartupError::NoWatches);
@@ -362,10 +393,11 @@ async fn run_daemon(
     Ok(())
 }
 
-/// Runs journal recovery for every watch, cleaning a provably stale git index
-/// lock left by a previous crash. Every non-`Clean` outcome is logged; nothing
-/// here can fail the daemon (recovery folds all trouble into its report).
-fn recover_stale_locks(paths: &DaemonPaths, specs: &[WatchSpec]) {
+/// Runs journal recovery for the given watches, cleaning a provably stale git
+/// index lock left by a previous crash. Every non-`Clean` outcome is logged;
+/// nothing here can fail the daemon (recovery folds all trouble into its
+/// report).
+fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = &'a WatchSpec>) {
     for spec in specs {
         let journal = Journal::in_dir(&paths.journal_dir, spec.name());
         let report = journal.recover(spec.path(), RecoveryOpts::new());
@@ -402,8 +434,16 @@ async fn build_started_engine_from_specs(
 /// reload or a source-died rebuild. Returns `None` (leaving the caller's current
 /// engine untouched) on any error, so a bad edit never takes a healthy daemon
 /// down.
+///
+/// `known_watches` are the names already supervised before this rebuild:
+/// journal recovery runs for any watch *not* in it (initial startup recovered
+/// the rest), so a watch introduced by a reload gets the same stale-lock
+/// cleaning a startup watch does — before its engine arms. (Recovering a
+/// journal orphaned by a watch *rename* — the journal is keyed by the old
+/// name — is a separate tracked task, not attempted here.)
 async fn build_started_engine(
     paths: &DaemonPaths,
+    known_watches: &[String],
 ) -> Option<(EngineHandle, EventReceiver, Vec<String>)> {
     let config = match Config::load(&paths.config_file) {
         Ok(config) => config,
@@ -423,6 +463,14 @@ async fn build_started_engine(
         error!("reload: config defines no watches; keeping current engine");
         return None;
     }
+
+    recover_stale_locks(
+        paths,
+        specs
+            .iter()
+            .filter(|spec| !known_watches.iter().any(|known| known == spec.name())),
+    );
+
     match build_started_engine_from_specs(specs).await {
         Ok(started) => Some(started),
         Err(err) => {
@@ -432,26 +480,84 @@ async fn build_started_engine(
     }
 }
 
+/// The result of a drain-and-rebuild attempt: the (possibly unchanged) engine
+/// plus what happened during the swap.
+struct RebuildOutcome {
+    handle: EngineHandle,
+    events: EventReceiver,
+    watch_names: Vec<String>,
+    /// Whether a fresh engine actually replaced the old one.
+    rebuilt: bool,
+    /// Whether the new engine reported failure (a dead signal source or a
+    /// closed bus) while the old one drained. The caller schedules a
+    /// backed-off rebuild, exactly as it would for the same event observed
+    /// live — the pump consumed it, so it will not reappear on the receiver.
+    failure_seen: bool,
+}
+
 /// Builds a fresh engine and, on success, drains the old one before swapping to
 /// it; on any failure it keeps the old engine. The new engine is started before
 /// the old is drained, so there is a brief window where both are armed — benign,
 /// since concurrent git commits serialize on the index lock — but it guarantees
 /// a valid `(handle, events)` at all times, honoring "keep the old engine on any
-/// reload error". Returns the (possibly unchanged) engine plus whether a rebuild
-/// actually happened.
+/// reload error".
+///
+/// While the old engine drains (up to its shutdown budget), the *new* engine's
+/// bus is pumped concurrently through the same log/journal path the supervisor
+/// uses: without this, a busy new engine could overflow its subscriber buffer
+/// during a slow drain, dropping events and leaving journal brackets
+/// unbalanced.
 async fn try_rebuild(
     paths: &DaemonPaths,
     old_handle: EngineHandle,
     mut old_events: EventReceiver,
     old_names: Vec<String>,
-) -> (EngineHandle, EventReceiver, Vec<String>, bool) {
-    match build_started_engine(paths).await {
-        Some((handle, events, names)) => {
-            old_handle.shutdown().await;
+) -> RebuildOutcome {
+    match build_started_engine(paths, &old_names).await {
+        Some((handle, mut events, names)) => {
+            let mut failure_seen = false;
+            {
+                let mut shutdown = std::pin::pin!(old_handle.shutdown());
+                // Pump the new engine's receiver until the old engine's drain
+                // completes. If the new bus closes (it should not — the engine
+                // just started), stop pumping and just await the drain, rather
+                // than busy-looping on `Closed`.
+                let mut pumping = true;
+                loop {
+                    if !pumping {
+                        (&mut shutdown).await;
+                        break;
+                    }
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        received = events.recv() => {
+                            let closed = matches!(received, Err(RecvError::Closed));
+                            if matches!(handle_bus(received, paths), Action::EngineFailure) {
+                                failure_seen = true;
+                            }
+                            if closed {
+                                pumping = false;
+                            }
+                        }
+                    }
+                }
+            }
             drain_remaining_events(paths, &mut old_events);
-            (handle, events, names, true)
+            RebuildOutcome {
+                handle,
+                events,
+                watch_names: names,
+                rebuilt: true,
+                failure_seen,
+            }
         }
-        None => (old_handle, old_events, old_names, false),
+        None => RebuildOutcome {
+            handle: old_handle,
+            events: old_events,
+            watch_names: old_names,
+            rebuilt: false,
+            failure_seen: false,
+        },
     }
 }
 
@@ -543,40 +649,38 @@ async fn supervise(
             Action::Continue => {}
             Action::Shutdown => break,
             Action::Reload => {
-                let (new_handle, new_events, new_names, rebuilt) =
-                    try_rebuild(&paths, handle, events, watch_names).await;
-                handle = new_handle;
-                events = new_events;
-                watch_names = new_names;
-                if rebuilt {
+                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
+                handle = outcome.handle;
+                events = outcome.events;
+                watch_names = outcome.watch_names;
+                if outcome.rebuilt {
                     // A full rebuild supersedes any pending source-died retry.
                     rebuild_at = None;
+                }
+                if outcome.failure_seen {
+                    schedule_rebuild(&mut backoff, &mut rebuild_at, "engine failed during swap");
                 }
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
-                let (new_handle, new_events, new_names, rebuilt) =
-                    try_rebuild(&paths, handle, events, watch_names).await;
-                handle = new_handle;
-                events = new_events;
-                watch_names = new_names;
-                if !rebuilt {
+                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
+                handle = outcome.handle;
+                events = outcome.events;
+                watch_names = outcome.watch_names;
+                if !outcome.rebuilt {
                     // The rebuild failed; keep retrying on a growing backoff so a
                     // persistently broken engine is not hammered.
-                    let delay = backoff.on_failure(Instant::now());
-                    warn!(?delay, "source-died rebuild failed; retrying after backoff");
-                    rebuild_at = Some(TokioInstant::now() + delay);
+                    schedule_rebuild(
+                        &mut backoff,
+                        &mut rebuild_at,
+                        "source-died rebuild failed; retrying",
+                    );
+                } else if outcome.failure_seen {
+                    schedule_rebuild(&mut backoff, &mut rebuild_at, "engine failed during swap");
                 }
             }
             Action::EngineFailure => {
-                if rebuild_at.is_none() {
-                    let delay = backoff.on_failure(Instant::now());
-                    warn!(
-                        ?delay,
-                        "watch signal source died; scheduling engine rebuild"
-                    );
-                    rebuild_at = Some(TokioInstant::now() + delay);
-                }
+                schedule_rebuild(&mut backoff, &mut rebuild_at, "watch signal source died");
             }
         }
     }
@@ -586,6 +690,22 @@ async fn supervise(
     // The drain finishes any in-flight pass, so trailing events (including the
     // final DaemonStopped) are logged and their journal brackets closed.
     drain_remaining_events(&paths, &mut events);
+}
+
+/// Arms (or keeps) the source-died rebuild timer: advances the backoff and sets
+/// the deadline unless one is already pending, logging why. Shared by every
+/// path that discovers engine failure — a live bus event, a failure observed
+/// while pumping during a swap, or a failed backoff rebuild.
+fn schedule_rebuild(
+    backoff: &mut SourceDiedBackoff,
+    rebuild_at: &mut Option<TokioInstant>,
+    why: &str,
+) {
+    if rebuild_at.is_none() {
+        let delay = backoff.on_failure(Instant::now());
+        warn!(?delay, reason = why, "scheduling engine rebuild");
+        *rebuild_at = Some(TokioInstant::now() + delay);
+    }
 }
 
 /// Handles one item from the event bus: logs it, journals the commit window if
@@ -727,28 +847,59 @@ fn journal_event(paths: &DaemonPaths, event: &Event) {
     }
 }
 
-/// Drains the request directory: parses each file, applies it, and deletes it —
-/// consumed or poison. A missing directory is not an error (the CLI creates it
-/// lazily). Read/parse failures are logged and the offending file removed so it
-/// cannot wedge the queue.
+/// Drains the request directory into the engine (see [`drain_request_dir`] for
+/// the consumption rules).
 fn process_requests(paths: &DaemonPaths, handle: &EngineHandle, watch_names: &[String]) {
-    let entries = match std::fs::read_dir(&paths.request_dir) {
+    drain_request_dir(&paths.request_dir, |request| {
+        apply_request(request, handle, watch_names);
+    });
+}
+
+/// Whether `name` is a *settled* request file the daemon may consume: a plain
+/// `*.toml` name that is not hidden (no leading dot). Writers create requests
+/// by writing to a temp or dot name in the same directory and `rename(2)`-ing
+/// to the final `*.toml` name (atomic on POSIX; see the [module docs](self)),
+/// so a name matching this predicate is always a complete file. Temp suffixes
+/// (`.tmp`, `.partial`, anything else) fail the `*.toml` requirement.
+fn is_settled_request_name(name: &str) -> bool {
+    name.ends_with(".toml") && !name.starts_with('.')
+}
+
+/// Scans `dir` and consumes every *settled* request file: each is parsed,
+/// handed to `on_request` when valid, and then deleted — a consumed request or
+/// a settled poison file alike (poison is logged and removed so it cannot
+/// wedge the queue). Unsettled names — dotfiles, temp suffixes, anything not
+/// `*.toml` — are a writer mid-flight per the contract and are ignored *and
+/// left in place*, never read or deleted. A missing directory is not an error
+/// (the CLI creates it lazily). Factored from [`process_requests`] so tests can
+/// drive it with a collecting closure instead of a live engine.
+fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
-            warn!(dir = %paths.request_dir.display(), error = %err, "could not read request dir");
+            warn!(dir = %dir.display(), error = %err, "could not read request dir");
             return;
         }
     };
 
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_settled_request_name(name) {
+            // A writer mid-flight (temp/dot name) or an unrelated file: not
+            // ours to touch.
+            continue;
+        }
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => match parse_request(&text) {
-                Ok(request) => apply_request(request, handle, watch_names),
+                Ok(request) => on_request(request),
                 Err(err) => {
                     warn!(file = %path.display(), error = %err, "malformed request file; dropping");
                 }
@@ -757,7 +908,7 @@ fn process_requests(paths: &DaemonPaths, handle: &EngineHandle, watch_names: &[S
                 warn!(file = %path.display(), error = %err, "could not read request file; dropping");
             }
         }
-        // Always remove the file — a consumed request or a poison one alike.
+        // Remove the settled file — a consumed request or a poison one alike.
         if let Err(err) = std::fs::remove_file(&path) {
             warn!(file = %path.display(), error = %err, "could not delete request file");
         }
@@ -966,6 +1117,66 @@ mod tests {
         assert!(parse_request("this is not toml = = =").is_err());
     }
 
+    // --- request-file consumption --------------------------------------------
+
+    #[test]
+    fn only_plain_toml_names_are_settled() {
+        assert!(is_settled_request_name("req.toml"));
+        assert!(is_settled_request_name("snapshot-1234.toml"));
+        // Hidden files are a writer's staging name, never consumed.
+        assert!(!is_settled_request_name(".req.toml"));
+        assert!(!is_settled_request_name(".hidden"));
+        // Temp suffixes and non-toml names are not settled.
+        assert!(!is_settled_request_name("req.toml.tmp"));
+        assert!(!is_settled_request_name("req.toml.partial"));
+        assert!(!is_settled_request_name("req.tmp"));
+        assert!(!is_settled_request_name("notes.txt"));
+        assert!(!is_settled_request_name("toml"));
+    }
+
+    #[test]
+    fn drain_ignores_unsettled_files_and_consumes_settled_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| dir.path().join(name);
+        // A settled, valid request.
+        std::fs::write(file("ok.toml"), "kind = \"snapshot\"\nwatch = \"vault\"\n").unwrap();
+        // A settled poison file: consumed (deleted) but produces no request.
+        std::fs::write(file("poison.toml"), "not toml = = =").unwrap();
+        // Unsettled names: a writer mid-flight, must be left untouched.
+        std::fs::write(file(".staged.toml"), "kind = \"snapshot\"\n").unwrap();
+        std::fs::write(file("mid.toml.tmp"), "kind = \"snapshot\"\n").unwrap();
+        std::fs::write(file("part.partial"), "kind = \"snapshot\"\n").unwrap();
+
+        let mut seen: Vec<Request> = Vec::new();
+        drain_request_dir(dir.path(), |request| seen.push(request));
+
+        assert_eq!(
+            seen,
+            vec![Request {
+                kind: RequestKind::Snapshot,
+                watch: Some("vault".to_string()),
+            }],
+            "exactly the one valid settled request is delivered"
+        );
+        assert!(!file("ok.toml").exists(), "a consumed request is deleted");
+        assert!(
+            !file("poison.toml").exists(),
+            "a settled poison file is deleted so it cannot wedge the queue"
+        );
+        assert!(
+            file(".staged.toml").exists(),
+            "a dotfile is a writer mid-flight and must be left in place"
+        );
+        assert!(
+            file("mid.toml.tmp").exists(),
+            "a temp-suffixed file must be left in place"
+        );
+        assert!(
+            file("part.partial").exists(),
+            "a partial file must be left in place"
+        );
+    }
+
     // --- log level mapping ---------------------------------------------------
 
     #[test]
@@ -1161,8 +1372,10 @@ mod tests {
 
         let shutdown = Arc::new(Notify::new());
         let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
         let daemon = tokio::spawn(run_daemon(
             paths.clone(),
+            config,
             Arc::clone(&shutdown),
             Arc::clone(&reload),
             Duration::from_millis(150),

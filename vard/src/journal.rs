@@ -21,11 +21,18 @@
 //! - the PID recorded in that record is no longer alive
 //!   ([`kill(pid, 0)`](rustix::process::test_kill_process) reports `ESRCH`),
 //!   **and**
+//! - the lock file's mtime falls inside the recorded operation's time window —
+//!   from [`STALE_LOCK_TS_SLACK`] before the record's `begin` timestamp through
+//!   [`MAX_OP_WINDOW`] after it. A lock created before our operation began, or
+//!   materially after it, cannot be ours: the recorded owner is dead and wrote
+//!   nothing outside that window, so such a lock belongs to another process (a
+//!   long `git gc`, an interactive rebase) and is never touched, **and**
 //! - the lock file's mtime is older than [`STALE_LOCK_MIN_AGE`].
 //!
 //! If the journal has no dangling record, the lock is foreign and is left
 //! untouched. If the owning PID is still alive, or the lock is younger than the
-//! age gate, the lock is left for a later start to reconsider. Corrupt or
+//! age gate, the lock is left for a later start to reconsider. A lock outside
+//! the operation window is reported as foreign and left in place. Corrupt or
 //! unreadable journals are treated conservatively: nothing is removed.
 //!
 //! # File format
@@ -59,6 +66,21 @@ use crate::paths;
 /// only *looks* abandoned because its `end` record has not landed yet. Fifteen
 /// minutes comfortably exceeds any single snapshot or sync.
 pub(crate) const STALE_LOCK_MIN_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Clock slack when matching a git lock's mtime against the journaled
+/// operation's `begin` timestamp: the lock's mtime may fall up to this far
+/// *before* the record (filesystem timestamp granularity, the lock being
+/// written a beat before the journal record lands). A lock older than that
+/// predates the operation entirely and cannot be ours.
+pub(crate) const STALE_LOCK_TS_SLACK: Duration = Duration::from_secs(60);
+
+/// The longest a single journaled operation is assumed to hold its git lock:
+/// a lock whose mtime is more than this *after* the operation's `begin`
+/// timestamp was created by someone else — the recorded owner is dead and
+/// wrote nothing after the window — so it is foreign and never removed.
+/// Fifteen minutes matches [`STALE_LOCK_MIN_AGE`]'s "comfortably exceeds any
+/// single snapshot or sync" rationale.
+pub(crate) const MAX_OP_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// The per-watch operation journal: a single line-oriented file recording the
 /// in-flight daemon operation for one watch.
@@ -167,6 +189,21 @@ impl Journal {
             };
         }
 
+        // The lock is ours only if its mtime falls inside the recorded
+        // operation's window ([STALE_LOCK_TS_SLACK] before the begin timestamp
+        // through [MAX_OP_WINDOW] after it). Outside it, the lock belongs to
+        // some other process — our dead owner wrote nothing outside that window
+        // — so it is left untouched. The journal is compacted: our operation
+        // demonstrably left no lock behind, and the record must not condemn a
+        // foreign lock on every future start.
+        if !lock_in_op_window(mtime, dangling.ts) {
+            let _ = self.compact();
+            return RecoveryReport::LockNotOurs {
+                op: dangling.op,
+                pid: dangling.pid,
+            };
+        }
+
         let age = opts.now.duration_since(mtime).unwrap_or(Duration::ZERO);
         if age < opts.min_lock_age {
             return RecoveryReport::LockTooFresh {
@@ -243,6 +280,26 @@ impl Journal {
 struct DanglingOp {
     op: String,
     pid: u32,
+    /// The record's `ts=` field: when the operation began, in unix seconds.
+    /// Ties a present git lock to *this* operation — a lock whose mtime falls
+    /// outside the operation's window cannot be ours (see [`lock_in_op_window`]).
+    ts: u64,
+}
+
+/// Whether a git lock with the given mtime could belong to an operation that
+/// began at unix-seconds `begin_ts`: inside
+/// `[begin_ts - STALE_LOCK_TS_SLACK, begin_ts + MAX_OP_WINDOW]`. Conservative
+/// on unrepresentable timestamps (a `ts` too large for [`SystemTime`]): returns
+/// `false`, so the lock is treated as foreign and never removed.
+fn lock_in_op_window(mtime: SystemTime, begin_ts: u64) -> bool {
+    let Some(begin) = UNIX_EPOCH.checked_add(Duration::from_secs(begin_ts)) else {
+        return false;
+    };
+    let earliest = begin.checked_sub(STALE_LOCK_TS_SLACK).unwrap_or(UNIX_EPOCH);
+    let Some(latest) = begin.checked_add(MAX_OP_WINDOW) else {
+        return false;
+    };
+    mtime >= earliest && mtime <= latest
 }
 
 /// Tunables for [`Journal::recover`], injectable so tests need not manipulate
@@ -302,6 +359,17 @@ pub(crate) enum RecoveryReport {
         /// The still-live PID.
         pid: u32,
     },
+    /// A dangling operation's owner is dead, but the git lock's mtime falls
+    /// outside that operation's time window
+    /// ([`STALE_LOCK_TS_SLACK`]/[`MAX_OP_WINDOW`]), so the lock cannot be ours:
+    /// it is foreign and was left untouched. The journal was compacted — our
+    /// operation demonstrably left no lock behind.
+    LockNotOurs {
+        /// The dangling operation's kind.
+        op: String,
+        /// The dead PID that had recorded it.
+        pid: u32,
+    },
     /// A dangling operation's owner is gone, but the lock is younger than the
     /// age gate; left untouched pending a later start.
     LockTooFresh {
@@ -341,6 +409,11 @@ impl fmt::Display for RecoveryReport {
             RecoveryReport::HolderAlive { op, pid } => write!(
                 f,
                 "dangling {op:?} still owned by live PID {pid}; git lock left in place"
+            ),
+            RecoveryReport::LockNotOurs { op, pid } => write!(
+                f,
+                "dangling {op:?} owner (PID {pid}) is gone but the git lock's mtime is outside \
+                 that operation's window; foreign lock left in place"
             ),
             RecoveryReport::LockTooFresh { op, pid, age } => write!(
                 f,
@@ -394,7 +467,9 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Parses a `begin <op> pid=<pid> ts=<ts>` line into a [`DanglingOp`], tolerant
 /// of `pid`/`ts` ordering. Returns `None` for any line that is not a
-/// well-formed `begin` record with a parseable PID.
+/// well-formed `begin` record with a parseable PID and timestamp — both are
+/// required, since recovery cannot tie a lock to an operation without them
+/// ([`begin`](Journal::begin) always writes both).
 fn parse_begin(line: &str) -> Option<DanglingOp> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "begin" {
@@ -402,13 +477,20 @@ fn parse_begin(line: &str) -> Option<DanglingOp> {
     }
     let op = tokens.next()?.to_string();
     let mut pid: Option<u32> = None;
+    let mut ts: Option<u64> = None;
     for token in tokens {
         if let Some(raw) = token.strip_prefix("pid=") {
             pid = Some(raw.parse().ok()?);
+        } else if let Some(raw) = token.strip_prefix("ts=") {
+            ts = Some(raw.parse().ok()?);
         }
-        // `ts=` and any future fields are ignored here.
+        // Any future fields are ignored here.
     }
-    Some(DanglingOp { op, pid: pid? })
+    Some(DanglingOp {
+        op,
+        pid: pid?,
+        ts: ts?,
+    })
 }
 
 /// Replaces ASCII whitespace in `token` with `_` so a written record stays a
@@ -517,12 +599,24 @@ mod tests {
         pid
     }
 
-    /// Hand-writes a dangling `begin` record with `pid` into `journal`.
-    fn write_dangling(journal: &Journal, op: &str, pid: u32) {
+    /// Hand-writes a dangling `begin` record with `pid` and `ts` into `journal`.
+    fn write_dangling(journal: &Journal, op: &str, pid: u32, ts: u64) {
         if let Some(parent) = journal.path().parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(journal.path(), format!("begin {op} pid={pid} ts=1000\n")).unwrap();
+        fs::write(journal.path(), format!("begin {op} pid={pid} ts={ts}\n")).unwrap();
+    }
+
+    /// The lock file's mtime as unix seconds, for writing a `begin` record
+    /// whose timestamp is coherent with the lock (inside the operation window).
+    fn mtime_secs(path: &Path) -> u64 {
+        fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     }
 
     #[test]
@@ -558,7 +652,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
         let journal = Journal::in_dir(dir.path(), "notes");
-        write_dangling(&journal, "snapshot", dead_pid());
+        // ts coherent with the lock's mtime: the lock is inside the op window.
+        let ts = mtime_secs(&lock_path(&repo));
+        write_dangling(&journal, "snapshot", dead_pid(), ts);
 
         // now = lock mtime + well past the gate.
         let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
@@ -582,7 +678,8 @@ mod tests {
         let repo = repo_with_lock(dir.path());
         let journal = Journal::in_dir(dir.path(), "notes");
         // Our own PID is alive.
-        write_dangling(&journal, "snapshot", std::process::id());
+        let ts = mtime_secs(&lock_path(&repo));
+        write_dangling(&journal, "snapshot", std::process::id(), ts);
 
         let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
         let opts = RecoveryOpts {
@@ -602,7 +699,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
         let journal = Journal::in_dir(dir.path(), "notes");
-        write_dangling(&journal, "snapshot", dead_pid());
+        // ts coherent with the mtime so the window check passes; only the age
+        // gate blocks removal here.
+        let ts = mtime_secs(&lock_path(&repo));
+        write_dangling(&journal, "snapshot", dead_pid(), ts);
 
         // now == mtime, so age is zero — below the gate.
         let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
@@ -657,7 +757,7 @@ mod tests {
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap(); // no index.lock
         let journal = Journal::in_dir(dir.path(), "notes");
-        write_dangling(&journal, "snapshot", dead_pid());
+        write_dangling(&journal, "snapshot", dead_pid(), 1000);
 
         let report = journal.recover(&repo, RecoveryOpts::new());
         assert!(
@@ -672,6 +772,68 @@ mod tests {
     }
 
     #[test]
+    fn lock_predating_the_begin_record_is_left_as_foreign() {
+        // A lock created before our operation began (mtime more than the slack
+        // before ts) cannot be ours — e.g. a long-running foreign git process
+        // whose lock predates the daemon's whole episode. It must be left in
+        // place even though our owner is dead and the lock is old.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_lock(dir.path());
+        let journal = Journal::in_dir(dir.path(), "notes");
+        // begin recorded well after the lock's mtime: lock predates the op.
+        let ts = mtime_secs(&lock_path(&repo)) + STALE_LOCK_TS_SLACK.as_secs() + 100;
+        write_dangling(&journal, "snapshot", dead_pid(), ts);
+
+        let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
+        let opts = RecoveryOpts {
+            now: mtime + STALE_LOCK_MIN_AGE + Duration::from_secs(1),
+            min_lock_age: STALE_LOCK_MIN_AGE,
+        };
+        let report = journal.recover(&repo, opts);
+        assert!(
+            matches!(report, RecoveryReport::LockNotOurs { .. }),
+            "got: {report}"
+        );
+        assert!(
+            lock_path(&repo).exists(),
+            "a lock predating our operation must never be removed"
+        );
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().len(),
+            0,
+            "the dangling record is compacted: our op left no lock"
+        );
+    }
+
+    #[test]
+    fn lock_much_newer_than_the_begin_record_is_left_as_foreign() {
+        // A lock created long after our operation began (mtime beyond the op
+        // window) was made by someone else after our owner died — e.g. a user's
+        // live rebase started hours later. It must be left in place.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_lock(dir.path());
+        let journal = Journal::in_dir(dir.path(), "notes");
+        // begin recorded long before the lock's mtime: lock postdates the op.
+        let ts = mtime_secs(&lock_path(&repo)) - MAX_OP_WINDOW.as_secs() - 100;
+        write_dangling(&journal, "snapshot", dead_pid(), ts);
+
+        let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
+        let opts = RecoveryOpts {
+            now: mtime + STALE_LOCK_MIN_AGE + Duration::from_secs(1),
+            min_lock_age: STALE_LOCK_MIN_AGE,
+        };
+        let report = journal.recover(&repo, opts);
+        assert!(
+            matches!(report, RecoveryReport::LockNotOurs { .. }),
+            "got: {report}"
+        );
+        assert!(
+            lock_path(&repo).exists(),
+            "a lock created after our operation's window must never be removed"
+        );
+    }
+
+    #[test]
     fn distinct_names_that_sanitize_alike_get_distinct_files() {
         assert_ne!(journal_file_name("a/b"), journal_file_name("a_b"));
     }
@@ -681,13 +843,40 @@ mod tests {
         let a = parse_begin("begin snapshot pid=42 ts=100").unwrap();
         assert_eq!(a.op, "snapshot");
         assert_eq!(a.pid, 42);
+        assert_eq!(a.ts, 100);
         let b = parse_begin("begin sync ts=100 pid=7").unwrap();
         assert_eq!(b.op, "sync");
         assert_eq!(b.pid, 7);
+        assert_eq!(b.ts, 100);
         assert!(
             parse_begin("begin snapshot ts=100").is_none(),
             "pid required"
         );
+        assert!(
+            parse_begin("begin snapshot pid=42").is_none(),
+            "ts required: without it a lock cannot be tied to the operation"
+        );
         assert!(parse_begin("garbage line").is_none());
+    }
+
+    #[test]
+    fn lock_window_bounds_are_inclusive_and_overflow_safe() {
+        let begin_ts = 1_000_000u64;
+        let begin = UNIX_EPOCH + Duration::from_secs(begin_ts);
+        // Inside: at begin, at the slack edge, at the window edge.
+        assert!(lock_in_op_window(begin, begin_ts));
+        assert!(lock_in_op_window(begin - STALE_LOCK_TS_SLACK, begin_ts));
+        assert!(lock_in_op_window(begin + MAX_OP_WINDOW, begin_ts));
+        // Outside: a second past either edge.
+        assert!(!lock_in_op_window(
+            begin - STALE_LOCK_TS_SLACK - Duration::from_secs(1),
+            begin_ts
+        ));
+        assert!(!lock_in_op_window(
+            begin + MAX_OP_WINDOW + Duration::from_secs(1),
+            begin_ts
+        ));
+        // An unrepresentable timestamp is conservative: never ours.
+        assert!(!lock_in_op_window(begin, u64::MAX));
     }
 }
