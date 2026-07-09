@@ -103,7 +103,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, timeout};
 
 use crate::config::{TriggerMode, WatchSpec};
-use crate::event::{Event, EventBus, EventReceiver, Trigger, WatchState};
+use crate::event::{Event, EventBus, EventReceiver, Trigger, TroubleKind, WatchState};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
 use crate::vcs::git::GitBackend;
 use crate::vcs::{SafeState, SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError};
@@ -239,8 +239,12 @@ fn coalesce(existing: Option<Provenance>, incoming: Provenance) -> Provenance {
 enum WatchInput {
     /// A snapshot is due for the given reason.
     Trigger(Provenance),
-    /// A signal source reported trouble; the detail is surfaced on the bus.
+    /// A signal source reported trouble; the kind and detail are both
+    /// surfaced on the bus.
     Trouble {
+        /// Distinguishes the signal source dying from every other cause; see
+        /// [`TroubleKind`].
+        kind: TroubleKind,
         /// Human-readable description of the condition.
         detail: String,
     },
@@ -414,8 +418,8 @@ impl Worker {
                 }
                 self.pending = Some(coalesce(self.pending.take(), prov));
             }
-            WatchInput::Trouble { detail } => {
-                self.set_state(WatchState::Attention, Some(detail));
+            WatchInput::Trouble { kind, detail } => {
+                self.set_state(WatchState::Attention, Some(kind), Some(detail));
             }
         }
     }
@@ -541,6 +545,7 @@ impl Worker {
         if self.retry == Some(RetryKind::UnsafePause) {
             self.set_state(
                 WatchState::Ok,
+                None,
                 Some("repository returned to a safe state".into()),
             );
         }
@@ -563,7 +568,7 @@ impl Worker {
     /// re-emit `Paused`.
     fn enter_unsafe(&mut self, reason: UnsafeReason) {
         self.retry = Some(RetryKind::UnsafePause);
-        self.set_state(WatchState::Paused, Some(reason.to_string()));
+        self.set_state(WatchState::Paused, None, Some(reason.to_string()));
     }
 
     /// Enters (or stays in) the failure retry after a probe or snapshot failed.
@@ -585,7 +590,14 @@ impl Worker {
     fn on_backend_panic(&mut self, trigger: Trigger, detail: &str) {
         let msg = format!("backend task panicked: {detail}");
         self.emit_failed_error(trigger, msg.clone());
-        self.set_state(WatchState::Attention, Some(msg));
+        // A panicked backend call is not the watcher/scheduler signal source
+        // dying — the worker itself survives it (see the module docs) — so
+        // it is `Degraded`, not `SourceDied`.
+        self.set_state(
+            WatchState::Attention,
+            Some(TroubleKind::Degraded),
+            Some(msg),
+        );
         self.clear_retry();
     }
 
@@ -615,8 +627,11 @@ impl Worker {
     }
 
     /// Transitions the watch's reported state, emitting
-    /// [`Event::WatchStateChanged`] only on an actual change.
-    fn set_state(&mut self, to: WatchState, reason: Option<String>) {
+    /// [`Event::WatchStateChanged`] only on an actual change. `trouble` is
+    /// `Some` only for a transition caused by trouble (a `Trouble` signal or a
+    /// backend panic); every other transition (a resolved-safe `Ok`, an
+    /// unsafe-repo `Paused`) passes `None`.
+    fn set_state(&mut self, to: WatchState, trouble: Option<TroubleKind>, reason: Option<String>) {
         if self.state == to {
             return;
         }
@@ -627,6 +642,7 @@ impl Worker {
             from,
             to,
             reason,
+            trouble,
         });
     }
 }
@@ -929,7 +945,11 @@ async fn dispatch_watcher(
             WatcherSignal::Activity { watch, .. } => {
                 (watch, WatchInput::Trigger(Provenance::event()))
             }
-            WatcherSignal::Trouble { watch, detail } => (watch, WatchInput::Trouble { detail }),
+            WatcherSignal::Trouble {
+                watch,
+                kind,
+                detail,
+            } => (watch, WatchInput::Trouble { kind, detail }),
         };
         if let Some(tx) = routes.get(&watch) {
             let _ = tx.send(input);
@@ -945,7 +965,11 @@ async fn dispatch_scheduler(
     while let Some(signal) = rx.recv().await {
         let (watch, input) = match signal {
             SchedulerSignal::Tick { watch } => (watch, WatchInput::Trigger(Provenance::interval())),
-            SchedulerSignal::Trouble { watch, detail } => (watch, WatchInput::Trouble { detail }),
+            SchedulerSignal::Trouble {
+                watch,
+                kind,
+                detail,
+            } => (watch, WatchInput::Trouble { kind, detail }),
         };
         if let Some(tx) = routes.get(&watch) {
             let _ = tx.send(input);
@@ -1905,8 +1929,16 @@ mod tests {
                 Event::SnapshotFailed { .. } => saw_failed = true,
                 Event::WatchStateChanged {
                     to: WatchState::Attention,
+                    trouble,
                     ..
-                } => saw_attention = true,
+                } => {
+                    saw_attention = true;
+                    assert_eq!(
+                        trouble,
+                        Some(TroubleKind::Degraded),
+                        "a panicked backend call is degraded, not a dead signal source"
+                    );
+                }
                 other => panic!("unexpected event: {other:?}"),
             }
         }
@@ -2242,20 +2274,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn trouble_moves_the_watch_to_attention() {
+    async fn trouble_moves_the_watch_to_attention_and_carries_its_kind() {
         let backend = FakeBackend::new();
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
         tx.send(WatchInput::Trouble {
+            kind: TroubleKind::Degraded,
             detail: "inotify queue overflowed".into(),
         })
         .unwrap();
 
         let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
         match ev {
-            Event::WatchStateChanged { to, reason, .. } => {
+            Event::WatchStateChanged {
+                to,
+                reason,
+                trouble,
+                ..
+            } => {
                 assert_eq!(to, WatchState::Attention);
                 assert_eq!(reason.as_deref(), Some("inotify queue overflowed"));
+                assert_eq!(
+                    trouble,
+                    Some(TroubleKind::Degraded),
+                    "the dispatched kind must arrive unparsed on the bus event"
+                );
+            }
+            other => panic!("expected an attention transition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trouble_with_source_died_is_distinguishable_from_degraded_on_the_bus() {
+        // A bus subscriber must be able to tell "the signal source died" apart
+        // from any other trouble cause without parsing `reason`.
+        let backend = FakeBackend::new();
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trouble {
+            kind: TroubleKind::SourceDied,
+            detail: "watch task ended abnormally: panic".into(),
+        })
+        .unwrap();
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match ev {
+            Event::WatchStateChanged { to, trouble, .. } => {
+                assert_eq!(to, WatchState::Attention);
+                assert_eq!(trouble, Some(TroubleKind::SourceDied));
             }
             other => panic!("expected an attention transition, got {other:?}"),
         }

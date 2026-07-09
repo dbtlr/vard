@@ -32,8 +32,8 @@ pub use engine::{
     EngineError, EngineHandle, SharedBackend,
 };
 pub use event::{
-    DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
-    WatchState,
+    DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TroubleKind,
+    TryRecvError, WatchState,
 };
 pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
 pub use vcs::git::GitBackend;

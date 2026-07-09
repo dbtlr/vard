@@ -135,6 +135,14 @@ pub enum Event {
         to: WatchState,
         /// Optional human-readable reason for the transition.
         reason: Option<String>,
+        /// Set when this transition was caused by trouble ([`TroubleKind`]);
+        /// `None` for every other transition (a resolved-safe `Ok`, an
+        /// unsafe-repo `Paused`, ...). Carrying it here — rather than only on
+        /// [`WatchState::Attention`] — keeps the enum small and lets a
+        /// subscriber match on the kind without also matching the state, and
+        /// it costs nothing on the far more common non-trouble transitions
+        /// since `None` is a single tag byte.
+        trouble: Option<TroubleKind>,
     },
     /// The daemon finished starting up.
     DaemonStarted,
@@ -231,6 +239,38 @@ impl fmt::Display for WatchState {
             WatchState::Conflicted => "conflicted",
             WatchState::SyncError => "sync-error",
             WatchState::Attention => "attention",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Why a watch needs attention, reported on [`Event::WatchStateChanged`]
+/// alongside its `reason` string.
+///
+/// The one distinction a subscriber needs without parsing `reason`: whether
+/// the watcher/scheduler task that produces this watch's signals has itself
+/// died, versus every other condition. A daemon supervisor reacts to
+/// `SourceDied` by rebuilding the engine (the watch is otherwise permanently
+/// silent); it need not react to `Degraded` the same way. `#[non_exhaustive]`
+/// so finer kinds can be added later without a breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TroubleKind {
+    /// The watcher's or scheduler's per-watch task ended abnormally (panicked
+    /// or exited unexpectedly) and is no longer producing signals for this
+    /// watch.
+    SourceDied,
+    /// Any other condition needing attention: a backend error, a channel
+    /// overflow, a panicked backend call, and so on. The signal source
+    /// itself is still alive.
+    Degraded,
+}
+
+impl fmt::Display for TroubleKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TroubleKind::SourceDied => "source-died",
+            TroubleKind::Degraded => "degraded",
         };
         f.write_str(s)
     }
@@ -486,6 +526,7 @@ mod tests {
                     from: WatchState::Ok,
                     to: WatchState::Paused,
                     reason: None,
+                    trouble: None,
                 },
                 "watch.state_changed",
             ),

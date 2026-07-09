@@ -29,8 +29,12 @@ async fn expect_activity(rx: &mut WatcherRx, watch: &str) {
         loop {
             match rx.recv().await {
                 Some(WatcherSignal::Activity { watch: w, .. }) if w == watch => break,
-                Some(WatcherSignal::Trouble { watch: w, detail }) if w == watch => {
-                    panic!("watch {w:?} reported trouble: {detail}")
+                Some(WatcherSignal::Trouble {
+                    watch: w,
+                    kind,
+                    detail,
+                }) if w == watch => {
+                    panic!("watch {w:?} reported trouble ({kind:?}): {detail}")
                 }
                 Some(_) => continue,
                 None => panic!("signal channel closed before a signal arrived"),
