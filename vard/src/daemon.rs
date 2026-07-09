@@ -1,5 +1,5 @@
 //! The `vard run` daemon shell: the long-lived supervisor that turns the file
-//! config into a running [`Engine`](vard_core::Engine) and keeps it healthy.
+//! config into a running [`Engine`] and keeps it healthy.
 //!
 //! # Responsibilities
 //!
