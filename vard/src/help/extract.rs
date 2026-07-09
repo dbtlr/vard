@@ -8,10 +8,12 @@ use super::model::{FlagEntry, FlagGroup, GlobalEntry, HelpExtras, HelpForm, Help
 /// uppercased by the renderer.
 const DEFAULT_FLAG_HEADING: &str = "Options";
 
-/// Arg ids that never render in the model (clap's help/version plumbing and
-/// the intercepted `-h`/`--help` flags).
-fn is_meta_arg(id: &str) -> bool {
-    matches!(id, "help" | "help_short" | "help_long" | "version")
+/// Arg ids for clap's help plumbing and the intercepted `-h`/`--help` flags.
+/// These never render — matching norn's convention of hiding help entries.
+/// `version` is deliberately NOT here: it renders in GLOBAL OPTIONS (see
+/// [`build_model`]), matching the manpage and completions.
+fn is_help_plumbing(id: &str) -> bool {
+    matches!(id, "help" | "help_short" | "help_long")
 }
 
 /// Walk the given clap `Command` and produce a fully-populated `HelpModel`.
@@ -35,24 +37,44 @@ pub fn build_model(cmd: &Command, root: &Command, cmd_path: &str, form: HelpForm
     // Collect globals from the root command (the source of truth for global
     // args). Clap propagates globals to subcommands but `is_global_set()` only
     // returns `true` on the declaring command, not on inherited copies.
-    let globals: Vec<GlobalEntry> = root
+    let global_entry = |a: &clap::Arg| {
+        let entry = flag_entry_from_arg(a, form);
+        GlobalEntry {
+            short: entry.short,
+            long: entry.long,
+            value_name: entry.value_name,
+            short_desc: entry.short_desc,
+        }
+    };
+    let mut globals: Vec<GlobalEntry> = root
         .get_arguments()
-        .filter(|a| a.is_global_set() && !is_meta_arg(a.get_id().as_str()))
-        .map(|a| {
-            let entry = flag_entry_from_arg(a, form);
-            GlobalEntry {
-                short: entry.short,
-                long: entry.long,
-                value_name: entry.value_name,
-                short_desc: entry.short_desc,
-            }
-        })
+        .filter(|a| a.is_global_set() && !is_help_plumbing(a.get_id().as_str()))
+        .map(&global_entry)
         .collect();
+    // Render `-V/--version` in GLOBAL OPTIONS. Clap synthesizes the version arg
+    // only at build/parse time, so it is absent from the unbuilt command factory
+    // this model is built from; key off `get_version()` (set by
+    // `#[command(version)]`) instead. Only the command that declares a version
+    // shows it — matching the generated manpage, where a subcommand without its
+    // own version has no `-V`.
+    if cmd.get_version().is_some() {
+        globals.push(GlobalEntry {
+            short: Some('V'),
+            long: Some("version".to_string()),
+            value_name: None,
+            // clap's default version help text.
+            short_desc: "Print version".to_string(),
+        });
+    }
 
     // Walk this command's args. Globals were already collected from `root`; the
     // `is_global_set()` skip below prevents double-collection.
     for arg in cmd.get_arguments() {
-        if is_meta_arg(arg.get_id().as_str()) {
+        if is_help_plumbing(arg.get_id().as_str()) {
+            continue;
+        }
+        // `version` is rendered in GLOBAL OPTIONS above, not in a flag group.
+        if matches!(arg.get_action(), clap::ArgAction::Version) {
             continue;
         }
         if arg.is_global_set() {
@@ -96,6 +118,7 @@ pub fn build_model(cmd: &Command, root: &Command, cmd_path: &str, form: HelpForm
         groups,
         globals,
         subcommands,
+        subcommand_required: cmd.is_subcommand_required_set(),
         extras: HelpExtras {
             canned_examples: super::examples::examples_for(cmd_path),
             conceptual_sections: super::examples::conceptual_sections_for(cmd_path),
@@ -129,6 +152,12 @@ fn flag_entry_from_arg(arg: &clap::Arg, form: HelpForm) -> FlagEntry {
         .filter(|pv| !pv.is_hide_set())
         .map(|pv| pv.get_name().to_string())
         .collect();
+    // Default values, rendered as `[default: …]` in long help (like the manpage).
+    let default_values: Vec<String> = arg
+        .get_default_values()
+        .iter()
+        .map(|v| v.to_string_lossy().into_owned())
+        .collect();
     FlagEntry {
         short,
         long,
@@ -136,6 +165,8 @@ fn flag_entry_from_arg(arg: &clap::Arg, form: HelpForm) -> FlagEntry {
         short_desc,
         long_desc,
         possible_values,
+        default_values,
+        required: arg.is_required_set(),
     }
 }
 
@@ -235,6 +266,45 @@ mod tests {
             .find(|f| f.long.as_deref() == Some("interval"))
             .expect("interval flag");
         assert_eq!(interval.value_name.as_deref(), Some("SECS"));
+    }
+
+    #[test]
+    fn version_flag_renders_as_global() {
+        // The real derived CLI carries `-V/--version`; it must surface in GLOBAL
+        // OPTIONS so a field rename can't silently drop it from help.
+        use clap::CommandFactory;
+        let root = crate::cli::Cli::command();
+        let model = build_model(&root, &root, "vard", HelpForm::Short);
+        let version = model
+            .globals
+            .iter()
+            .find(|g| g.long.as_deref() == Some("version"))
+            .expect("version flag must appear in GLOBAL OPTIONS");
+        assert_eq!(version.short, Some('V'));
+        // ...and never leak into an ordinary flag group.
+        for g in &model.groups {
+            assert!(g.flags.iter().all(|f| f.long.as_deref() != Some("version")));
+        }
+    }
+
+    #[test]
+    fn captures_default_values() {
+        let cmd = Command::new("run").arg(
+            Arg::new("interval")
+                .long("interval")
+                .value_name("SECS")
+                .default_value("5")
+                .help("Debounce interval")
+                .help_heading("Timing"),
+        );
+        let model = build_model(&cmd, &cmd, "vard run", HelpForm::Long);
+        let interval = model
+            .groups
+            .iter()
+            .flat_map(|g| g.flags.iter())
+            .find(|f| f.long.as_deref() == Some("interval"))
+            .expect("interval flag");
+        assert_eq!(interval.default_values, vec!["5".to_string()]);
     }
 
     #[test]

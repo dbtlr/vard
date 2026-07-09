@@ -6,6 +6,7 @@
 //! - `-h` uses a single global aligned column across all groups
 //! - `--help` uses hanging indent (flag on its own line, prose beneath)
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 use super::model::{FlagEntry, GlobalEntry, HelpModel};
@@ -14,11 +15,13 @@ use crate::output::palette::Palette;
 const GLOBAL_DESC_MAX: usize = 70;
 const REPO_URL: &str = "https://github.com/dbtlr/vard";
 
-/// Abstracts over `FlagEntry` and `GlobalEntry` so `label()` can serve both.
+/// Abstracts over `FlagEntry` and `GlobalEntry` so the column layout and the
+/// aligned line-writer can serve both without duplication.
 trait LabelSource {
     fn short(&self) -> Option<char>;
     fn long(&self) -> Option<&str>;
     fn value_name(&self) -> Option<&str>;
+    fn short_desc(&self) -> &str;
 }
 
 impl LabelSource for FlagEntry {
@@ -31,6 +34,9 @@ impl LabelSource for FlagEntry {
     fn value_name(&self) -> Option<&str> {
         self.value_name.as_deref()
     }
+    fn short_desc(&self) -> &str {
+        &self.short_desc
+    }
 }
 
 impl LabelSource for GlobalEntry {
@@ -42,6 +48,9 @@ impl LabelSource for GlobalEntry {
     }
     fn value_name(&self) -> Option<&str> {
         self.value_name.as_deref()
+    }
+    fn short_desc(&self) -> &str {
+        &self.short_desc
     }
 }
 
@@ -62,16 +71,50 @@ fn label<T: LabelSource>(item: &T) -> String {
     s
 }
 
+/// Build the USAGE synopsis from the model: `path [OPTIONS]`, then each
+/// positional (`<NAME>` required, `[NAME]` optional), then the subcommand slot
+/// (`<COMMAND>` when required, `[COMMAND]` when a bare invocation is valid).
+fn usage_synopsis(model: &HelpModel) -> String {
+    let mut s = format!("{} [OPTIONS]", model.command_path);
+    for p in &model.positionals {
+        let name = p
+            .value_name
+            .as_deref()
+            .or(p.long.as_deref())
+            .unwrap_or("ARG");
+        if p.required {
+            s.push_str(&format!(" <{name}>"));
+        } else {
+            s.push_str(&format!(" [{name}]"));
+        }
+    }
+    if !model.subcommands.is_empty() {
+        if model.subcommand_required {
+            s.push_str(" <COMMAND>");
+        } else {
+            s.push_str(" [COMMAND]");
+        }
+    }
+    s
+}
+
+fn write_usage(out: &mut dyn Write, palette: &Palette, model: &HelpModel) -> io::Result<()> {
+    write_section_header(out, palette, "USAGE")?;
+    writeln!(
+        out,
+        "    {}{}{}",
+        palette.fg.render(),
+        usage_synopsis(model),
+        palette.fg.render_reset()
+    )?;
+    writeln!(out)
+}
+
 /// Render the short (`-h`) form of `model` to `out`.
 ///
 /// Flag lines in `-h` are one-liners; they align to a single global column and
 /// do not wrap.
-pub fn render_short(
-    out: &mut dyn Write,
-    model: &HelpModel,
-    palette: &Palette,
-    _term_width: usize,
-) -> io::Result<()> {
+pub fn render_short(out: &mut dyn Write, model: &HelpModel, palette: &Palette) -> io::Result<()> {
     // Description line (dim).
     if !model.about.is_empty() {
         writeln!(
@@ -85,38 +128,26 @@ pub fn render_short(
     }
 
     // USAGE line.
-    write_section_header(out, palette, "USAGE")?;
-    writeln!(
-        out,
-        "    {}{} [OPTIONS]{}{}",
-        palette.fg.render(),
-        model.command_path,
-        if model.subcommands.is_empty() {
-            ""
-        } else {
-            " <COMMAND>"
-        },
-        palette.fg.render_reset()
-    )?;
-    writeln!(out)?;
+    write_usage(out, palette, model)?;
 
     // Positionals.
     if !model.positionals.is_empty() {
         write_section_header(out, palette, "ARGUMENTS")?;
-        let col = compute_aligned_column(&model.positionals);
+        let refs: Vec<&FlagEntry> = model.positionals.iter().collect();
+        let col = compute_column(&refs);
         for p in &model.positionals {
-            write_flag_line_aligned(out, palette, p, col)?;
+            write_aligned_line(out, palette, p, col, None)?;
         }
         writeln!(out)?;
     }
 
     // Flag groups — single column across ALL groups.
     let all_flags: Vec<&FlagEntry> = model.groups.iter().flat_map(|g| g.flags.iter()).collect();
-    let col = compute_aligned_column_borrowed(&all_flags);
+    let col = compute_column(&all_flags);
     for group in &model.groups {
         write_section_header(out, palette, &group.heading.to_uppercase())?;
         for f in &group.flags {
-            write_flag_line_aligned(out, palette, f, col)?;
+            write_aligned_line(out, palette, f, col, None)?;
         }
         writeln!(out)?;
     }
@@ -129,14 +160,7 @@ pub fn render_short(
     }
 
     // GLOBAL OPTIONS — full block, no collapse.
-    if !model.globals.is_empty() {
-        write_section_header(out, palette, "GLOBAL OPTIONS")?;
-        let col_g = compute_globals_column(&model.globals);
-        for g in &model.globals {
-            write_global_line(out, palette, g, col_g)?;
-        }
-        writeln!(out)?;
-    }
+    write_globals(out, palette, model)?;
 
     // Footer: pointer to long form.
     writeln!(
@@ -186,13 +210,9 @@ fn write_subcommands(
     Ok(())
 }
 
-/// `(longest "flag + placeholder") + 2 spaces`.
-fn compute_aligned_column(flags: &[FlagEntry]) -> usize {
-    flags.iter().map(|f| flag_label(f).len()).max().unwrap_or(0) + 2
-}
-
-fn compute_aligned_column_borrowed(flags: &[&FlagEntry]) -> usize {
-    flags.iter().map(|f| flag_label(f).len()).max().unwrap_or(0) + 2
+/// `(longest "flag + placeholder") + 2 spaces`, over any [`LabelSource`].
+fn compute_column<T: LabelSource>(items: &[&T]) -> usize {
+    items.iter().map(|i| label(*i).len()).max().unwrap_or(0) + 2
 }
 
 /// Render the leading `-s, --long <PLACEHOLDER>` portion (without color).
@@ -200,57 +220,37 @@ pub(super) fn flag_label(f: &FlagEntry) -> String {
     label(f)
 }
 
-fn write_flag_line_aligned(
-    out: &mut dyn Write,
-    palette: &Palette,
-    f: &FlagEntry,
-    col: usize,
-) -> io::Result<()> {
-    let label = flag_label(f);
-    let (flag_part, placeholder_part) = split_flag_and_placeholder(&label);
-    let pad = col.saturating_sub(label.len());
-    writeln!(
-        out,
-        "    {fs}{flag}{fe}{ps}{ph}{pe}{spaces}{ds}{desc}{de}",
-        fs = palette.accent.render(),
-        flag = flag_part,
-        fe = palette.accent.render_reset(),
-        ps = palette.fg.render(),
-        ph = placeholder_part,
-        pe = palette.fg.render_reset(),
-        spaces = " ".repeat(pad),
-        ds = palette.dim.render(),
-        desc = f.short_desc,
-        de = palette.dim.render_reset(),
-    )
-}
-
-pub(super) fn split_flag_and_placeholder(label: &str) -> (&str, &str) {
-    if let Some(idx) = label.find(" <") {
-        (&label[..idx], &label[idx..])
-    } else {
-        (label, "")
+/// Truncate `s` to at most `max` display columns on a UTF-8 char boundary,
+/// appending `…` when anything was cut. Byte slicing here would panic on a
+/// multi-byte boundary; walking char boundaries keeps it safe.
+fn truncate_desc(s: &str, max: usize) -> Cow<'_, str> {
+    if s.len() <= max {
+        return Cow::Borrowed(s);
     }
+    let mut cut = max.saturating_sub(1).min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Cow::Owned(format!("{}…", &s[..cut]))
 }
 
-fn compute_globals_column(globals: &[GlobalEntry]) -> usize {
-    globals.iter().map(|g| label(g).len()).max().unwrap_or(0) + 2
-}
-
-fn write_global_line(
+/// Write one aligned `    <label><pad><desc>` line for any [`LabelSource`].
+/// `desc_max`, when set, constrains the description (globals, per spec §2.2);
+/// truncation is applied here as a pre-step so both flag and global lines share
+/// this single writer.
+fn write_aligned_line<T: LabelSource>(
     out: &mut dyn Write,
     palette: &Palette,
-    g: &GlobalEntry,
+    item: &T,
     col: usize,
+    desc_max: Option<usize>,
 ) -> io::Result<()> {
-    let label = label(g);
+    let label = label(item);
     let (flag_part, placeholder_part) = split_flag_and_placeholder(&label);
     let pad = col.saturating_sub(label.len());
-    // Constrain description per spec §2.2.
-    let desc = if g.short_desc.len() > GLOBAL_DESC_MAX {
-        format!("{}…", &g.short_desc[..GLOBAL_DESC_MAX.saturating_sub(1)])
-    } else {
-        g.short_desc.clone()
+    let desc = match desc_max {
+        Some(max) => truncate_desc(item.short_desc(), max),
+        None => Cow::Borrowed(item.short_desc()),
     };
     writeln!(
         out,
@@ -266,6 +266,28 @@ fn write_global_line(
         desc = desc,
         de = palette.dim.render_reset(),
     )
+}
+
+/// Render the GLOBAL OPTIONS block (shared by short and long forms).
+fn write_globals(out: &mut dyn Write, palette: &Palette, model: &HelpModel) -> io::Result<()> {
+    if model.globals.is_empty() {
+        return Ok(());
+    }
+    write_section_header(out, palette, "GLOBAL OPTIONS")?;
+    let refs: Vec<&GlobalEntry> = model.globals.iter().collect();
+    let col = compute_column(&refs);
+    for g in &model.globals {
+        write_aligned_line(out, palette, g, col, Some(GLOBAL_DESC_MAX))?;
+    }
+    writeln!(out)
+}
+
+pub(super) fn split_flag_and_placeholder(label: &str) -> (&str, &str) {
+    if let Some(idx) = label.find(" <") {
+        (&label[..idx], &label[idx..])
+    } else {
+        (label, "")
+    }
 }
 
 /// Render the `EXAMPLES` section. Each entry is two lines: the command at
@@ -357,12 +379,7 @@ fn write_conceptual_sections_block(
 ///
 /// Hanging-indent style for flags: flag on its own line, descriptions/prose
 /// indented 8 spaces beneath. Globals still use the aligned column.
-pub fn render_long(
-    out: &mut dyn Write,
-    model: &HelpModel,
-    palette: &Palette,
-    term_width: usize,
-) -> io::Result<()> {
+pub fn render_long(out: &mut dyn Write, model: &HelpModel, palette: &Palette) -> io::Result<()> {
     // Description (one-line about).
     if !model.about.is_empty() {
         writeln!(
@@ -390,20 +407,7 @@ pub fn render_long(
     }
 
     // USAGE.
-    write_section_header(out, palette, "USAGE")?;
-    writeln!(
-        out,
-        "    {}{} [OPTIONS]{}{}",
-        palette.fg.render(),
-        model.command_path,
-        if model.subcommands.is_empty() {
-            ""
-        } else {
-            " <COMMAND>"
-        },
-        palette.fg.render_reset()
-    )?;
-    writeln!(out)?;
+    write_usage(out, palette, model)?;
 
     // Positionals — hanging indent.
     if !model.positionals.is_empty() {
@@ -435,14 +439,7 @@ pub fn render_long(
     write_conceptual_sections_block(out, palette, &model.extras.conceptual_sections)?;
 
     // GLOBAL OPTIONS — aligned column.
-    if !model.globals.is_empty() {
-        write_section_header(out, palette, "GLOBAL OPTIONS")?;
-        let col_g = compute_globals_column(&model.globals);
-        for g in &model.globals {
-            write_global_line(out, palette, g, col_g)?;
-        }
-        writeln!(out)?;
-    }
+    write_globals(out, palette, model)?;
 
     // Footer: docs URL.
     writeln!(
@@ -453,7 +450,6 @@ pub fn render_long(
         palette.dim.render_reset()
     )?;
 
-    let _ = term_width;
     Ok(())
 }
 
@@ -503,6 +499,16 @@ fn write_flag_hanging(out: &mut dyn Write, palette: &Palette, f: &FlagEntry) -> 
             de = palette.dim.render_reset(),
         )?;
     }
+    // Default value(s), rendered `[default: …]` as the manpage does.
+    if !f.default_values.is_empty() {
+        writeln!(
+            out,
+            "        {ds}[default: {vals}]{de}",
+            ds = palette.dim.render(),
+            vals = f.default_values.join(", "),
+            de = palette.dim.render_reset(),
+        )?;
+    }
     writeln!(out)?;
     Ok(())
 }
@@ -529,6 +535,8 @@ mod tests {
                         short_desc: "Debounce interval".to_string(),
                         long_desc: None,
                         possible_values: vec![],
+                        default_values: vec![],
+                        required: false,
                     },
                     FlagEntry {
                         short: None,
@@ -537,6 +545,8 @@ mod tests {
                         short_desc: "Snapshot once then exit".to_string(),
                         long_desc: None,
                         possible_values: vec![],
+                        default_values: vec![],
+                        required: false,
                     },
                 ],
             }],
@@ -547,6 +557,7 @@ mod tests {
                 short_desc: "Color output: auto, always, or never".to_string(),
             }],
             subcommands: vec![],
+            subcommand_required: false,
             extras: HelpExtras::default(),
         }
     }
@@ -554,7 +565,7 @@ mod tests {
     fn render_to_string(model: &HelpModel) -> String {
         let palette = Palette::off();
         let mut buf = Vec::new();
-        render_short(&mut buf, model, &palette, 100).unwrap();
+        render_short(&mut buf, model, &palette).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -569,6 +580,60 @@ mod tests {
         let out = render_to_string(&sample_model());
         assert!(out.contains("USAGE\n"));
         assert!(out.contains("vard run [OPTIONS]"));
+    }
+
+    #[test]
+    fn usage_shows_optional_command_slot() {
+        let mut model = sample_model();
+        model.subcommands = vec![("run".to_string(), "Run the daemon".to_string())];
+        model.subcommand_required = false;
+        let out = render_to_string(&model);
+        assert!(
+            out.contains("[OPTIONS] [COMMAND]"),
+            "optional subcommand must render [COMMAND]; got:\n{out}"
+        );
+        assert!(!out.contains("<COMMAND>"));
+    }
+
+    #[test]
+    fn usage_shows_required_command_slot() {
+        let mut model = sample_model();
+        model.subcommands = vec![("run".to_string(), "Run the daemon".to_string())];
+        model.subcommand_required = true;
+        let out = render_to_string(&model);
+        assert!(out.contains("[OPTIONS] <COMMAND>"));
+    }
+
+    #[test]
+    fn usage_includes_positionals() {
+        let mut model = sample_model();
+        model.positionals = vec![
+            FlagEntry {
+                short: None,
+                long: None,
+                value_name: Some("PATH".to_string()),
+                short_desc: "required path".to_string(),
+                long_desc: None,
+                possible_values: vec![],
+                default_values: vec![],
+                required: true,
+            },
+            FlagEntry {
+                short: None,
+                long: None,
+                value_name: Some("EXTRA".to_string()),
+                short_desc: "optional extra".to_string(),
+                long_desc: None,
+                possible_values: vec![],
+                default_values: vec![],
+                required: false,
+            },
+        ];
+        let out = render_to_string(&model);
+        assert!(
+            out.contains("[OPTIONS] <PATH> [EXTRA]"),
+            "positionals must render in USAGE; got:\n{out}"
+        );
     }
 
     #[test]
@@ -607,6 +672,23 @@ mod tests {
     }
 
     #[test]
+    fn global_description_truncation_respects_char_boundary() {
+        // A multi-byte character straddling the byte limit must not panic and
+        // must truncate on a char boundary. `é` is two bytes; padding places one
+        // astride the GLOBAL_DESC_MAX-1 cut point.
+        let mut model = sample_model();
+        model.globals[0].short_desc =
+            format!("{}é{}", "a".repeat(GLOBAL_DESC_MAX - 2), "z".repeat(20));
+        // Must not panic while rendering; the two-byte `é` straddles the cut, so
+        // it is dropped whole and the prefix ends cleanly with the ellipsis.
+        let out = render_to_string(&model);
+        assert!(
+            out.contains(&format!("{}…", "a".repeat(GLOBAL_DESC_MAX - 2))),
+            "expected char-boundary truncation; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn aligned_column_uses_global_longest() {
         // Two groups with very different flag lengths — the column must align
         // to the longest across BOTH groups.
@@ -625,6 +707,8 @@ mod tests {
                         short_desc: "short".to_string(),
                         long_desc: None,
                         possible_values: vec![],
+                        default_values: vec![],
+                        required: false,
                     }],
                 },
                 FlagGroup {
@@ -636,11 +720,14 @@ mod tests {
                         short_desc: "zebra".to_string(),
                         long_desc: None,
                         possible_values: vec![],
+                        default_values: vec![],
+                        required: false,
                     }],
                 },
             ],
             globals: vec![],
             subcommands: vec![],
+            subcommand_required: false,
             extras: HelpExtras::default(),
         };
         let out = render_to_string(&model);
@@ -655,7 +742,7 @@ mod tests {
     fn render_long_to_string(model: &HelpModel) -> String {
         let palette = Palette::off();
         let mut buf = Vec::new();
-        render_long(&mut buf, model, &palette, 100).unwrap();
+        render_long(&mut buf, model, &palette).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -711,6 +798,17 @@ mod tests {
         assert!(first_para_idx < second_para_idx);
         assert!(lines[first_para_idx].starts_with("        "));
         assert!(lines[second_para_idx].starts_with("        "));
+    }
+
+    #[test]
+    fn long_form_renders_default_values() {
+        let mut model = sample_model();
+        model.groups[0].flags[0].default_values = vec!["5".to_string()];
+        let out = render_long_to_string(&model);
+        assert!(
+            out.contains("[default: 5]"),
+            "expected default rendered like the manpage; got:\n{out}"
+        );
     }
 
     #[test]

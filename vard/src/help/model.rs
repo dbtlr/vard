@@ -26,6 +26,13 @@ pub struct FlagEntry {
     /// Possible enum values like `["records", "json", "jsonl"]`. Empty for
     /// free-form args. Shown in `--help` (long form) only.
     pub possible_values: Vec<String>,
+    /// Default values captured from clap (`arg.get_default_values()`). Rendered
+    /// as `[default: …]` in `--help` (long form), mirroring the manpage. Empty
+    /// when the arg has no default.
+    pub default_values: Vec<String>,
+    /// Whether the arg is required. Drives `<NAME>` vs `[NAME]` in the USAGE
+    /// synopsis for positionals.
+    pub required: bool,
 }
 
 /// A named group of flags, e.g. "Options".
@@ -78,6 +85,9 @@ pub struct HelpModel {
     /// Subcommand list for parent commands (e.g. `vard --help` lists `run`).
     /// Empty for leaf commands.
     pub subcommands: Vec<(String, String)>, // (name, about)
+    /// Whether a subcommand must be given. Drives `<COMMAND>` (required) vs
+    /// `[COMMAND]` (optional — a bare `vard` is valid) in the USAGE synopsis.
+    pub subcommand_required: bool,
     pub extras: HelpExtras,
 }
 
@@ -94,6 +104,8 @@ mod tests {
             short_desc: "Print help".to_string(),
             long_desc: None,
             possible_values: vec![],
+            default_values: vec![],
+            required: false,
         };
         assert_eq!(e.short, Some('h'));
         assert_eq!(e.long.as_deref(), Some("help"));
