@@ -15,6 +15,7 @@
 //! The API is unstable (0.x) until published with semver guarantees.
 
 pub mod config;
+pub mod engine;
 pub mod event;
 pub mod scheduler;
 pub mod vcs;
@@ -24,6 +25,10 @@ pub use config::{
     ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SYNC,
     DEFAULT_SYNC_INTERVAL, DEFAULT_TRIGGER, TriggerMode, WatchSpec, WatchSpecBuilder,
     parse_duration,
+};
+pub use engine::{
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_UNSAFE_REPOLL_INTERVAL,
+    DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder, EngineError, SharedBackend,
 };
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
