@@ -117,6 +117,7 @@ pub struct WatchSpec {
     exclude: Vec<String>,
     branch: Option<String>,
     remote: String,
+    poll_interval: Option<Duration>,
 }
 
 impl WatchSpec {
@@ -177,6 +178,17 @@ impl WatchSpec {
     pub fn remote(&self) -> &str {
         &self.remote
     }
+
+    /// Explicit polling override for the filesystem watcher.
+    ///
+    /// `None` (the default) lets the watcher use the platform-native backend
+    /// and fall back to polling only if the native backend fails to arm.
+    /// `Some(period)` forces polling at `period` regardless of native support,
+    /// for filesystems where native events are unreliable (network mounts,
+    /// some containers). When set, the period is strictly positive.
+    pub fn poll_interval(&self) -> Option<Duration> {
+        self.poll_interval
+    }
 }
 
 /// A fluent builder for [`WatchSpec`]. Obtain one from [`WatchSpec::builder`].
@@ -196,6 +208,7 @@ pub struct WatchSpecBuilder {
     exclude: Vec<String>,
     branch: Option<String>,
     remote: String,
+    poll_interval: Option<Duration>,
 }
 
 impl WatchSpecBuilder {
@@ -211,6 +224,7 @@ impl WatchSpecBuilder {
             exclude: Vec::new(),
             branch: None,
             remote: DEFAULT_REMOTE.to_string(),
+            poll_interval: None,
         }
     }
 
@@ -262,12 +276,22 @@ impl WatchSpecBuilder {
         self
     }
 
+    /// Forces the watcher to poll at `period` instead of using native events.
+    ///
+    /// `period` must be strictly positive; [`build`](Self::build) rejects a
+    /// zero period. Leave this unset to use native events with automatic
+    /// polling fallback.
+    pub fn poll_interval(mut self, period: Duration) -> Self {
+        self.poll_interval = Some(period);
+        self
+    }
+
     /// Validates the accumulated fields and produces a [`WatchSpec`].
     ///
     /// Enforces: non-empty name; a name limited to ASCII alphanumerics and
     /// `-`, `_`, `.` and not the path-special `.` or `..` (safe for state-file
-    /// names); non-empty path; and strictly positive `quiesce`, `interval`,
-    /// and `sync_interval`.
+    /// names); non-empty path; strictly positive `quiesce`, `interval`, and
+    /// `sync_interval`; and a strictly positive `poll_interval` when one is set.
     pub fn build(self) -> Result<WatchSpec, ConfigError> {
         if self.name.is_empty() {
             return Err(ConfigError::EmptyName);
@@ -299,6 +323,13 @@ impl WatchSpecBuilder {
                 field: "sync_interval",
             });
         }
+        if let Some(period) = self.poll_interval
+            && period.is_zero()
+        {
+            return Err(ConfigError::ZeroDuration {
+                field: "poll_interval",
+            });
+        }
 
         Ok(WatchSpec {
             name: self.name,
@@ -311,6 +342,7 @@ impl WatchSpecBuilder {
             exclude: self.exclude,
             branch: self.branch,
             remote: self.remote,
+            poll_interval: self.poll_interval,
         })
     }
 }
@@ -516,6 +548,7 @@ mod tests {
         assert!(spec.exclude().is_empty());
         assert_eq!(spec.branch(), None);
         assert_eq!(spec.remote(), DEFAULT_REMOTE);
+        assert_eq!(spec.poll_interval(), None);
     }
 
     #[test]
@@ -535,6 +568,7 @@ mod tests {
             .exclude(["target", "*.log"])
             .branch("backup")
             .remote("origin2")
+            .poll_interval(Duration::from_secs(30))
             .build()
             .unwrap();
         assert_eq!(spec.trigger(), TriggerMode::Events);
@@ -545,6 +579,7 @@ mod tests {
         assert_eq!(spec.exclude(), ["target".to_string(), "*.log".to_string()]);
         assert_eq!(spec.branch(), Some("backup"));
         assert_eq!(spec.remote(), "origin2");
+        assert_eq!(spec.poll_interval(), Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -614,6 +649,14 @@ mod tests {
                 .build(),
             Err(ConfigError::ZeroDuration {
                 field: "sync_interval"
+            })
+        );
+        assert_eq!(
+            WatchSpec::builder("n", "/p")
+                .poll_interval(Duration::ZERO)
+                .build(),
+            Err(ConfigError::ZeroDuration {
+                field: "poll_interval"
             })
         );
     }
