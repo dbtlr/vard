@@ -103,7 +103,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, timeout};
 
 use crate::config::{TriggerMode, WatchSpec};
-use crate::event::{Event, EventBus, EventReceiver, Trigger, TroubleKind, WatchState};
+use crate::event::{Event, EventBus, EventReceiver, SkipReason, Trigger, TroubleKind, WatchState};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
 use crate::vcs::git::GitBackend;
 use crate::vcs::{SafeState, SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError};
@@ -198,6 +198,15 @@ impl Provenance {
     fn interval() -> Self {
         Self {
             trigger: Trigger::Interval,
+            user_text: None,
+        }
+    }
+
+    /// A manual provenance, injected by [`EngineHandle::trigger`] when a host
+    /// (the daemon draining a request file, spec §11) asks for a snapshot now.
+    fn manual() -> Self {
+        Self {
+            trigger: Trigger::Manual,
             user_text: None,
         }
     }
@@ -465,6 +474,16 @@ impl Worker {
                 }
             }
 
+            // The repository is safe and a backend commit is imminent. Announce
+            // it before the git write can begin so a bus subscriber can bracket
+            // the commit window (journal begin/complete). This fires per sweep,
+            // including the bounded post-op re-check below, because each sweep is
+            // its own commit window. INVARIANT: every arm below closes this
+            // bracket with exactly one outcome event — `SnapshotCompleted`,
+            // `SnapshotFailed`, or `SnapshotSkipped` — so a subscriber's record
+            // never dangles (see `Event::SnapshotStarted`).
+            self.emit_started(prov.trigger);
+
             match snapshot_with_retry(Arc::clone(&self.backend), self.cfg, &prov).await {
                 PassResult::Committed(outcome) => {
                     self.emit_completed(prov.trigger, &outcome);
@@ -488,25 +507,41 @@ impl Worker {
                 }
                 PassResult::Clean => {
                     // Nothing to commit: the pending change resolved (it was
-                    // committed or reverted elsewhere). Clear any retry so a
-                    // prior failure episode does not keep ticking.
+                    // committed or reverted elsewhere). Close the started
+                    // bracket, then clear any retry so a prior failure episode
+                    // does not keep ticking.
+                    self.emit_skipped(prov.trigger, SkipReason::Clean);
                     self.clear_retry();
                 }
                 PassResult::Unsafe(reason) => {
+                    // The repo turned unsafe between the probe and the commit:
+                    // no commit was made, so the bracket closes as skipped (the
+                    // pause itself travels as `WatchStateChanged`).
+                    self.emit_skipped(prov.trigger, SkipReason::Unsafe);
                     self.pending = Some(prov);
                     self.enter_unsafe(reason);
                     return;
                 }
                 PassResult::StillLocked => {
                     // Never delete a foreign lock: requeue and try again on the
-                    // next trigger.
+                    // next trigger. Nothing was committed, so close the bracket.
+                    self.emit_skipped(prov.trigger, SkipReason::LockContended);
                     self.pending = Some(coalesce(self.pending.take(), prov));
                     return;
                 }
                 PassResult::Failed(err) => {
                     // Preserve the pending change and converge it on the bounded
                     // retry timer instead of dropping a hard failure.
+                    // `enter_failure` surfaces `SnapshotFailed` only on the
+                    // transition into the failure retry; a repeat inside the
+                    // episode closes this pass's bracket as skipped instead
+                    // (checked here, before `enter_failure` mutates the retry
+                    // state), so the bracket invariant holds without a per-tick
+                    // failure storm.
                     self.pending = Some(prov.clone());
+                    if self.retry == Some(RetryKind::Failure) {
+                        self.emit_skipped(prov.trigger, SkipReason::RetryStillFailing);
+                    }
                     self.enter_failure(prov.trigger, &err);
                     return;
                 }
@@ -599,6 +634,26 @@ impl Worker {
             Some(msg),
         );
         self.clear_retry();
+    }
+
+    /// Emits [`Event::SnapshotStarted`] just before a backend commit is
+    /// attempted (see [`run_pass`](Self::run_pass)).
+    fn emit_started(&self, trigger: Trigger) {
+        self.bus.emit(Event::SnapshotStarted {
+            watch: self.name.clone(),
+            trigger,
+        });
+    }
+
+    /// Emits [`Event::SnapshotSkipped`]: the no-commit outcome that closes a
+    /// [`SnapshotStarted`](Event::SnapshotStarted) bracket when neither a
+    /// completion nor a (newly surfaced) failure applies.
+    fn emit_skipped(&self, trigger: Trigger, reason: SkipReason) {
+        self.bus.emit(Event::SnapshotSkipped {
+            watch: self.name.clone(),
+            trigger,
+            reason,
+        });
     }
 
     /// Emits [`Event::SnapshotCompleted`] for a committed snapshot.
@@ -774,10 +829,17 @@ impl Engine {
         let mut watcher_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> = HashMap::new();
         let mut scheduler_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> =
             HashMap::new();
+        // The handle keeps its own clone of every worker's input sender so it can
+        // inject manual triggers ([`EngineHandle::trigger`]). Held per watch
+        // regardless of trigger mode — even an interval-only watch accepts a
+        // manual snapshot. See [`EngineHandle::shutdown`] for why these must be
+        // dropped before the workers are drained.
+        let mut handle_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> = HashMap::new();
 
         for cw in watches {
             let name = cw.spec.name().to_string();
             let (tx, rx) = mpsc::unbounded_channel();
+            handle_routes.insert(name.clone(), tx.clone());
             let mode = cw.spec.trigger();
 
             let mute = if matches!(mode, TriggerMode::Events | TriggerMode::Both) {
@@ -828,6 +890,7 @@ impl Engine {
             bus,
             workers,
             dispatchers,
+            routes: handle_routes,
             drain_timeout: cfg.shutdown_drain_timeout,
         })
     }
@@ -851,15 +914,46 @@ pub struct EngineHandle {
     bus: EventBus,
     workers: Vec<JoinHandle<()>>,
     dispatchers: Vec<JoinHandle<()>>,
+    /// A clone of every worker's input sender, keyed by watch name, so
+    /// [`trigger`](Self::trigger) can inject a manual snapshot. These are
+    /// additional senders on the same channels the dispatchers feed, so
+    /// [`shutdown`](Self::shutdown) must drop this map before draining the
+    /// workers or their channels never close.
+    routes: HashMap<String, mpsc::UnboundedSender<WatchInput>>,
     drain_timeout: Duration,
 }
 
 impl EngineHandle {
+    /// Injects a manual snapshot trigger ([`Trigger::Manual`]) for the named
+    /// watch, exactly as if a filesystem or interval signal had arrived — the
+    /// worker coalesces it with any pending change (manual wins on priority) and
+    /// snapshots on its serialized loop.
+    ///
+    /// This is the daemon's lever for a user-requested snapshot (spec §11: the
+    /// CLI drops a request file, the daemon drains it and calls this).
+    ///
+    /// Returns `true` if the watch exists and the trigger was delivered to its
+    /// worker; `false` if no watch by that name is configured (or, defensively,
+    /// if its worker has already stopped). The delivery is fire-and-forget: a
+    /// `true` return means the worker was handed the trigger, not that a commit
+    /// landed — the outcome arrives later on the event bus.
+    pub fn trigger(&self, watch: &str) -> bool {
+        match self.routes.get(watch) {
+            Some(tx) => tx.send(WatchInput::Trigger(Provenance::manual())).is_ok(),
+            None => false,
+        }
+    }
+
     /// Winds the engine down gracefully, emitting [`Event::DaemonStopped`] once
     /// every task has joined.
     ///
     /// The teardown is a cancellation drain, in order:
     ///
+    /// 0. **Drop the handle's own route senders.** The handle retains a sender
+    ///    per worker for [`trigger`](Self::trigger); those are dropped first, so
+    ///    that once the dispatchers' senders go too, each worker channel is truly
+    ///    senderless and closes. (Skipping this would wedge the drain until the
+    ///    timeout.)
     /// 1. **Stop the dispatchers.** Both dispatch tasks are aborted and joined,
     ///    which drops every per-watch route sender they held. No new trigger can
     ///    reach a worker after this point.
@@ -892,8 +986,16 @@ impl EngineHandle {
             bus,
             workers,
             dispatchers,
+            routes,
             drain_timeout,
         } = self;
+
+        // 0. Drop the handle's own route senders. The dispatchers hold their
+        //    clones (dropped in step 1), but this map holds one more sender per
+        //    worker for [`trigger`](Self::trigger); a worker's channel only
+        //    closes once *every* sender is gone. Without this drop the drain in
+        //    step 2 would block until the timeout aborts the workers.
+        drop(routes);
 
         // 1. Stop the dispatchers first so no further trigger reaches a worker.
         //    Aborting drops the route senders they hold; joining guarantees
@@ -1460,10 +1562,17 @@ mod tests {
 
     /// Advances the paused clock in bounded steps until `events` yields a value,
     /// letting the worker's blocking calls and backoff/re-poll sleeps progress.
+    ///
+    /// Skips [`Event::SnapshotStarted`] and [`Event::SnapshotSkipped`]: the
+    /// pre-commit signal and its no-commit closer bracket every backend sweep,
+    /// and these outcome-oriented assertions care about what a snapshot *did*
+    /// (committed, failed, changed state), not that one was attempted. The
+    /// dedicated bracket tests read the raw stream instead.
     async fn advance_until_event(events: &mut EventReceiver, step: Duration) -> Event {
         for _ in 0..500 {
             settle().await;
             match events.try_recv() {
+                Ok(Event::SnapshotStarted { .. }) | Ok(Event::SnapshotSkipped { .. }) => continue,
                 Ok(ev) => return ev,
                 Err(TryRecvError::Empty) => {}
                 Err(other) => panic!("event channel error: {other:?}"),
@@ -1471,6 +1580,21 @@ mod tests {
             tokio::time::advance(step).await;
         }
         panic!("no event arrived within the step budget");
+    }
+
+    /// Drains any buffered [`Event::SnapshotStarted`]/[`Event::SnapshotSkipped`]
+    /// bracket events and returns whether no *effect* event (Completed / Failed
+    /// / StateChanged / …) remains — i.e. passes may have announced attempts
+    /// that concluded without a commit, but nothing else was reported. Replaces
+    /// a bare `events.try_recv().is_err()` now that every sweep is bracketed.
+    fn no_more_outcomes(events: &mut EventReceiver) -> bool {
+        loop {
+            match events.try_recv() {
+                Ok(Event::SnapshotStarted { .. }) | Ok(Event::SnapshotSkipped { .. }) => continue,
+                Ok(_) => return false,
+                Err(_) => return true,
+            }
+        }
     }
 
     /// Advances the paused clock in bounded steps until the backend has seen at
@@ -1498,6 +1622,7 @@ mod tests {
         for _ in 0..200 {
             settle().await;
             match events.try_recv() {
+                Ok(Event::SnapshotStarted { .. }) | Ok(Event::SnapshotSkipped { .. }) => continue,
                 Ok(ev) => return Some(ev),
                 Err(TryRecvError::Empty) => {}
                 Err(other) => panic!("event channel error: {other:?}"),
@@ -1570,9 +1695,205 @@ mod tests {
             other => panic!("expected SnapshotCompleted, got {other:?}"),
         }
         wait_snapshot_calls(&backend, 2).await;
-        assert!(events.try_recv().is_err(), "exactly one snapshot");
+        assert!(
+            no_more_outcomes(&mut events),
+            "exactly one snapshot outcome"
+        );
         // One commit plus one converging re-check.
         assert_eq!(backend.snapshot_calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_started_precedes_completed_in_a_pass() {
+        // The pre-commit signal is emitted before the outcome for the same pass
+        // and carries the same trigger, so a subscriber can bracket the commit
+        // window. Reads the raw stream (no Started filtering).
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]); // then Clean on the re-check
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        let mut seen: Vec<Event> = Vec::new();
+        for _ in 0..500 {
+            settle().await;
+            while let Ok(ev) = events.try_recv() {
+                seen.push(ev);
+            }
+            if seen
+                .iter()
+                .any(|e| matches!(e, Event::SnapshotCompleted { .. }))
+            {
+                break;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        let started = seen.iter().position(|e| {
+            matches!(
+                e,
+                Event::SnapshotStarted {
+                    trigger: Trigger::Event,
+                    ..
+                }
+            )
+        });
+        let completed = seen
+            .iter()
+            .position(|e| matches!(e, Event::SnapshotCompleted { .. }));
+        let started = started.expect("a SnapshotStarted must precede the commit");
+        let completed = completed.expect("the commit must complete");
+        assert!(
+            started < completed,
+            "Started must precede Completed, got {seen:?}"
+        );
+    }
+
+    /// Collects raw events (no filtering) while advancing the paused clock,
+    /// until `done` accepts the collected list. Panics if the budget is spent
+    /// first.
+    async fn collect_raw_until(
+        events: &mut EventReceiver,
+        step: Duration,
+        done: impl Fn(&[Event]) -> bool,
+    ) -> Vec<Event> {
+        let mut seen: Vec<Event> = Vec::new();
+        for _ in 0..500 {
+            settle().await;
+            while let Ok(ev) = events.try_recv() {
+                seen.push(ev);
+            }
+            if done(&seen) {
+                return seen;
+            }
+            tokio::time::advance(step).await;
+        }
+        panic!("expected events never arrived; got {seen:?}");
+    }
+
+    /// Asserts the started→outcome bracket invariant over a raw event stream
+    /// from a single watch: scanning in order, every [`Event::SnapshotStarted`]
+    /// is closed by exactly one Completed/Failed/Skipped before the next
+    /// Started opens, no outcome arrives with no bracket open, and the stream
+    /// does not end mid-bracket. Non-bracket events (state changes) may
+    /// interleave freely.
+    fn assert_brackets_balanced(events: &[Event]) {
+        let mut open = false;
+        for ev in events {
+            match ev {
+                Event::SnapshotStarted { .. } => {
+                    assert!(
+                        !open,
+                        "a second Started before the previous bracket closed: {events:?}"
+                    );
+                    open = true;
+                }
+                Event::SnapshotCompleted { .. }
+                | Event::SnapshotFailed { .. }
+                | Event::SnapshotSkipped { .. } => {
+                    assert!(open, "an outcome with no open Started bracket: {events:?}");
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !open,
+            "stream ended with an unclosed Started bracket: {events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clean_pass_closes_the_started_bracket_with_skipped() {
+        // A pass whose sweep finds a clean tree commits nothing, but its
+        // SnapshotStarted must still be closed — by SnapshotSkipped(Clean) with
+        // the same trigger — so a journaling subscriber's begin record never
+        // dangles after a no-op sweep.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Clean]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
+
+        let seen = collect_raw_until(&mut events, Duration::from_secs(1), |evs| {
+            evs.iter()
+                .any(|e| matches!(e, Event::SnapshotSkipped { .. }))
+        })
+        .await;
+
+        assert_brackets_balanced(&seen);
+        let started_count = seen
+            .iter()
+            .filter(|e| matches!(e, Event::SnapshotStarted { .. }))
+            .count();
+        assert_eq!(started_count, 1, "one sweep, one bracket: {seen:?}");
+        match seen
+            .iter()
+            .find(|e| matches!(e, Event::SnapshotSkipped { .. }))
+        {
+            Some(Event::SnapshotSkipped {
+                trigger, reason, ..
+            }) => {
+                assert_eq!(*trigger, Trigger::Interval);
+                assert_eq!(*reason, SkipReason::Clean);
+            }
+            other => panic!("expected SnapshotSkipped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lock_exhausted_pass_closes_the_started_bracket_with_skipped() {
+        // A pass that gives up on a permanently contended lock (requeueing, not
+        // deleting) commits nothing and reports no failure — but its
+        // SnapshotStarted must still close, as SnapshotSkipped(LockContended).
+        // All the in-bracket lock retries share the one bracket.
+        let backend = FakeBackend::new();
+        backend.script([
+            Scripted::Lock,
+            Scripted::Lock,
+            Scripted::Lock,
+            Scripted::Lock,
+            Scripted::Lock,
+        ]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // Step past the 2/4/8/16s lock backoffs.
+        let seen = collect_raw_until(&mut events, Duration::from_secs(16), |evs| {
+            evs.iter()
+                .any(|e| matches!(e, Event::SnapshotSkipped { .. }))
+        })
+        .await;
+
+        assert_brackets_balanced(&seen);
+        let started_count = seen
+            .iter()
+            .filter(|e| matches!(e, Event::SnapshotStarted { .. }))
+            .count();
+        assert_eq!(
+            started_count, 1,
+            "the lock retries stay within one bracket: {seen:?}"
+        );
+        match seen
+            .iter()
+            .find(|e| matches!(e, Event::SnapshotSkipped { .. }))
+        {
+            Some(Event::SnapshotSkipped {
+                trigger, reason, ..
+            }) => {
+                assert_eq!(*trigger, Trigger::Event);
+                assert_eq!(*reason, SkipReason::LockContended);
+            }
+            other => panic!("expected SnapshotSkipped, got {other:?}"),
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, Event::SnapshotFailed { .. })),
+            "a contended lock is skipped, not failed: {seen:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1585,8 +1906,12 @@ mod tests {
             .unwrap();
         wait_snapshot_calls(&backend, 1).await;
         settle().await;
-        // No event: an interval on a clean tree is a no-op.
-        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        // No effect event: an interval on a clean tree commits nothing (the
+        // sweep's Started/Skipped bracket is filtered by the helper).
+        assert!(
+            no_more_outcomes(&mut events),
+            "an interval on a clean tree is a no-op"
+        );
         assert_eq!(backend.snapshot_calls(), 1);
     }
 
@@ -1637,7 +1962,7 @@ mod tests {
 
         wait_snapshot_calls(&backend, 4).await;
         assert!(
-            events.try_recv().is_err(),
+            no_more_outcomes(&mut events),
             "ten queued triggers must collapse into one follow-up, not ten"
         );
         assert_eq!(
@@ -1664,7 +1989,7 @@ mod tests {
             "a write during the muted window must not be lost"
         );
         settle().await;
-        assert!(events.try_recv().is_err(), "then it converges");
+        assert!(no_more_outcomes(&mut events), "then it converges");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1751,8 +2076,8 @@ mod tests {
         }
         settle().await;
         assert!(
-            matches!(events.try_recv(), Err(TryRecvError::Empty)),
-            "a permanently locked repo must not report a snapshot"
+            no_more_outcomes(&mut events),
+            "a permanently locked repo must not report a snapshot outcome"
         );
         // Exactly the configured number of attempts, then the pass gives up.
         assert_eq!(backend.snapshot_calls(), cfg.lock_retry_attempts as usize);
@@ -2325,6 +2650,94 @@ mod tests {
             }
             other => panic!("expected an attention transition, got {other:?}"),
         }
+    }
+
+    // --- EngineHandle::trigger and shutdown ----------------------------------
+
+    /// Builds and starts an interval-only engine over one fake-backed watch.
+    /// Interval-only avoids arming a real filesystem watcher, and the long
+    /// interval means the scheduler never ticks during the test (first tick is
+    /// one full interval after arming), so only an injected manual trigger drives
+    /// a snapshot. Real time (not paused) so `start`/`shutdown` behave normally.
+    async fn start_interval_engine(backend: Arc<FakeBackend>) -> EngineHandle {
+        let spec = WatchSpec::builder("w", "/tmp")
+            .trigger(TriggerMode::Interval)
+            .interval(Duration::from_secs(3600))
+            .build()
+            .unwrap();
+        Engine::builder()
+            .watch_with_backend(spec, backend as SharedBackend)
+            .shutdown_drain_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trigger_injects_a_manual_snapshot() {
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let engine = Engine::builder()
+            .watch_with_backend(
+                WatchSpec::builder("w", "/tmp")
+                    .trigger(TriggerMode::Interval)
+                    .interval(Duration::from_secs(3600))
+                    .build()
+                    .unwrap(),
+                Arc::clone(&backend) as SharedBackend,
+            )
+            .build()
+            .unwrap();
+        let mut events = engine.subscribe();
+        let handle = engine.start().await.unwrap();
+
+        assert!(
+            handle.trigger("w"),
+            "trigger on an existing watch returns true"
+        );
+
+        let trigger = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::SnapshotCompleted { trigger, .. } = events.recv().await.unwrap() {
+                    return trigger;
+                }
+            }
+        })
+        .await
+        .expect("an injected manual trigger must produce a snapshot");
+        assert_eq!(
+            trigger,
+            Trigger::Manual,
+            "the injected trigger must reach the worker as Manual"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trigger_returns_false_for_an_unknown_watch() {
+        let backend = FakeBackend::new();
+        let handle = start_interval_engine(backend).await;
+        assert!(
+            !handle.trigger("does-not-exist"),
+            "trigger on a missing watch returns false"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_promptly_despite_retained_route_senders() {
+        // Regression: the handle now retains a route sender per worker for
+        // `trigger`. If shutdown does not drop them before draining, each worker
+        // channel keeps a live sender and the drain blocks until the (60s) drain
+        // timeout aborts everything. Assert shutdown returns well inside that.
+        let backend = FakeBackend::new();
+        let handle = start_interval_engine(backend).await;
+        timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown must drain promptly, not wait out the drain timeout");
     }
 
     // --- builder validation --------------------------------------------------

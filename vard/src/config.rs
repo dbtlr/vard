@@ -52,16 +52,20 @@ const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// Schema version. Probed before full deserialization; see
-    /// [`from_toml_str`](Config::from_toml_str).
+    /// Schema version. Read via the pre-parse probe in
+    /// [`from_toml_str`](Config::from_toml_str) rather than this field, which is
+    /// retained so the schema round-trips and tests can assert it.
+    #[allow(dead_code)]
     pub version: i64,
     /// The `[daemon]` section (spec §12). Absent entirely, or with only
     /// some fields set, defaults fill in the rest — see [`DaemonConfig`].
     #[serde(default)]
     pub daemon: DaemonConfig,
     /// Tolerated opaquely; a later task adds the typed `[ai]` section.
+    #[allow(dead_code)]
     ai: Option<toml::Value>,
     /// Tolerated opaquely; a later task adds the typed `[update]` section.
+    #[allow(dead_code)]
     update: Option<toml::Value>,
     #[serde(default)]
     pub defaults: Defaults,
@@ -125,10 +129,13 @@ pub(crate) struct Defaults {
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub sync_interval: Option<Duration>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     hook_timeout: Option<toml::Value>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     hook_rate_limit: Option<toml::Value>,
 }
 
@@ -161,13 +168,18 @@ pub(crate) struct WatchConfig {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
     /// Tolerated opaquely; a later task adds typed `[watch.hooks]`.
+    #[allow(dead_code)]
     hooks: Option<toml::Value>,
 }
 
 impl Config {
     /// The default config path, `$XDG_CONFIG_HOME/vard/config.toml`.
+    // The daemon resolves paths via `DaemonPaths`; kept for future CLI callers
+    // (e.g. `vard config path`).
+    #[allow(dead_code)]
     pub fn default_path() -> Result<PathBuf, ConfigError> {
         paths::config_file().map_err(|e| ConfigError::Path(e.to_string()))
     }

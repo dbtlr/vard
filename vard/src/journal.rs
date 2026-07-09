@@ -70,6 +70,9 @@ pub(crate) struct Journal {
 impl Journal {
     /// The journal for `watch_name` at the default location, one file under
     /// `$XDG_STATE_HOME/vard/journal`.
+    // The daemon resolves the journal dir via `DaemonPaths` and uses `in_dir`;
+    // this XDG convenience is kept for future non-daemon callers.
+    #[allow(dead_code)]
     pub(crate) fn for_watch(watch_name: &str) -> Result<Journal, JournalError> {
         let dir = paths::journal_dir().map_err(|e| JournalError::Path(e.to_string()))?;
         Ok(Self::in_dir(&dir, watch_name))
@@ -87,6 +90,8 @@ impl Journal {
     }
 
     /// The journal file's path.
+    // Exercised by tests; a diagnostic accessor for future callers.
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -450,6 +455,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[non_exhaustive]
 pub(crate) enum JournalError {
     /// The journal directory path could not be resolved (see [`paths`]).
+    // Only produced by the XDG `for_watch` constructor, dead until a non-daemon
+    // caller uses it; the daemon builds journals from an explicit dir.
+    #[allow(dead_code)]
     Path(String),
     /// A journal file operation failed.
     Io {

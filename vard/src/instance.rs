@@ -36,13 +36,17 @@ pub(crate) struct InstanceLock {
     /// The locked file. Kept open purely to keep the `flock` held; closing the
     /// descriptor (on drop) is what releases the lock.
     file: File,
-    /// The lock file's path, retained for diagnostics.
+    /// The lock file's path, retained for diagnostics (see [`path`](Self::path)).
+    #[allow(dead_code)]
     path: PathBuf,
 }
 
 impl InstanceLock {
     /// Acquires the daemon's single-instance lock at the default location,
     /// `$XDG_STATE_HOME/vard/vard.lock`.
+    // The daemon resolves paths through `DaemonPaths` and calls `acquire_at`;
+    // this XDG convenience is kept for future callers (e.g. `vard status`).
+    #[allow(dead_code)]
     pub(crate) fn acquire() -> Result<InstanceLock, LockError> {
         let path = paths::lock_file().map_err(|e| LockError::Path(e.to_string()))?;
         Self::acquire_at(&path)
@@ -103,6 +107,8 @@ impl InstanceLock {
     }
 
     /// The lock file's path, for diagnostics.
+    // Exercised by tests; a diagnostic accessor for future status reporting.
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }

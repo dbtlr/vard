@@ -1,0 +1,1233 @@
+//! The `vard run` daemon shell: the long-lived supervisor that turns the file
+//! config into a running [`Engine`](vard_core::Engine) and keeps it healthy.
+//!
+//! # Responsibilities
+//!
+//! 1. Acquire the single-instance [`InstanceLock`] so only one daemon owns a
+//!    state directory (contention exits with code 2).
+//! 2. Load and resolve the file [`Config`] into watch specs; a missing or
+//!    watch-less config is a startup error (nothing to do).
+//! 3. Recover any stale git index locks left by a previous crash (per-watch
+//!    [`Journal`] recovery), then build and start the engine.
+//! 4. Supervise it: log every bus [`Event`], bracket each commit window in the
+//!    per-watch journal (`begin` on `snapshot.started`, `complete` on the
+//!    `snapshot.completed`/`snapshot.failed`/`snapshot.skipped` outcome the
+//!    engine guarantees follows it — see [`journal_event`]), reload on SIGHUP
+//!    or a config-file edit, rebuild on a dead signal source with exponential
+//!    backoff, drain snapshot/sync request files, and shut down cleanly on
+//!    SIGINT/SIGTERM.
+//!
+//! # The request-file contract (ADR 0004, spec §11)
+//!
+//! The CLI (VRD-15/16) and the daemon do not share memory; they rendezvous
+//! through files under [`paths::request_dir`]. Each file is a small TOML
+//! document:
+//!
+//! ```toml
+//! kind = "snapshot"   # or "sync"
+//! watch = "vault"     # optional; omitted means "every watch"
+//! ```
+//!
+//! The daemon polls the directory, and for each file:
+//!
+//! - `kind = "snapshot"` injects a manual `Trigger::Manual` snapshot via
+//!   [`EngineHandle::trigger`](vard_core::EngineHandle::trigger) — for the named
+//!   watch, or every watch when `watch` is omitted. An unknown watch is logged
+//!   and skipped.
+//! - `kind = "sync"` is accepted but not yet implemented (VRD-19); it is logged
+//!   and dropped.
+//!
+//! Every file is deleted after it is consumed — including a malformed one, which
+//! is logged and removed so a single poison file cannot wedge the queue.
+//!
+//! # Config and request watching: mtime polling, not a notifier
+//!
+//! Both the config file and the request directory are watched by a lightweight
+//! mtime poll (default every [`DEFAULT_POLL_INTERVAL`]), not by arming a
+//! `vard-core` [`Watcher`](vard_core::Watcher) on them. Polling is simpler and
+//! avoids a feedback loop on the request directory (the daemon itself deletes
+//! files there, which a notifier would report back as activity); a couple of
+//! seconds of latency on a control-plane path is immaterial. Config edits are
+//! debounced (see [`MtimeDebounce`]) so an editor writing several times in a row
+//! collapses into a single rebuild.
+//!
+//! # Testability
+//!
+//! The IO loop is factored around an explicit [`DaemonPaths`] (config file, lock
+//! file, request dir, journal dir) rather than reaching into XDG, mirroring the
+//! `*_at`/`in_dir` cores elsewhere in the crate, and it takes its shutdown/reload
+//! signals as [`Notify`] handles rather than raw OS signals. Tests drive
+//! [`run_daemon`] against a tempdir with a cancellation `Notify` standing in for
+//! SIGTERM; production wires the real paths and signal handlers in [`run`].
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use serde::Deserialize;
+use tokio::sync::Notify;
+use tokio::time::Instant as TokioInstant;
+use tracing::{debug, error, info, warn};
+
+use vard_core::{
+    Engine, EngineError, EngineHandle, Event, EventReceiver, RecvError, TroubleKind, WatchSpec,
+    WatchState,
+};
+
+use crate::config::{Config, ConfigError, LogLevel};
+use crate::instance::InstanceLock;
+use crate::journal::{Journal, RecoveryOpts, RecoveryReport};
+use crate::paths::{self, HomeNotFound};
+
+/// How often the supervisor polls the config file's mtime and drains the
+/// request directory. A control-plane cadence: fast enough that a manual
+/// snapshot request feels responsive, slow enough to be negligible overhead.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Base delay before the first rebuild after a watch's signal source dies. The
+/// backoff doubles from here on repeated quick failures (see
+/// [`SourceDiedBackoff`]).
+const SOURCE_DIED_BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// Cap on the source-died rebuild backoff: a persistently broken engine retries
+/// at most this often rather than hammering.
+const SOURCE_DIED_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// How long the engine must run without a fresh source-died failure before the
+/// backoff resets to [`SOURCE_DIED_BACKOFF_BASE`]. A failure after this long is
+/// treated as a new incident, not a continuation of the previous storm.
+const SOURCE_DIED_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// The concrete filesystem locations the daemon reads and writes, resolved once
+/// at startup. Held explicitly (rather than re-derived from XDG on each use) so
+/// tests can inject a tempdir; [`from_xdg`](Self::from_xdg) is the production
+/// resolver.
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonPaths {
+    /// `config.toml`, loaded and reloaded into watch specs.
+    pub config_file: PathBuf,
+    /// The single-instance `flock` target.
+    pub lock_file: PathBuf,
+    /// The request-file queue drained each poll.
+    pub request_dir: PathBuf,
+    /// The directory holding per-watch operation journals.
+    pub journal_dir: PathBuf,
+}
+
+impl DaemonPaths {
+    /// Resolves every daemon path from the XDG base directories.
+    pub(crate) fn from_xdg() -> Result<DaemonPaths, HomeNotFound> {
+        Ok(DaemonPaths {
+            config_file: paths::config_file()?,
+            lock_file: paths::lock_file()?,
+            request_dir: paths::request_dir()?,
+            journal_dir: paths::journal_dir()?,
+        })
+    }
+}
+
+/// Production entry point for `vard run`. Resolves paths, takes the
+/// single-instance lock, validates the config, initializes logging, then runs
+/// the async supervisor to completion. Returns the process exit code: `0` on a
+/// clean shutdown, `2` on any startup error (lock contention, missing or invalid
+/// config), matching spec §11's "0 healthy, 2 error" convention.
+pub(crate) fn run() -> ExitCode {
+    let paths = match DaemonPaths::from_xdg() {
+        Ok(paths) => paths,
+        Err(err) => {
+            eprintln!("vard: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Hold the lock for the daemon's whole lifetime; contention exits 2.
+    let lock = match InstanceLock::acquire_at(&paths.lock_file) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!("vard: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Validate the config up front so a missing/empty/invalid file exits 2 with
+    // a clear message, before any runtime is spun up.
+    let config = match load_startup_config(&paths) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+
+    init_tracing(config.daemon.log_level);
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("vard: could not start async runtime: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let result = runtime.block_on(async move {
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        install_signal_handlers(Arc::clone(&shutdown), Arc::clone(&reload));
+        run_daemon(paths, shutdown, reload, DEFAULT_POLL_INTERVAL).await
+    });
+
+    // Wind the runtime down, then release the instance lock explicitly so its
+    // ordering after shutdown is documented rather than incidental.
+    drop(runtime);
+    drop(lock);
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("vard: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Loads and validates the config for startup, mapping every failure to a clear
+/// stderr message and exit code 2. A missing file and an empty watch set are
+/// both "nothing to do" errors that point at the (later) `vard watch add`.
+fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
+    let config = match Config::load(&paths.config_file) {
+        Ok(config) => config,
+        Err(ConfigError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "vard: no config file at {}; there is nothing to watch yet. \
+                 Add a watch with `vard watch add` (landing in a later release).",
+                paths.config_file.display()
+            );
+            return Err(ExitCode::from(2));
+        }
+        Err(err) => {
+            eprintln!("vard: {err}");
+            return Err(ExitCode::from(2));
+        }
+    };
+
+    match config.resolve() {
+        Ok(specs) if specs.is_empty() => {
+            eprintln!(
+                "vard: config at {} defines no watches; \
+                 add one with `vard watch add` (landing in a later release).",
+                paths.config_file.display()
+            );
+            Err(ExitCode::from(2))
+        }
+        Ok(_) => Ok(config),
+        Err(err) => {
+            eprintln!("vard: {err}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Initializes stderr logging at the config's level. Best-effort: a second call
+/// in one process (e.g. across tests) is a no-op rather than a panic. The level
+/// is fixed for the process lifetime — a `log_level` change in the config takes
+/// effect on the next restart, not on reload, since the daemon does not arm a
+/// reloadable filter layer.
+fn init_tracing(level: LogLevel) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(log_level_to_tracing(level))
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
+/// Maps the config's [`LogLevel`] to a [`tracing::Level`].
+fn log_level_to_tracing(level: LogLevel) -> tracing::Level {
+    match level {
+        LogLevel::Error => tracing::Level::ERROR,
+        LogLevel::Warn => tracing::Level::WARN,
+        LogLevel::Info => tracing::Level::INFO,
+        LogLevel::Debug => tracing::Level::DEBUG,
+        LogLevel::Trace => tracing::Level::TRACE,
+    }
+}
+
+/// Spawns background tasks that translate OS signals into the supervisor's
+/// [`Notify`] handles: SIGINT/SIGTERM request shutdown, SIGHUP requests a
+/// reload. Each `notify_one` collapses into a single wakeup, which is exactly
+/// the debounce we want for a burst of SIGHUPs.
+fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                error!(error = %err, "could not install SIGINT handler");
+                return;
+            }
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                error!(error = %err, "could not install SIGTERM handler");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        shutdown.notify_one();
+    });
+
+    tokio::spawn(async move {
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(sig) => sig,
+            Err(err) => {
+                error!(error = %err, "could not install SIGHUP handler");
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            reload.notify_one();
+        }
+    });
+}
+
+/// The daemon's startup errors, surfaced to [`run`] as an exit-2 message. Bad
+/// edits are caught here (config load/resolve) before the engine is built.
+#[derive(Debug)]
+#[non_exhaustive]
+enum StartupError {
+    /// The config file could not be loaded or resolved.
+    Config(ConfigError),
+    /// The config resolved to no watches — nothing to run.
+    NoWatches,
+    /// The engine could not be built or started.
+    Engine(EngineError),
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupError::Config(err) => write!(f, "{err}"),
+            StartupError::NoWatches => f.write_str("config defines no watches"),
+            StartupError::Engine(err) => write!(f, "could not start engine: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StartupError::Config(err) => Some(err),
+            StartupError::Engine(err) => Some(err),
+            StartupError::NoWatches => None,
+        }
+    }
+}
+
+/// Runs the daemon: recovers stale locks, builds the initial engine, and
+/// supervises it until `shutdown` fires. Factored out of [`run`] so tests can
+/// drive it against injected paths with a cancellation `Notify` in place of a
+/// real SIGTERM. `reload` stands in for SIGHUP.
+async fn run_daemon(
+    paths: DaemonPaths,
+    shutdown: Arc<Notify>,
+    reload: Arc<Notify>,
+    poll_interval: Duration,
+) -> Result<(), StartupError> {
+    let config = Config::load(&paths.config_file).map_err(StartupError::Config)?;
+    let specs = config.resolve().map_err(StartupError::Config)?;
+    if specs.is_empty() {
+        return Err(StartupError::NoWatches);
+    }
+
+    recover_stale_locks(&paths, &specs);
+
+    let (handle, events, watch_names) = build_started_engine_from_specs(specs)
+        .await
+        .map_err(StartupError::Engine)?;
+
+    supervise(
+        paths,
+        handle,
+        events,
+        watch_names,
+        shutdown,
+        reload,
+        poll_interval,
+    )
+    .await;
+    Ok(())
+}
+
+/// Runs journal recovery for every watch, cleaning a provably stale git index
+/// lock left by a previous crash. Every non-`Clean` outcome is logged; nothing
+/// here can fail the daemon (recovery folds all trouble into its report).
+fn recover_stale_locks(paths: &DaemonPaths, specs: &[WatchSpec]) {
+    for spec in specs {
+        let journal = Journal::in_dir(&paths.journal_dir, spec.name());
+        let report = journal.recover(spec.path(), RecoveryOpts::new());
+        match report {
+            RecoveryReport::Clean => {}
+            RecoveryReport::LockRemoved { .. } => {
+                warn!(watch = spec.name(), report = %report, "recovered a stale git lock");
+            }
+            other => {
+                info!(watch = spec.name(), report = %other, "journal recovery");
+            }
+        }
+    }
+}
+
+/// Builds a git-backed engine from resolved specs, subscribes, and starts it.
+/// Returns the handle, a fresh event subscriber, and the ordered watch names
+/// (used to fan a `watch`-less snapshot request out to every watch).
+async fn build_started_engine_from_specs(
+    specs: Vec<WatchSpec>,
+) -> Result<(EngineHandle, EventReceiver, Vec<String>), EngineError> {
+    let watch_names: Vec<String> = specs.iter().map(|spec| spec.name().to_string()).collect();
+    let mut builder = Engine::builder();
+    for spec in specs {
+        builder = builder.watch(spec);
+    }
+    let engine = builder.build()?;
+    let events = engine.subscribe();
+    let handle = engine.start().await?;
+    Ok((handle, events, watch_names))
+}
+
+/// Loads the current config from disk and starts a fresh engine from it, for a
+/// reload or a source-died rebuild. Returns `None` (leaving the caller's current
+/// engine untouched) on any error, so a bad edit never takes a healthy daemon
+/// down.
+async fn build_started_engine(
+    paths: &DaemonPaths,
+) -> Option<(EngineHandle, EventReceiver, Vec<String>)> {
+    let config = match Config::load(&paths.config_file) {
+        Ok(config) => config,
+        Err(err) => {
+            error!(error = %err, "reload: could not load config; keeping current engine");
+            return None;
+        }
+    };
+    let specs = match config.resolve() {
+        Ok(specs) => specs,
+        Err(err) => {
+            error!(error = %err, "reload: could not resolve config; keeping current engine");
+            return None;
+        }
+    };
+    if specs.is_empty() {
+        error!("reload: config defines no watches; keeping current engine");
+        return None;
+    }
+    match build_started_engine_from_specs(specs).await {
+        Ok(started) => Some(started),
+        Err(err) => {
+            error!(error = %err, "reload: could not start new engine; keeping current engine");
+            None
+        }
+    }
+}
+
+/// Builds a fresh engine and, on success, drains the old one before swapping to
+/// it; on any failure it keeps the old engine. The new engine is started before
+/// the old is drained, so there is a brief window where both are armed — benign,
+/// since concurrent git commits serialize on the index lock — but it guarantees
+/// a valid `(handle, events)` at all times, honoring "keep the old engine on any
+/// reload error". Returns the (possibly unchanged) engine plus whether a rebuild
+/// actually happened.
+async fn try_rebuild(
+    paths: &DaemonPaths,
+    old_handle: EngineHandle,
+    mut old_events: EventReceiver,
+    old_names: Vec<String>,
+) -> (EngineHandle, EventReceiver, Vec<String>, bool) {
+    match build_started_engine(paths).await {
+        Some((handle, events, names)) => {
+            old_handle.shutdown().await;
+            drain_remaining_events(paths, &mut old_events);
+            (handle, events, names, true)
+        }
+        None => (old_handle, old_events, old_names, false),
+    }
+}
+
+/// Processes (logs + journals) every event still buffered on a receiver whose
+/// engine has fully shut down. `EngineHandle::shutdown` joins every task before
+/// emitting the final `DaemonStopped`, so once it returns the buffer holds the
+/// complete tail of the stream — draining it here guarantees each journal
+/// `begin` written earlier meets the outcome that completes it, instead of
+/// dangling because the supervisor stopped reading mid-bracket.
+fn drain_remaining_events(paths: &DaemonPaths, events: &mut EventReceiver) {
+    use vard_core::TryRecvError;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                log_event(&event);
+                journal_event(paths, &event);
+            }
+            Err(TryRecvError::Lagged(skipped)) => {
+                warn!(skipped, "event bus lagged during shutdown drain");
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+        }
+    }
+}
+
+/// What one turn of the supervisor loop decided to do next. Kept separate from
+/// the `select!` so the engine swap happens outside the branch that borrows the
+/// event receiver.
+enum Action {
+    /// Nothing to do; keep looping.
+    Continue,
+    /// Rebuild from the current config (a config edit or SIGHUP).
+    Reload,
+    /// The scheduled source-died backoff elapsed; rebuild now.
+    BackoffRebuild,
+    /// A watch's signal source died (or the bus closed); schedule a backed-off
+    /// rebuild.
+    EngineFailure,
+    /// Shut down gracefully.
+    Shutdown,
+}
+
+/// The supervisor loop: selects over the event bus, the shutdown/reload signals,
+/// the poll timer, and the source-died backoff timer, applying each turn's
+/// [`Action`] outside the select so the engine can be swapped without borrow
+/// conflicts.
+#[allow(clippy::too_many_arguments)]
+async fn supervise(
+    paths: DaemonPaths,
+    mut handle: EngineHandle,
+    mut events: EventReceiver,
+    mut watch_names: Vec<String>,
+    shutdown: Arc<Notify>,
+    reload: Arc<Notify>,
+    poll_interval: Duration,
+) {
+    let mut poll = tokio::time::interval(poll_interval);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut config_mtime = MtimeDebounce::new(file_mtime(&paths.config_file));
+    let mut backoff = SourceDiedBackoff::new();
+    // When set, a source-died rebuild is due at this deadline.
+    let mut rebuild_at: Option<TokioInstant> = None;
+
+    loop {
+        let action = tokio::select! {
+            _ = shutdown.notified() => Action::Shutdown,
+            _ = reload.notified() => {
+                info!("reload requested (SIGHUP)");
+                Action::Reload
+            }
+            _ = poll.tick() => {
+                process_requests(&paths, &handle, &watch_names);
+                if config_mtime.poll(file_mtime(&paths.config_file)) {
+                    info!("config file changed; reloading");
+                    Action::Reload
+                } else {
+                    Action::Continue
+                }
+            }
+            _ = tokio::time::sleep_until(rebuild_at.unwrap_or_else(TokioInstant::now)),
+                if rebuild_at.is_some() =>
+            {
+                Action::BackoffRebuild
+            }
+            received = events.recv() => handle_bus(received, &paths),
+        };
+
+        match action {
+            Action::Continue => {}
+            Action::Shutdown => break,
+            Action::Reload => {
+                let (new_handle, new_events, new_names, rebuilt) =
+                    try_rebuild(&paths, handle, events, watch_names).await;
+                handle = new_handle;
+                events = new_events;
+                watch_names = new_names;
+                if rebuilt {
+                    // A full rebuild supersedes any pending source-died retry.
+                    rebuild_at = None;
+                }
+            }
+            Action::BackoffRebuild => {
+                rebuild_at = None;
+                let (new_handle, new_events, new_names, rebuilt) =
+                    try_rebuild(&paths, handle, events, watch_names).await;
+                handle = new_handle;
+                events = new_events;
+                watch_names = new_names;
+                if !rebuilt {
+                    // The rebuild failed; keep retrying on a growing backoff so a
+                    // persistently broken engine is not hammered.
+                    let delay = backoff.on_failure(Instant::now());
+                    warn!(?delay, "source-died rebuild failed; retrying after backoff");
+                    rebuild_at = Some(TokioInstant::now() + delay);
+                }
+            }
+            Action::EngineFailure => {
+                if rebuild_at.is_none() {
+                    let delay = backoff.on_failure(Instant::now());
+                    warn!(
+                        ?delay,
+                        "watch signal source died; scheduling engine rebuild"
+                    );
+                    rebuild_at = Some(TokioInstant::now() + delay);
+                }
+            }
+        }
+    }
+
+    info!("shutting down");
+    handle.shutdown().await;
+    // The drain finishes any in-flight pass, so trailing events (including the
+    // final DaemonStopped) are logged and their journal brackets closed.
+    drain_remaining_events(&paths, &mut events);
+}
+
+/// Handles one item from the event bus: logs it, journals the commit window if
+/// applicable, and reports whether it signals engine failure (a dead signal
+/// source or a closed bus) that warrants a rebuild.
+fn handle_bus(received: Result<Event, RecvError>, paths: &DaemonPaths) -> Action {
+    match received {
+        Ok(event) => {
+            log_event(&event);
+            journal_event(paths, &event);
+            if is_source_died(&event) {
+                Action::EngineFailure
+            } else {
+                Action::Continue
+            }
+        }
+        Err(RecvError::Lagged(skipped)) => {
+            warn!(skipped, "event bus lagged; some events were dropped");
+            Action::Continue
+        }
+        Err(RecvError::Closed) => {
+            warn!("event bus closed unexpectedly; scheduling engine rebuild");
+            Action::EngineFailure
+        }
+    }
+}
+
+/// Whether an event reports a watch's signal source dying — the one condition a
+/// supervisor rebuilds for (the watch is otherwise permanently silent).
+fn is_source_died(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::WatchStateChanged {
+            trouble: Some(TroubleKind::SourceDied),
+            ..
+        }
+    )
+}
+
+/// Logs an event via tracing: `info` for snapshots and lifecycle, `warn` for
+/// failures and attention. Uses [`Event::name`] as a stable field so log
+/// consumers can key off the catalog string.
+fn log_event(event: &Event) {
+    let name = event.name();
+    match event {
+        Event::SnapshotStarted { watch, trigger } => {
+            // The pre-commit signal is high-rate (per sweep); keep it at debug.
+            debug!(event = name, %watch, %trigger, "snapshot starting");
+        }
+        Event::SnapshotCompleted {
+            watch,
+            snapshot,
+            files_changed,
+            trigger,
+        } => {
+            info!(event = name, %watch, %snapshot, files_changed, %trigger, "snapshot completed");
+        }
+        Event::SnapshotFailed {
+            watch,
+            trigger,
+            error,
+        } => {
+            warn!(event = name, %watch, %trigger, %error, "snapshot failed");
+        }
+        Event::SnapshotSkipped {
+            watch,
+            trigger,
+            reason,
+        } => {
+            // The no-commit closer of the started bracket; high-rate for clean
+            // sweeps (one follows every commit's re-check), so debug like the
+            // opener.
+            debug!(event = name, %watch, %trigger, %reason, "snapshot skipped");
+        }
+        Event::WatchStateChanged {
+            watch,
+            from,
+            to,
+            reason,
+            trouble,
+        } => {
+            let reason = reason.as_deref().unwrap_or("");
+            if trouble.is_some() || matches!(to, WatchState::Attention) {
+                warn!(event = name, %watch, %from, %to, ?trouble, reason, "watch needs attention");
+            } else {
+                info!(event = name, %watch, %from, %to, reason, "watch state changed");
+            }
+        }
+        Event::SyncPushed { watch } => info!(event = name, %watch, "pushed to remote"),
+        Event::SyncPulled {
+            watch,
+            prev_ref,
+            new_ref,
+        } => info!(event = name, %watch, %prev_ref, %new_ref, "pulled from remote"),
+        Event::SyncConflict { watch } => warn!(event = name, %watch, "sync conflict"),
+        Event::SyncResolved { watch, resolver } => {
+            info!(event = name, %watch, %resolver, "sync conflict resolved");
+        }
+        Event::SyncFailed { watch, error } => warn!(event = name, %watch, %error, "sync failed"),
+        Event::RestoreCompleted {
+            watch,
+            restored_to,
+            prev_ref,
+        } => info!(event = name, %watch, %restored_to, %prev_ref, "restore completed"),
+        Event::DaemonStarted => info!(event = name, "daemon started"),
+        Event::DaemonStopped => info!(event = name, "daemon stopped"),
+        Event::UpdateAvailable { version } => info!(event = name, %version, "update available"),
+        // `Event` is non_exhaustive; a new variant logs at info until handled.
+        _ => info!(event = name, "event"),
+    }
+}
+
+/// Brackets a snapshot's commit window in the per-watch journal: `begin` on the
+/// pre-commit [`Event::SnapshotStarted`], `complete` on the outcome that closes
+/// its bracket — [`Event::SnapshotCompleted`], [`Event::SnapshotFailed`], or
+/// [`Event::SnapshotSkipped`] (the engine guarantees exactly one of the three
+/// follows every started). Completing on skipped outcomes is what keeps the
+/// journal empty after a no-op sweep, so recovery's "no dangling begin means
+/// any git lock is foreign — never touch it" protection stays meaningful.
+/// Journal errors are logged and never propagated — a journaling hiccup must
+/// not crash the daemon or interrupt snapshotting.
+fn journal_event(paths: &DaemonPaths, event: &Event) {
+    match event {
+        Event::SnapshotStarted { watch, .. } => {
+            let journal = Journal::in_dir(&paths.journal_dir, watch);
+            if let Err(err) = journal.begin("snapshot") {
+                warn!(%watch, error = %err, "journal begin failed");
+            }
+        }
+        Event::SnapshotCompleted { watch, .. }
+        | Event::SnapshotFailed { watch, .. }
+        | Event::SnapshotSkipped { watch, .. } => {
+            let journal = Journal::in_dir(&paths.journal_dir, watch);
+            if let Err(err) = journal.complete() {
+                warn!(%watch, error = %err, "journal complete failed");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drains the request directory: parses each file, applies it, and deletes it —
+/// consumed or poison. A missing directory is not an error (the CLI creates it
+/// lazily). Read/parse failures are logged and the offending file removed so it
+/// cannot wedge the queue.
+fn process_requests(paths: &DaemonPaths, handle: &EngineHandle, watch_names: &[String]) {
+    let entries = match std::fs::read_dir(&paths.request_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            warn!(dir = %paths.request_dir.display(), error = %err, "could not read request dir");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse_request(&text) {
+                Ok(request) => apply_request(request, handle, watch_names),
+                Err(err) => {
+                    warn!(file = %path.display(), error = %err, "malformed request file; dropping");
+                }
+            },
+            Err(err) => {
+                warn!(file = %path.display(), error = %err, "could not read request file; dropping");
+            }
+        }
+        // Always remove the file — a consumed request or a poison one alike.
+        if let Err(err) = std::fs::remove_file(&path) {
+            warn!(file = %path.display(), error = %err, "could not delete request file");
+        }
+    }
+}
+
+/// Applies one parsed request: a snapshot injects a manual trigger (for the
+/// named watch, or every watch when unnamed); a sync is logged and dropped
+/// pending VRD-19.
+fn apply_request(request: Request, handle: &EngineHandle, watch_names: &[String]) {
+    match request.kind {
+        RequestKind::Snapshot => match request.watch {
+            Some(watch) => {
+                if handle.trigger(&watch) {
+                    info!(%watch, "manual snapshot requested");
+                } else {
+                    warn!(%watch, "snapshot requested for an unknown watch; ignoring");
+                }
+            }
+            None => {
+                for watch in watch_names {
+                    handle.trigger(watch);
+                }
+                info!(
+                    count = watch_names.len(),
+                    "manual snapshot requested for all watches"
+                );
+            }
+        },
+        RequestKind::Sync => {
+            info!("sync requested but not yet implemented (VRD-19); dropping");
+        }
+    }
+}
+
+/// A parsed request file (see the [module docs](self) for the contract).
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    /// The operation requested.
+    kind: RequestKind,
+    /// The target watch; `None` means every watch.
+    #[serde(default)]
+    watch: Option<String>,
+}
+
+/// The operations a request file can name.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum RequestKind {
+    /// Take a snapshot now.
+    Snapshot,
+    /// Sync with the remote (not yet implemented).
+    Sync,
+}
+
+/// Parses a request file's TOML text, returning a human-readable error string on
+/// any malformation (missing/unknown `kind`, unknown fields, or invalid TOML) so
+/// the poison file can be logged and dropped.
+fn parse_request(text: &str) -> Result<Request, String> {
+    toml::from_str(text).map_err(|err| err.to_string())
+}
+
+/// Reads a file's modification time, or `None` if it is missing or unreadable.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// A one-cycle debounce over a file's mtime: it reports a change only once the
+/// mtime has held steady at a new value across two consecutive polls, so a burst
+/// of writes (an editor saving repeatedly) collapses into a single settled
+/// signal rather than a rebuild per write.
+struct MtimeDebounce {
+    /// The last mtime we reported as settled.
+    stable: Option<SystemTime>,
+    /// A new mtime seen once, awaiting a second confirming poll.
+    pending: Option<SystemTime>,
+}
+
+impl MtimeDebounce {
+    /// Starts from an initial (settled) mtime.
+    fn new(initial: Option<SystemTime>) -> MtimeDebounce {
+        MtimeDebounce {
+            stable: initial,
+            pending: None,
+        }
+    }
+
+    /// Feeds the current mtime; returns `true` exactly when a settled change is
+    /// detected (a new value seen on two consecutive polls).
+    fn poll(&mut self, current: Option<SystemTime>) -> bool {
+        if current == self.stable {
+            // Back to (or still at) the settled value: cancel any pending change.
+            self.pending = None;
+            false
+        } else if self.pending == current {
+            // The same new value on a second poll: settle it.
+            self.stable = current;
+            self.pending = None;
+            true
+        } else {
+            // First sighting of a new value: wait one more poll to confirm.
+            self.pending = current;
+            false
+        }
+    }
+}
+
+/// Exponential backoff for source-died rebuilds: doubles from a base toward a
+/// cap on repeated quick failures, resetting to the base after a healthy period.
+struct SourceDiedBackoff {
+    base: Duration,
+    cap: Duration,
+    reset_after: Duration,
+    /// The delay the next failure will use.
+    next: Duration,
+    /// When the previous failure occurred, to detect a healthy gap.
+    last_failure: Option<Instant>,
+}
+
+impl SourceDiedBackoff {
+    /// A backoff with the module's default base/cap/reset constants.
+    fn new() -> SourceDiedBackoff {
+        SourceDiedBackoff {
+            base: SOURCE_DIED_BACKOFF_BASE,
+            cap: SOURCE_DIED_BACKOFF_CAP,
+            reset_after: SOURCE_DIED_BACKOFF_RESET_AFTER,
+            next: SOURCE_DIED_BACKOFF_BASE,
+            last_failure: None,
+        }
+    }
+
+    /// Advances the backoff for a failure at `now`, returning the delay to wait
+    /// before rebuilding. Resets to the base when the previous failure was more
+    /// than `reset_after` ago (the engine had recovered), otherwise doubles
+    /// toward the cap.
+    fn on_failure(&mut self, now: Instant) -> Duration {
+        let within_window = self
+            .last_failure
+            .is_some_and(|prev| now.duration_since(prev) < self.reset_after);
+        self.next = if within_window {
+            (self.next * 2).min(self.cap)
+        } else {
+            self.base
+        };
+        self.last_failure = Some(now);
+        self.next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- request-file parsing ------------------------------------------------
+
+    #[test]
+    fn parses_a_snapshot_request_with_a_watch() {
+        let req = parse_request("kind = \"snapshot\"\nwatch = \"vault\"\n").unwrap();
+        assert_eq!(
+            req,
+            Request {
+                kind: RequestKind::Snapshot,
+                watch: Some("vault".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_snapshot_request_without_a_watch() {
+        let req = parse_request("kind = \"snapshot\"\n").unwrap();
+        assert_eq!(req.kind, RequestKind::Snapshot);
+        assert_eq!(req.watch, None, "an absent watch fans out to all watches");
+    }
+
+    #[test]
+    fn parses_a_sync_request() {
+        let req = parse_request("kind = \"sync\"\n").unwrap();
+        assert_eq!(req.kind, RequestKind::Sync);
+    }
+
+    #[test]
+    fn missing_kind_is_an_error() {
+        let err = parse_request("watch = \"vault\"\n").unwrap_err();
+        assert!(
+            err.contains("kind"),
+            "error should name the missing key: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_kind_is_an_error() {
+        assert!(parse_request("kind = \"restore\"\n").is_err());
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        // A poison file with a stray key must be rejected, not silently accepted.
+        assert!(parse_request("kind = \"snapshot\"\nwhen = \"now\"\n").is_err());
+    }
+
+    #[test]
+    fn invalid_toml_is_an_error_not_a_panic() {
+        assert!(parse_request("this is not toml = = =").is_err());
+    }
+
+    // --- log level mapping ---------------------------------------------------
+
+    #[test]
+    fn log_level_maps_to_tracing_level() {
+        assert_eq!(log_level_to_tracing(LogLevel::Error), tracing::Level::ERROR);
+        assert_eq!(log_level_to_tracing(LogLevel::Warn), tracing::Level::WARN);
+        assert_eq!(log_level_to_tracing(LogLevel::Info), tracing::Level::INFO);
+        assert_eq!(log_level_to_tracing(LogLevel::Debug), tracing::Level::DEBUG);
+        assert_eq!(log_level_to_tracing(LogLevel::Trace), tracing::Level::TRACE);
+    }
+
+    // --- mtime debounce ------------------------------------------------------
+
+    #[test]
+    fn mtime_debounce_needs_two_stable_polls_to_fire() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(1);
+        let mut d = MtimeDebounce::new(Some(t0));
+
+        // No change: never fires.
+        assert!(!d.poll(Some(t0)));
+        // First sighting of the new value: still debouncing.
+        assert!(!d.poll(Some(t1)));
+        // Second, confirming poll at the same value: fires once.
+        assert!(d.poll(Some(t1)));
+        // Settled; no re-fire without a further change.
+        assert!(!d.poll(Some(t1)));
+    }
+
+    #[test]
+    fn mtime_debounce_cancels_a_reverted_change() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(1);
+        let mut d = MtimeDebounce::new(Some(t0));
+
+        // A flicker to t1 then back to t0 before confirming: no fire.
+        assert!(!d.poll(Some(t1)));
+        assert!(!d.poll(Some(t0)));
+        assert!(!d.poll(Some(t0)));
+    }
+
+    // --- source-died backoff -------------------------------------------------
+
+    #[test]
+    fn backoff_starts_at_base_and_doubles_within_the_window() {
+        let mut b = SourceDiedBackoff::new();
+        let t = Instant::now();
+        assert_eq!(b.on_failure(t), SOURCE_DIED_BACKOFF_BASE);
+        // A quick second failure doubles.
+        assert_eq!(
+            b.on_failure(t + Duration::from_secs(1)),
+            SOURCE_DIED_BACKOFF_BASE * 2
+        );
+        assert_eq!(
+            b.on_failure(t + Duration::from_secs(2)),
+            SOURCE_DIED_BACKOFF_BASE * 4
+        );
+    }
+
+    #[test]
+    fn backoff_resets_after_a_healthy_gap() {
+        let mut b = SourceDiedBackoff::new();
+        let t = Instant::now();
+        b.on_failure(t);
+        b.on_failure(t + Duration::from_secs(1)); // now at base*2
+        // A failure well past the reset window starts over at the base.
+        let healthy = t + SOURCE_DIED_BACKOFF_RESET_AFTER + Duration::from_secs(5);
+        assert_eq!(b.on_failure(healthy), SOURCE_DIED_BACKOFF_BASE);
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        let mut b = SourceDiedBackoff::new();
+        let mut t = Instant::now();
+        let mut last = Duration::ZERO;
+        for _ in 0..100 {
+            last = b.on_failure(t);
+            t += Duration::from_secs(1);
+        }
+        assert_eq!(
+            last, SOURCE_DIED_BACKOFF_CAP,
+            "backoff must saturate at the cap"
+        );
+    }
+
+    // --- end-to-end smoke ----------------------------------------------------
+
+    /// Runs a raw git command in `dir`, asserting success.
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Number of commits on HEAD.
+    fn commit_count(repo: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("failed to spawn git");
+        if !out.status.success() {
+            return 0;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// The full commit message of HEAD.
+    fn head_message(repo: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(repo)
+            .output()
+            .expect("failed to spawn git");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// Initializes a git repo ready to commit into, with one root commit.
+    fn init_repo(repo: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        git_ok(repo, &["init", "-b", "main"]);
+        git_ok(repo, &["config", "user.email", "vard-test@example.com"]);
+        git_ok(repo, &["config", "user.name", "Vard Test"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["commit", "--allow-empty", "-m", "root"]);
+        assert_eq!(commit_count(repo), 1);
+    }
+
+    /// Polls until `repo` has at least `at_least` commits, occasionally
+    /// re-touching `touch` so an events watch fires even if the first write raced
+    /// the watcher arming. The re-touch is sparse (every ~3s, never faster than
+    /// the quiesce window) so the watch's quiescence can settle in the quiet gaps
+    /// rather than being reset on every poll. `touch` is `None` for a watch
+    /// driven by an explicit trigger (interval/manual). Generous budget for CI
+    /// jitter.
+    async fn wait_for_commits(repo: &Path, at_least: usize, touch: Option<&Path>) {
+        for i in 0..400 {
+            if commit_count(repo) >= at_least {
+                return;
+            }
+            if let (Some(path), true) = (touch, i % 30 == 0) {
+                let _ = std::fs::write(path, format!("poke {i}"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "repo never reached {at_least} commits (stuck at {})",
+            commit_count(repo)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_snapshots_writes_and_manual_requests_then_shuts_down() {
+        let root = tempfile::tempdir().unwrap();
+        // Two watches on two repos, so the event and manual paths never race:
+        // `auto` is events-driven (a write snapshots itself); `manual` is
+        // interval-only with a huge interval (no filesystem watcher, no auto
+        // snapshot), so only an injected request commits it.
+        let auto = root.path().join("auto");
+        let manual = root.path().join("manual");
+        init_repo(&auto);
+        init_repo(&manual);
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"auto\"\npath = {auto:?}\ntrigger = \"events\"\nquiesce = \"500ms\"\n\n\
+                 [[watch]]\nname = \"manual\"\npath = {manual:?}\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            ),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // A write to the events watch snapshots itself through the whole
+        // pipeline. Re-touching removes any watcher-arm race.
+        let auto_note = auto.join("note.md");
+        std::fs::write(&auto_note, b"first note").unwrap();
+        wait_for_commits(&auto, 2, Some(&auto_note)).await;
+        assert!(
+            head_message(&auto).contains("Vard-Trigger: event"),
+            "the automatic snapshot must be event-triggered, got:\n{}",
+            head_message(&auto)
+        );
+
+        // Make the interval-only watch dirty (no watcher, so nothing auto-fires)
+        // and drop a manual snapshot request for it: only the request commits it.
+        std::fs::write(manual.join("note.md"), b"manual note").unwrap();
+        std::fs::write(
+            paths.request_dir.join("req-1.toml"),
+            "kind = \"snapshot\"\nwatch = \"manual\"\n",
+        )
+        .unwrap();
+        wait_for_commits(&manual, 2, None).await;
+        assert!(
+            head_message(&manual).contains("Vard-Trigger: manual"),
+            "the requested snapshot must be manual-triggered, got:\n{}",
+            head_message(&manual)
+        );
+
+        // The consumed request file is deleted.
+        for _ in 0..50 {
+            if !paths.request_dir.join("req-1.toml").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !paths.request_dir.join("req-1.toml").exists(),
+            "a consumed request file must be deleted"
+        );
+
+        // A SIGTERM-equivalent shutdown drives a clean exit.
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+
+        // After a clean shutdown no journal holds a dangling begin: every
+        // snapshot.started bracket was closed by its outcome, so each watch's
+        // journal is compacted to empty (or was never written). A dangling
+        // begin here would degrade recovery's foreign-lock protection on the
+        // next start — the exact defect the skipped outcome exists to prevent.
+        for watch in ["auto", "manual"] {
+            let journal_path = Journal::in_dir(&paths.journal_dir, watch);
+            let len = std::fs::metadata(journal_path.path())
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            assert_eq!(
+                len, 0,
+                "watch {watch:?} journal must hold no dangling begin after a clean shutdown"
+            );
+        }
+    }
+}

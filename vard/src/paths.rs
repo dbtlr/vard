@@ -36,11 +36,15 @@ pub fn state_dir() -> Result<PathBuf, HomeNotFound> {
 
 /// `$XDG_DATA_HOME/vard`, default `~/.local/share/vard` — update staging,
 /// metadata.
+// Consumed by the self-update flow (VRD-17); resolved and tested here now.
+#[allow(dead_code)]
 pub fn data_dir() -> Result<PathBuf, HomeNotFound> {
     xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
 /// `<state_dir>/logs` — vard's own rotated logfile.
+// Consumed when file-based log rotation lands; resolved and tested here now.
+#[allow(dead_code)]
 pub fn log_dir() -> Result<PathBuf, HomeNotFound> {
     Ok(state_dir()?.join("logs"))
 }
