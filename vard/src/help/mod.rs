@@ -110,11 +110,39 @@ fn handle_help_subcommand(root: &clap::Command, args: &[String], color: ColorWhe
         return None;
     }
 
-    // Remaining operands form the topic path (e.g. `help run`).
+    match resolve_help_topic(root, iter) {
+        Ok((topic, path)) => {
+            let model = build_model(topic, root, &path, HelpForm::Long);
+            Some(emit(HelpForm::Long, &model, color))
+        }
+        Err(unknown) => {
+            eprintln!("{BIN_NAME}: unrecognized help topic '{unknown}'");
+            Some(2)
+        }
+    }
+}
+
+/// Resolve the operands after a `help` token into the command they name and
+/// its rendered path, skipping flags and their values just like the
+/// first-operand scan in [`handle_help_subcommand`]. Returns the unknown
+/// token on failure.
+fn resolve_help_topic<'a, I>(
+    root: &'a clap::Command,
+    mut iter: I,
+) -> Result<(&'a clap::Command, String), String>
+where
+    I: Iterator<Item = &'a String>,
+{
     let mut current = root;
     let mut path = BIN_NAME.to_string();
-    for t in iter {
-        if t == "--" || is_flag(t) {
+    while let Some(t) = iter.next() {
+        if t == "--" {
+            continue;
+        }
+        if is_flag(t) {
+            if !t.contains('=') && flag_takes_value(current, root, t) {
+                iter.next();
+            }
             continue;
         }
         match current
@@ -125,14 +153,10 @@ fn handle_help_subcommand(root: &clap::Command, args: &[String], color: ColorWhe
                 path = format!("{path} {t}");
                 current = child;
             }
-            None => {
-                eprintln!("{BIN_NAME}: unrecognized help topic '{t}'");
-                return Some(2);
-            }
+            None => return Err(t.clone()),
         }
     }
-    let model = build_model(current, root, &path, HelpForm::Long);
-    Some(emit(HelpForm::Long, &model, color))
+    Ok((current, path))
 }
 
 /// Render short help for the root command (`vard` with no args and no help
@@ -381,6 +405,24 @@ mod tests {
             Err(()),
             "an invalid --color value must defer to clap, not coerce to Auto"
         );
+    }
+
+    #[test]
+    fn help_topic_skips_value_taking_flag_values() {
+        // `vard help run --color never`: `never` is --color's value, not a topic.
+        let root = Cli::command();
+        let args = argv(&["run", "--color", "never"]);
+        let (topic, path) = resolve_help_topic(&root, args.iter())
+            .expect("--color's value must not be read as a help topic");
+        assert_eq!(topic.get_name(), "run");
+        assert_eq!(path, format!("{BIN_NAME} run"));
+    }
+
+    #[test]
+    fn help_topic_rejects_unknown_operand() {
+        let root = Cli::command();
+        let args = argv(&["nope"]);
+        assert_eq!(resolve_help_topic(&root, args.iter()).unwrap_err(), "nope");
     }
 
     #[test]
