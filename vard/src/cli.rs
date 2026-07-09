@@ -91,10 +91,11 @@ pub struct Cli {
 pub enum Command {
     /// Run the vard daemon in the foreground: watch every configured directory
     /// and snapshot it into version control until stopped.
-    ///
-    /// Holds the single-instance lock for the state directory, so only one
-    /// daemon runs at a time. Reloads on SIGHUP or a change to the config file,
-    /// and shuts down cleanly on SIGINT or SIGTERM.
+    //
+    // The lifecycle prose lives in `long_about` below — the single authoritative
+    // source. A doc-comment paragraph here would be discarded by clap (an
+    // explicit `long_about` wins), so only the first line (the `about`) is a
+    // `///` comment.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
 Run the vard daemon in the foreground until stopped.
@@ -102,12 +103,13 @@ Run the vard daemon in the foreground until stopped.
 The daemon acquires the single-instance lock for its state directory (so only \
 one vard owns a directory tree at a time), loads the file config into watch \
 specs, recovers any stale version-control locks left by a previous crash, then \
-watches every configured directory and snapshots changes into version control.
+watches every configured directory and snapshots changes into version control. \
+A second daemon contending for the same state directory exits with status 2.
 
 It stays attached to the terminal and logs each event to stderr. It reloads on \
-SIGHUP or when the config file changes on disk, and shuts down cleanly on \
-SIGINT or SIGTERM. A second daemon contending for the same state directory \
-exits with status 2.")]
+SIGHUP or when the config file changes on disk, rebuilds a watch whose event \
+source dies (with exponential backoff), and shuts down cleanly on SIGINT or \
+SIGTERM.")]
     Run,
 }
 
