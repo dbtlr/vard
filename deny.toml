@@ -15,6 +15,12 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
+    # notify (the filesystem-watch backend) is dedicated to the public domain
+    # under CC0-1.0 — a permissive dedication compatible with an MIT project.
+    "CC0-1.0",
+    # inotify / inotify-sys (notify's Linux backend, compiled only on Linux)
+    # are ISC-licensed, a simple permissive license in the MIT family.
+    "ISC",
 ]
 
 [bans]

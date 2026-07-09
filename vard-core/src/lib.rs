@@ -17,6 +17,7 @@
 pub mod config;
 pub mod event;
 pub mod vcs;
+pub mod watcher;
 
 pub use config::{
     ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SYNC,
@@ -32,4 +33,8 @@ pub use vcs::{
     ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
     RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, UnsafeReason,
     VcsBackend, VcsError, VcsRef,
+};
+pub use watcher::{
+    Activity, ArmMode, DEFAULT_POLL_INTERVAL, MuteGuard, WatchHandle, Watcher, WatcherError,
+    WatcherRx,
 };

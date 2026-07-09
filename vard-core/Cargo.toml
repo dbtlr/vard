@@ -8,10 +8,19 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
+# The watcher needs `rt` (spawn one quiescence task per armed watch on the
+# ambient runtime) and `time` (per-watch quiescence deadlines) on top of the
+# `sync` channels the rest of the crate uses. `macros` is deliberately NOT
+# enabled here: the quiescence loop uses `tokio::time::timeout` rather than
+# `select!`, so the macro feature stays dev-only (for `#[tokio::test]`).
+tokio = { workspace = true, features = ["rt", "time"] }
+notify = { workspace = true }
+ignore = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "sync"] }
-# Real git repositories in tempdirs back the vcs backend's integration tests.
-# Dev-only: the crate's non-dev dependency tree stays tokio-only.
+# `macros` + `test-util` drive the watcher's deterministic tests: paused-time
+# (`start_paused`) quiescence tests and `#[tokio::test]` real-FS tests.
+tokio = { workspace = true, features = ["rt", "macros", "sync", "test-util"] }
+# Real git repositories and watched directories in tempdirs back the vcs
+# backend's and watcher's integration tests.
 tempfile = "3"
