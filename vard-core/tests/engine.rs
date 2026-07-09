@@ -7,9 +7,13 @@
 //! [`Engine::start`](vard_core::Engine::start) actually arms the platform
 //! watcher, spawns per-watch workers, and turns a real filesystem write into a
 //! [`Event::SnapshotCompleted`] — and that two watches make progress
-//! independently. They use a fake [`VcsBackend`] (so no git is required) with
-//! generous timeouts, in the style of `tests/watcher.rs`.
+//! independently. Most use a fake [`VcsBackend`] (so no git is required); one
+//! exercises a real [`GitBackend`](vard_core::GitBackend) end to end to prove
+//! self-suppression (vard's own commit does not loop). Generous timeouts keep
+//! them robust, in the style of `tests/watcher.rs`.
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -194,4 +198,89 @@ async fn two_watches_make_progress_independently() {
 
     assert_eq!(backend_a.committed.load(Ordering::SeqCst), 1);
     assert_eq!(backend_b.committed.load(Ordering::SeqCst), 1);
+}
+
+/// Runs a git command in `dir`, asserting success.
+fn git_ok(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("failed to spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Asserts no [`Event::SnapshotCompleted`] for `watch` arrives within `window`.
+async fn assert_no_snapshot(events: &mut EventReceiver, watch: &str, window: Duration) {
+    let result = timeout(window, async {
+        loop {
+            match events.recv().await {
+                Ok(Event::SnapshotCompleted { watch: w, .. }) if w == watch => {
+                    panic!(
+                        "watch {w:?} took an unexpected second snapshot (self-suppression failed)"
+                    )
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("event channel error: {e:?}"),
+            }
+        }
+    })
+    .await;
+    // Timing out is the success case: no snapshot fired in the window.
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn vards_own_commit_does_not_retrigger_a_snapshot() {
+    // A real git repository proves self-suppression end to end: after the
+    // snapshot commits, the writes it makes under `.git/` (and the muted window)
+    // must not feed back as fresh activity and loop.
+    let dir = tempfile::tempdir().unwrap();
+    git_ok(dir.path(), &["init", "-b", "main"]);
+    git_ok(
+        dir.path(),
+        &["config", "user.email", "vard-test@example.com"],
+    );
+    git_ok(dir.path(), &["config", "user.name", "Vard Test"]);
+    git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+
+    let spec = WatchSpec::builder("repo", dir.path())
+        .trigger(TriggerMode::Events)
+        .branch("main")
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+
+    // `watch` (not `watch_with_backend`) opens a real GitBackend at build time.
+    let engine = Engine::builder().watch(spec).build().unwrap();
+    let mut events = engine.subscribe();
+    engine.start().await.unwrap();
+
+    std::fs::write(dir.path().join("notes.md"), b"hello vard").unwrap();
+    expect_completed(&mut events, "repo").await;
+
+    // No second snapshot: vard's own commit is self-suppressed.
+    assert_no_snapshot(&mut events, "repo", Duration::from_millis(1500)).await;
+
+    // The commit really landed, tagged with its trigger trailer.
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["log", "--format=%s%n%(trailers:key=Vard-Trigger)"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log.contains("snapshot:"),
+        "expected a snapshot commit: {log}"
+    );
+    assert!(
+        log.contains("Vard-Trigger: event"),
+        "expected trailer: {log}"
+    );
 }
