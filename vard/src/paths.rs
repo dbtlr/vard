@@ -45,6 +45,23 @@ pub fn log_dir() -> Result<PathBuf, HomeNotFound> {
     Ok(state_dir()?.join("logs"))
 }
 
+/// `<state_dir>/vard.lock` — the flock target that enforces a single daemon
+/// instance per state directory.
+pub fn lock_file() -> Result<PathBuf, HomeNotFound> {
+    Ok(state_dir()?.join("vard.lock"))
+}
+
+/// `<state_dir>/requests` — the request-file queue the CLI drops into and the
+/// daemon drains.
+pub fn request_dir() -> Result<PathBuf, HomeNotFound> {
+    Ok(state_dir()?.join("requests"))
+}
+
+/// `<state_dir>/journal` — per-watch operation journals.
+pub fn journal_dir() -> Result<PathBuf, HomeNotFound> {
+    Ok(state_dir()?.join("journal"))
+}
+
 fn xdg_dir(var: &str, default_rel: &str) -> Result<PathBuf, HomeNotFound> {
     resolve(env::var_os(var), home().as_deref(), default_rel).ok_or(HomeNotFound)
 }
