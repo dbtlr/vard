@@ -560,6 +560,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "thread_local"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -703,6 +713,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vard"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "clap",
  "clap_complete",
  "clap_complete_nushell",
@@ -710,6 +721,7 @@ dependencies = [
  "rustix",
  "serde",
  "tempfile",
+ "terminal_size",
  "tokio",
  "toml",
  "tracing",

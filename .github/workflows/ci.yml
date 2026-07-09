@@ -71,15 +71,8 @@ jobs:
       - name: vard --version
         run: ./target/release/vard --version
 
-      - name: vard --help
-        run: ./target/release/vard --help
-
-      # build.rs generates these on every build profile; the release build
-      # above has already run it for this job's target dir.
-      - name: completions + manpage artifacts exist and are non-empty
-        run: |
-          test -s target/completions/vard.bash
-          test -s target/completions/_vard
-          test -s target/completions/vard.fish
-          test -s target/completions/vard.nu
-          test -s target/man/vard.1
+      # Binary + artifact smoke assertions live in scripts/ci-smoke.sh so the
+      # exact same checks run locally before a push — CI and local gates share
+      # one source and cannot drift.
+      - name: binary + artifact smokes (scripts/ci-smoke.sh)
+        run: scripts/ci-smoke.sh

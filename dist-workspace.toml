@@ -14,6 +14,9 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-d
 # Whether to install an updater program
 install-updater = false
 # Extra static files to include in each App (path relative to the workspace root)
-include = ["target/completions/vard.bash", "target/completions/_vard", "target/completions/vard.fish", "target/completions/vard.nu", "target/man/vard.1"]
+# One manpage per (sub)command; keep this list in sync with the subcommands.
+# The `dist_manpages` test in the vard crate fails if a generated page is
+# missing here.
+include = ["target/completions/vard.bash", "target/completions/_vard", "target/completions/vard.fish", "target/completions/vard.nu", "target/man/vard.1", "target/man/vard-run.1"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
