@@ -30,5 +30,6 @@ pub use event::{
 pub use vcs::git::GitBackend;
 pub use vcs::{
     ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
-    RestoreTarget, SafeState, Snapshot, SnapshotId, UnsafeReason, VcsBackend, VcsError, VcsRef,
+    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, UnsafeReason,
+    VcsBackend, VcsError, VcsRef,
 };
