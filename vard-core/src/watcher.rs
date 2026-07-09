@@ -57,9 +57,10 @@
 //! root invalidated, an I/O failure inside the backend) is forwarded as
 //! [`WatcherSignal::Trouble`] and conservatively counted as activity — an
 //! error may hide changes. A quiescence task that dies abnormally is likewise
-//! reported as `Trouble` by a supervisor, so a watch can never silently turn
-//! into a zombie that looks armed but reports nothing. Consumers route
-//! `Trouble` to the watch's attention state.
+//! reported as `Trouble` by a supervisor. Trouble travels the same channel as
+//! `Activity`, so these reports reach the consumer only while it keeps its
+//! [`WatcherRx`] alive — receiver lifetime is the host's concern. Consumers
+//! route `Trouble` to the watch's attention state.
 //!
 //! # Native events with polling fallback
 //!
@@ -477,7 +478,8 @@ fn surface_overflow(
 }
 
 /// Watches the quiescence task and reports an abnormal end as
-/// [`WatcherSignal::Trouble`], so a watch can never die silently. A
+/// [`WatcherSignal::Trouble`], so an abnormal death is surfaced rather than
+/// silent — for as long as the consumer holds its [`WatcherRx`]. A
 /// deliberate abort (disarm) is not abnormal and reports nothing.
 fn supervise(
     watch: String,
@@ -503,8 +505,8 @@ fn supervise(
 /// the watcher runs. Every armed watch feeds the single [`WatcherRx`] returned
 /// alongside the watcher.
 ///
-/// The watcher is cheap to clone-by-handle: [`arm`](Watcher::arm) takes
-/// `&self`, so one `Watcher` value serves the whole process.
+/// [`arm`](Watcher::arm) takes `&self`, so one `Watcher` value serves the
+/// whole process.
 pub struct Watcher {
     signal_tx: mpsc::UnboundedSender<WatcherSignal>,
 }

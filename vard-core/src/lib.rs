@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod event;
+pub mod scheduler;
 pub mod vcs;
 pub mod watcher;
 
@@ -28,6 +29,7 @@ pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
     WatchState,
 };
+pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
 pub use vcs::git::GitBackend;
 pub use vcs::{
     ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
