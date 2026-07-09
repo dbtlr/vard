@@ -23,8 +23,15 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+
+    // Fallback: if a help flag survived interception (it normally does not),
+    // render help rather than silently starting the daemon.
+    if let Some(code) = help::render_parsed_help(&cli) {
+        return ExitCode::from(code as u8);
+    }
+
     match cli.command {
         Some(Command::Run) => daemon::run(),
-        None => ExitCode::from(help::print_root_short() as u8),
+        None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }

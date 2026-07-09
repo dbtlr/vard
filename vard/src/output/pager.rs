@@ -8,13 +8,19 @@ use std::process::{Command, Stdio};
 
 /// Whether output should be paged: only on a TTY, only when not suppressed, and
 /// only when the buffer is taller than the terminal (minus a two-line margin).
-pub fn should_page(buffer_line_count: usize, no_pager: bool, stdout_is_tty: bool) -> bool {
+///
+/// `term_height` is resolved once by the caller (alongside the TTY check) and
+/// threaded in, so a single terminal query serves palette resolution, paging,
+/// and rendering.
+pub fn should_page(
+    buffer_line_count: usize,
+    no_pager: bool,
+    stdout_is_tty: bool,
+    term_height: usize,
+) -> bool {
     if no_pager || !stdout_is_tty {
         return false;
     }
-    let term_height = terminal_size::terminal_size()
-        .map(|(_, h)| h.0 as usize)
-        .unwrap_or(24);
     buffer_line_count > term_height.saturating_sub(2)
 }
 
@@ -68,16 +74,21 @@ mod tests {
 
     #[test]
     fn no_pager_flag_disables() {
-        assert!(!should_page(1000, true, true));
+        assert!(!should_page(1000, true, true, 24));
     }
 
     #[test]
     fn non_tty_disables() {
-        assert!(!should_page(1000, false, false));
+        assert!(!should_page(1000, false, false, 24));
     }
 
     #[test]
     fn short_output_skips_pager() {
-        assert!(!should_page(5, false, true));
+        assert!(!should_page(5, false, true, 24));
+    }
+
+    #[test]
+    fn tall_output_pages() {
+        assert!(should_page(1000, false, true, 24));
     }
 }

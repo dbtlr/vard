@@ -106,10 +106,21 @@ impl Palette {
 ///
 /// Reads `NO_COLOR` and `CLICOLOR_FORCE` from the environment and detects
 /// whether stdout is a TTY, then delegates to [`resolve_inner`].
+/// Convenience wrapper that queries the terminal itself. The help emitter uses
+/// [`resolve_with_tty`] to avoid a second isatty probe; the record/list commands
+/// (VRD-15+) are the intended callers here, so it is `allow`ed until they land.
+#[allow(dead_code)]
 pub fn resolve(when: ColorWhen) -> Palette {
+    let is_tty = std::io::stdout().is_terminal();
+    resolve_with_tty(when, is_tty)
+}
+
+/// Like [`resolve`], but takes a pre-resolved `is_tty` so a caller that has
+/// already queried the terminal once (e.g. the help emitter) does not probe it
+/// again.
+pub fn resolve_with_tty(when: ColorWhen, is_tty: bool) -> Palette {
     let no_color = env::var_os("NO_COLOR").is_some();
     let force = env::var_os("CLICOLOR_FORCE").is_some();
-    let is_tty = std::io::stdout().is_terminal();
     resolve_inner(when, no_color, force, is_tty)
 }
 
