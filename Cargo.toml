@@ -24,6 +24,11 @@ ignore = "0.4"
 # TOML. See VRD-9.
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# Advisory `flock` single-instance locking and `kill(pid, 0)` liveness probes
+# for stale-lock recovery back the daemon shell (vard only). `fs` supplies
+# `flock`; `process` supplies `test_kill_process`/`Pid`. Kept default-features
+# off to stay dependency-light.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"

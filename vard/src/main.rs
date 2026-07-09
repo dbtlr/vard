@@ -8,6 +8,13 @@ mod cli;
 // when its consuming command lands.
 #[allow(dead_code)]
 mod config;
+// The single-instance lock and per-watch operation journal (VRD-14 B2). Built
+// and tested here; `vard run` wires them into startup in B3. Same dead-code
+// allow as config/paths until their consuming command lands.
+#[allow(dead_code)]
+mod instance;
+#[allow(dead_code)]
+mod journal;
 #[allow(dead_code)]
 mod paths;
 

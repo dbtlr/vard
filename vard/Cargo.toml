@@ -19,6 +19,12 @@ vard-core = { path = "../vard-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+rustix = { workspace = true }
+
+[dev-dependencies]
+# Tempdir-isolated tests for the instance lock and operation journal; mirrors
+# vard-core's dev-dependency.
+tempfile = "3"
 
 [build-dependencies]
 clap = { workspace = true }

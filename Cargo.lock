@@ -591,7 +591,9 @@ dependencies = [
  "clap_complete",
  "clap_complete_nushell",
  "clap_mangen",
+ "rustix",
  "serde",
+ "tempfile",
  "toml",
  "vard-core",
 ]
