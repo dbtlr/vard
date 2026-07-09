@@ -258,9 +258,10 @@ fn log_level_to_tracing(level: LogLevel) -> tracing::Level {
     }
 }
 
-/// Exit code for a hard exit forced by a second termination signal: the
-/// conventional `128 + SIGINT(2)` "killed by Ctrl-C".
-const SECOND_SIGNAL_EXIT_CODE: i32 = 130;
+/// Exit codes for a hard exit forced by a second termination signal: the
+/// conventional `128 + signo` for the signal that forced it.
+const SECOND_SIGINT_EXIT_CODE: i32 = 130;
+const SECOND_SIGTERM_EXIT_CODE: i32 = 143;
 
 /// Spawns background tasks that translate OS signals into the supervisor's
 /// [`Notify`] handles: SIGINT/SIGTERM request shutdown, SIGHUP requests a
@@ -269,7 +270,7 @@ const SECOND_SIGNAL_EXIT_CODE: i32 = 130;
 ///
 /// The termination handler keeps listening after the first signal: a *second*
 /// SIGINT/SIGTERM during a slow graceful drain hard-exits the process
-/// immediately (code [`SECOND_SIGNAL_EXIT_CODE`]) so a user can always
+/// immediately (the conventional `128 + signo` code) so a user can always
 /// escalate a hung shutdown — tokio's installed handler would otherwise
 /// swallow the repeat and leave no way out short of SIGKILL.
 fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
@@ -292,9 +293,9 @@ fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
         };
         let mut already_asked = false;
         loop {
-            let received = tokio::select! {
-                sig = sigint.recv() => sig,
-                sig = sigterm.recv() => sig,
+            let (received, exit_code) = tokio::select! {
+                sig = sigint.recv() => (sig, SECOND_SIGINT_EXIT_CODE),
+                sig = sigterm.recv() => (sig, SECOND_SIGTERM_EXIT_CODE),
             };
             if received.is_none() {
                 // The signal stream closed; nothing more to translate.
@@ -302,7 +303,7 @@ fn install_signal_handlers(shutdown: Arc<Notify>, reload: Arc<Notify>) {
             }
             if already_asked {
                 eprintln!("vard: received a second termination signal; exiting immediately");
-                std::process::exit(SECOND_SIGNAL_EXIT_CODE);
+                std::process::exit(exit_code);
             }
             already_asked = true;
             shutdown.notify_one();
@@ -405,6 +406,11 @@ fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = 
             RecoveryReport::Clean => {}
             RecoveryReport::LockRemoved { .. } => {
                 warn!(watch = spec.name(), report = %report, "recovered a stale git lock");
+            }
+            // A foreign lock is currently wedging a watched repo — operator
+            // significant, even though it is not ours to remove.
+            RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
+                warn!(watch = spec.name(), report = %report, "journal recovery");
             }
             other => {
                 info!(watch = spec.name(), report = %other, "journal recovery");
