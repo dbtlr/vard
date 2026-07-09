@@ -19,6 +19,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -202,6 +203,314 @@ async fn two_watches_make_progress_independently() {
 
     assert_eq!(backend_a.committed.load(Ordering::SeqCst), 1);
     assert_eq!(backend_b.committed.load(Ordering::SeqCst), 1);
+}
+
+/// A fake backend whose in-flight commit can be gated by the test, so a
+/// shutdown can be exercised while a pass is genuinely mid-flight.
+///
+/// Like [`FakeBackend`] it commits only when the tree has been marked dirty (so
+/// the post-op re-check converges). When a gate is installed, the dirty commit
+/// blocks on it — flagging `at_gate` first — until the test releases it (or
+/// never, to model a stuck worker).
+struct GatedBackend {
+    dirty: AtomicBool,
+    committed: AtomicUsize,
+    /// Set true while a commit is parked on the gate: precise proof the worker
+    /// is blocked *inside* the snapshot, not merely that a call happened.
+    at_gate: AtomicBool,
+    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl GatedBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            dirty: AtomicBool::new(false),
+            committed: AtomicUsize::new(0),
+            at_gate: AtomicBool::new(false),
+            gate: Mutex::new(None),
+        })
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Installs a gate that the next dirty commit blocks on. Returns the sender
+    /// that releases it; never sending models a commit that never returns.
+    fn install_gate(&self) -> std::sync::mpsc::Sender<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.gate.lock().unwrap() = Some(rx);
+        tx
+    }
+}
+
+impl VcsBackend for GatedBackend {
+    fn is_safe_state(&self) -> Result<SafeState, VcsError> {
+        Ok(SafeState::Safe)
+    }
+
+    fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        // A dirty commit: park on the gate if one is installed, so the test can
+        // hold the pass in flight across a shutdown.
+        if let Some(rx) = self.gate.lock().unwrap().take() {
+            self.at_gate.store(true, Ordering::SeqCst);
+            let _ = rx.recv();
+            self.at_gate.store(false, Ordering::SeqCst);
+        }
+        self.committed.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(SnapshotOutcome {
+            id: SnapshotId::new("beadfeed"),
+            summary: ChangeSummary {
+                changed: 1,
+                added: 0,
+                deleted: 0,
+                notable: vec!["notes.md".to_string()],
+            },
+        }))
+    }
+
+    fn log(&self, _filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError> {
+        Ok(Vec::new())
+    }
+
+    fn diff(&self, _from: &VcsRef, _to: Option<&VcsRef>) -> Result<String, VcsError> {
+        Ok(String::new())
+    }
+
+    fn restore(&self, _target: &RestoreTarget) -> Result<(), VcsError> {
+        unimplemented!("restore is out of scope for the snapshot engine")
+    }
+
+    fn fetch(&self) -> Result<RemoteState, VcsError> {
+        unimplemented!("fetch is out of scope for the snapshot engine")
+    }
+
+    fn reconcile(&self) -> Result<ReconcileOutcome, VcsError> {
+        unimplemented!("reconcile is out of scope for the snapshot engine")
+    }
+
+    fn push(&self) -> Result<PushOutcome, VcsError> {
+        unimplemented!("push is out of scope for the snapshot engine")
+    }
+}
+
+/// Polls `cond` until it holds or `WAIT` elapses, yielding between checks so
+/// the worker's tasks make progress.
+async fn wait_until(mut cond: impl FnMut() -> bool) {
+    let ok = timeout(WAIT, async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(ok.is_ok(), "condition never held within {WAIT:?}");
+}
+
+/// Drains all events currently queued without blocking, returning them in order.
+fn drain_events(events: &mut EventReceiver) -> Vec<Event> {
+    let mut out = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+#[tokio::test]
+async fn shutdown_drains_an_in_flight_pass() {
+    // A pass caught mid-commit must finish (emitting SnapshotCompleted) before
+    // shutdown reports DaemonStopped — the drain never abandons in-flight work.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = GatedBackend::new();
+    let release = backend.install_gate();
+    backend.mark_dirty();
+
+    let spec = WatchSpec::builder("notes", dir.path())
+        .trigger(TriggerMode::Events)
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+    let engine = Engine::builder()
+        .watch_with_backend(spec, backend.clone())
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    std::fs::write(dir.path().join("notes.md"), b"hello").unwrap();
+    // Wait until the worker is genuinely parked inside the gated commit.
+    wait_until(|| backend.at_gate.load(Ordering::SeqCst)).await;
+
+    // Shut down while the pass is in flight; release the gate a beat later so
+    // shutdown's worker-drain is what waits for the commit to finish.
+    let ((), ()) = tokio::join!(handle.shutdown(), async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = release.send(());
+    });
+
+    assert_eq!(
+        backend.committed.load(Ordering::SeqCst),
+        1,
+        "the in-flight commit must have completed during the drain"
+    );
+
+    // The drained event stream shows the snapshot landing before the stop.
+    let evs = drain_events(&mut events);
+    let completed = evs
+        .iter()
+        .position(|e| matches!(e, Event::SnapshotCompleted { .. }));
+    let stopped = evs.iter().position(|e| matches!(e, Event::DaemonStopped));
+    let completed = completed.expect("an in-flight snapshot must complete");
+    let stopped = stopped.expect("shutdown must emit DaemonStopped");
+    assert!(
+        completed < stopped,
+        "SnapshotCompleted must precede DaemonStopped, got {evs:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_stops_all_tasks_and_emits_no_events_after() {
+    // After shutdown returns, every task has joined: DaemonStopped is the last
+    // event and the keepalive cycle is broken, so a later write snapshots nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = GatedBackend::new();
+    let spec = WatchSpec::builder("notes", dir.path())
+        .trigger(TriggerMode::Events)
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+    let engine = Engine::builder()
+        .watch_with_backend(spec, backend.clone())
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    backend.mark_dirty();
+    std::fs::write(dir.path().join("notes.md"), b"hello").unwrap();
+    expect_completed(&mut events, "notes").await;
+
+    handle.shutdown().await;
+
+    // DaemonStopped is present and nothing follows it in the stream.
+    let evs = drain_events(&mut events);
+    assert_eq!(
+        evs.last(),
+        Some(&Event::DaemonStopped),
+        "DaemonStopped must be the final event, got {evs:?}"
+    );
+    // Every task has joined and the bus has no senders left: the receiver is
+    // Closed, not merely Empty — proof no worker or dispatcher survives.
+    assert_eq!(
+        events.try_recv(),
+        Err(vard_core::TryRecvError::Closed),
+        "the event bus must be closed once every task has joined"
+    );
+
+    // The keepalive cycle is broken: the worker is gone, so a fresh write drives
+    // no further commit.
+    let committed_before = backend.committed.load(Ordering::SeqCst);
+    backend.mark_dirty();
+    std::fs::write(dir.path().join("notes.md"), b"world").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        backend.committed.load(Ordering::SeqCst),
+        committed_before,
+        "no worker should remain to snapshot after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn a_second_engine_can_watch_the_same_path_after_shutdown() {
+    // Shutting the first engine down releases the notify backend on the path, so
+    // a second engine can arm the same directory and make progress.
+    let dir = tempfile::tempdir().unwrap();
+
+    let backend_a = GatedBackend::new();
+    let spec_a = WatchSpec::builder("notes", dir.path())
+        .trigger(TriggerMode::Events)
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+    let engine_a = Engine::builder()
+        .watch_with_backend(spec_a, backend_a.clone())
+        .build()
+        .unwrap();
+    let mut events_a = engine_a.subscribe();
+    let handle_a = engine_a.start().await.unwrap();
+
+    backend_a.mark_dirty();
+    std::fs::write(dir.path().join("first.md"), b"a").unwrap();
+    expect_completed(&mut events_a, "notes").await;
+    handle_a.shutdown().await;
+
+    // A brand-new engine over the very same path.
+    let backend_b = GatedBackend::new();
+    let spec_b = WatchSpec::builder("notes", dir.path())
+        .trigger(TriggerMode::Events)
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+    let engine_b = Engine::builder()
+        .watch_with_backend(spec_b, backend_b.clone())
+        .build()
+        .unwrap();
+    let mut events_b = engine_b.subscribe();
+    let handle_b = engine_b.start().await.unwrap();
+
+    backend_b.mark_dirty();
+    std::fs::write(dir.path().join("second.md"), b"b").unwrap();
+    expect_completed(&mut events_b, "notes").await;
+    assert_eq!(backend_b.committed.load(Ordering::SeqCst), 1);
+
+    handle_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_aborts_a_worker_stuck_past_the_drain_timeout() {
+    // A worker still running a pass when the drain budget elapses is aborted, and
+    // shutdown still completes with DaemonStopped rather than hanging forever.
+    let dir = tempfile::tempdir().unwrap();
+    let backend = GatedBackend::new();
+    // Install a gate we never release: the commit blocks indefinitely.
+    let _release = backend.install_gate();
+    backend.mark_dirty();
+
+    let spec = WatchSpec::builder("notes", dir.path())
+        .trigger(TriggerMode::Events)
+        .quiesce(QUIESCE)
+        .build()
+        .unwrap();
+    let engine = Engine::builder()
+        .watch_with_backend(spec, backend.clone())
+        .shutdown_drain_timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    std::fs::write(dir.path().join("notes.md"), b"hello").unwrap();
+    wait_until(|| backend.at_gate.load(Ordering::SeqCst)).await;
+
+    // Shutdown must return despite the stuck worker (bounded by the drain
+    // timeout, then an abort). A generous outer timeout guards against a hang.
+    timeout(WAIT, handle.shutdown())
+        .await
+        .expect("shutdown must not hang on a stuck worker");
+
+    // The stuck commit never finished, yet the engine wound down cleanly.
+    assert_eq!(
+        backend.committed.load(Ordering::SeqCst),
+        0,
+        "the stuck commit must not have completed"
+    );
+    let evs = drain_events(&mut events);
+    assert!(
+        evs.contains(&Event::DaemonStopped),
+        "shutdown must emit DaemonStopped even after aborting a stuck worker, got {evs:?}"
+    );
 }
 
 /// Runs a git command in `dir`, asserting success.

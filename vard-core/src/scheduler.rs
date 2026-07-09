@@ -56,11 +56,12 @@
 //! # Trouble reporting
 //!
 //! A schedule task that dies abnormally is reported as
-//! [`SchedulerSignal::Trouble`] by a supervisor; a deliberate disarm (handle
-//! drop) is not abnormal and reports nothing. Trouble travels the same
-//! channel as ticks, so the report reaches the consumer only while the
-//! [`SchedulerRx`] is alive — keeping that receiver alive and drained is the
-//! host's concern.
+//! [`SchedulerSignal::Trouble`] (kind
+//! [`SourceDied`](crate::event::TroubleKind::SourceDied)) by a supervisor; a
+//! deliberate disarm (handle drop) is not abnormal and reports nothing.
+//! Trouble travels the same channel as ticks, so the report reaches the
+//! consumer only while the [`SchedulerRx`] is alive — keeping that receiver
+//! alive and drained is the host's concern.
 //!
 //! # One scheduler per purpose
 //!
@@ -75,6 +76,8 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
+use crate::event::TroubleKind;
+
 /// What the scheduler reports on its one stream: an elapsed interval or trouble.
 ///
 /// `Tick` is emitted once each time a watch's interval comes due — the first
@@ -82,10 +85,11 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 /// [module docs](self) for how a late timer task and a lagging consumer
 /// differ).
 ///
-/// `Trouble` means the schedule needs attention: its task died abnormally. A
-/// schedule that emits `Trouble` is no longer ticking, so the consumer should
-/// surface the condition and, if it still wants interval snapshots for that
-/// watch, re-arm it.
+/// `Trouble` means the schedule needs attention: its task died abnormally —
+/// the only way a schedule currently reports trouble, so `kind` is always
+/// [`TroubleKind::SourceDied`]. A schedule that emits `Trouble` is no longer
+/// ticking, so the consumer should surface the condition and, if it still
+/// wants interval snapshots for that watch, re-arm it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SchedulerSignal {
@@ -98,6 +102,12 @@ pub enum SchedulerSignal {
     Trouble {
         /// Stable name of the watch.
         watch: String,
+        /// Distinguishes the schedule's own task dying from every other
+        /// cause; see [`TroubleKind`]. Always [`TroubleKind::SourceDied`]
+        /// today — a schedule's only failure mode is its task dying — kept
+        /// as a field (not hardcoded at the call site) so a future trouble
+        /// source needs no signature change.
+        kind: TroubleKind,
         /// Human-readable description of the condition.
         detail: String,
     },
@@ -180,9 +190,11 @@ async fn run_schedule(
 }
 
 /// Watches a schedule task and reports an abnormal end as
-/// [`SchedulerSignal::Trouble`], so an abnormal death is surfaced rather than
-/// silent — for as long as the consumer holds its [`SchedulerRx`]. A
-/// deliberate abort (disarm) is not abnormal and reports nothing.
+/// [`SchedulerSignal::Trouble`] with [`TroubleKind::SourceDied`] — the task
+/// that produces this watch's ticks is gone — so an abnormal death is
+/// surfaced rather than silent, for as long as the consumer holds its
+/// [`SchedulerRx`]. A deliberate abort (disarm) is not abnormal and reports
+/// nothing.
 fn supervise(
     watch: String,
     task: JoinHandle<()>,
@@ -194,6 +206,7 @@ fn supervise(
         {
             let _ = signal_tx.send(SchedulerSignal::Trouble {
                 watch,
+                kind: TroubleKind::SourceDied,
                 detail: format!("schedule task ended abnormally: {err}"),
             });
         }
@@ -544,7 +557,14 @@ mod tests {
             .expect("supervisor itself must not die");
 
         match rx.try_recv() {
-            Ok(SchedulerSignal::Trouble { watch, .. }) => assert_eq!(watch, "w"),
+            Ok(SchedulerSignal::Trouble { watch, kind, .. }) => {
+                assert_eq!(watch, "w");
+                assert_eq!(
+                    kind,
+                    TroubleKind::SourceDied,
+                    "an abnormal task end must be reported as the signal source dying"
+                );
+            }
             other => panic!("expected Trouble after a task panic, got {other:?}"),
         }
     }

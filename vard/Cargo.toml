@@ -19,6 +19,19 @@ vard-core = { path = "../vard-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+rustix = { workspace = true }
+# The daemon shell (`vard run`) drives the async engine, so it needs a
+# multi-thread runtime, `macros` for `#[tokio::main]`/`select!`, `signal` for
+# SIGINT/SIGTERM/SIGHUP, and `time` for the mtime-poll and backoff timers on top
+# of the workspace `sync` channels.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Tempdir-isolated tests for the instance lock, operation journal, and the
+# daemon smoke test; mirrors vard-core's dev-dependency.
+tempfile = "3"
 
 [build-dependencies]
 clap = { workspace = true }

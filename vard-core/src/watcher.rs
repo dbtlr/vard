@@ -55,12 +55,15 @@
 //!
 //! Errors do not vanish. A notify error (inotify queue overflow, a watched
 //! root invalidated, an I/O failure inside the backend) is forwarded as
-//! [`WatcherSignal::Trouble`] and conservatively counted as activity — an
-//! error may hide changes. A quiescence task that dies abnormally is likewise
-//! reported as `Trouble` by a supervisor. Trouble travels the same channel as
-//! `Activity`, so these reports reach the consumer only while it keeps its
-//! [`WatcherRx`] alive — receiver lifetime is the host's concern. Consumers
-//! route `Trouble` to the watch's attention state.
+//! [`WatcherSignal::Trouble`] (kind [`Degraded`](crate::event::TroubleKind::Degraded))
+//! and conservatively counted as activity — an error may hide changes. A
+//! quiescence task that dies abnormally is likewise reported as `Trouble`,
+//! but kind [`SourceDied`](crate::event::TroubleKind::SourceDied) — the task
+//! producing this watch's signals is gone — by a supervisor. Trouble travels
+//! the same channel as `Activity`, so these reports reach the consumer only
+//! while it keeps its [`WatcherRx`] alive — receiver lifetime is the host's
+//! concern. Consumers route `Trouble` to the watch's attention state, reading
+//! the kind to tell a dead source from every other condition.
 //!
 //! # Native events with polling fallback
 //!
@@ -83,6 +86,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout};
 
 use crate::config::WatchSpec;
+use crate::event::TroubleKind;
 
 /// Poll period used when the native watcher fails to arm and the watch falls
 /// back to polling. A watch that opts into polling explicitly overrides this
@@ -104,9 +108,11 @@ const RAW_EVENT_CAPACITY: usize = 1024;
 /// both mean "the directory changed, then settled".
 ///
 /// `Trouble` means the watch needs attention: the filesystem backend reported
-/// an error, the bridge channel overflowed, or the watch's own task died. A
-/// watch that emits `Trouble` may still be delivering events, but the consumer
-/// cannot assume completeness and should surface the condition.
+/// an error, the bridge channel overflowed, or the watch's own task died —
+/// `kind` distinguishes that last case ([`TroubleKind::SourceDied`]) from the
+/// other two ([`TroubleKind::Degraded`]). A watch that emits `Trouble` may
+/// still be delivering events, but the consumer cannot assume completeness
+/// and should surface the condition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WatcherSignal {
@@ -121,6 +127,9 @@ pub enum WatcherSignal {
     Trouble {
         /// Stable name of the watch.
         watch: String,
+        /// Distinguishes the watch's own task dying from every other cause;
+        /// see [`TroubleKind`].
+        kind: TroubleKind,
         /// Human-readable description of the condition.
         detail: String,
     },
@@ -355,6 +364,7 @@ fn handle_event(shared: &HandlerShared, result: notify::Result<notify::Event>) {
             // as activity — it may hide real changes.
             let _ = shared.signal_tx.send(WatcherSignal::Trouble {
                 watch: shared.watch.clone(),
+                kind: TroubleKind::Degraded,
                 detail: error.to_string(),
             });
             forward_marker(shared);
@@ -472,15 +482,17 @@ fn surface_overflow(
     if overflow.swap(false, Ordering::SeqCst) {
         let _ = signal_tx.send(WatcherSignal::Trouble {
             watch: name.to_string(),
+            kind: TroubleKind::Degraded,
             detail: "event channel overflowed; some filesystem events were dropped".to_string(),
         });
     }
 }
 
 /// Watches the quiescence task and reports an abnormal end as
-/// [`WatcherSignal::Trouble`], so an abnormal death is surfaced rather than
-/// silent — for as long as the consumer holds its [`WatcherRx`]. A
-/// deliberate abort (disarm) is not abnormal and reports nothing.
+/// [`WatcherSignal::Trouble`] with [`TroubleKind::SourceDied`] — the task that
+/// produces this watch's signals is gone, so an abnormal death is surfaced
+/// rather than silent — for as long as the consumer holds its [`WatcherRx`].
+/// A deliberate abort (disarm) is not abnormal and reports nothing.
 fn supervise(
     watch: String,
     task: JoinHandle<()>,
@@ -492,6 +504,7 @@ fn supervise(
         {
             let _ = signal_tx.send(WatcherSignal::Trouble {
                 watch,
+                kind: TroubleKind::SourceDied,
                 detail: format!("watch task ended abnormally: {err}"),
             });
         }
@@ -922,8 +935,17 @@ mod tests {
         handle_event(&shared, Err(notify::Error::generic("queue overflowed")));
 
         match signals.try_recv() {
-            Ok(WatcherSignal::Trouble { watch, detail }) => {
+            Ok(WatcherSignal::Trouble {
+                watch,
+                kind,
+                detail,
+            }) => {
                 assert_eq!(watch, "w");
+                assert_eq!(
+                    kind,
+                    TroubleKind::Degraded,
+                    "a backend error is degraded, not a dead source"
+                );
                 assert!(detail.contains("queue overflowed"), "detail: {detail}");
             }
             other => panic!("expected Trouble, got {other:?}"),
@@ -1094,8 +1116,17 @@ mod tests {
         settle().await;
 
         match rx.try_recv() {
-            Ok(WatcherSignal::Trouble { watch, detail }) => {
+            Ok(WatcherSignal::Trouble {
+                watch,
+                kind,
+                detail,
+            }) => {
                 assert_eq!(watch, "w");
+                assert_eq!(
+                    kind,
+                    TroubleKind::Degraded,
+                    "a channel overflow is degraded, not a dead source"
+                );
                 assert!(detail.contains("overflow"), "detail: {detail}");
             }
             other => panic!("expected Trouble for the overflow, got {other:?}"),
@@ -1212,7 +1243,14 @@ mod tests {
             .expect("supervisor itself must not die");
 
         match rx.try_recv() {
-            Ok(WatcherSignal::Trouble { watch, .. }) => assert_eq!(watch, "w"),
+            Ok(WatcherSignal::Trouble { watch, kind, .. }) => {
+                assert_eq!(watch, "w");
+                assert_eq!(
+                    kind,
+                    TroubleKind::SourceDied,
+                    "an abnormal task end must be reported as the signal source dying"
+                );
+            }
             other => panic!("expected Trouble after a task panic, got {other:?}"),
         }
     }

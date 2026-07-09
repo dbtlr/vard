@@ -62,6 +62,28 @@ pub const DEFAULT_CAPACITY: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
+    /// A snapshot is about to be attempted: emitted immediately before the
+    /// worker invokes the backend commit, so the git write has not begun yet.
+    ///
+    /// This is the *pre-commit* signal, and it opens a bracket the engine
+    /// guarantees to close: every `SnapshotStarted` is followed by **exactly
+    /// one** matching outcome for the same watch —
+    /// [`SnapshotCompleted`](Event::SnapshotCompleted),
+    /// [`SnapshotFailed`](Event::SnapshotFailed), or
+    /// [`SnapshotSkipped`](Event::SnapshotSkipped). A binary-level subscriber
+    /// relies on that invariant to bracket the commit window — journal `begin`
+    /// on `SnapshotStarted`, `complete` on the outcome — so a daemon that dies
+    /// mid-commit leaves a recoverable record of the operation in flight, and a
+    /// pass that commits nothing still closes its record (which is what keeps a
+    /// foreign git lock distinguishable from an abandoned one at recovery).
+    /// Reactors that only care about committed work should key off
+    /// `SnapshotCompleted` instead.
+    SnapshotStarted {
+        /// Stable name of the watch about to be snapshotted.
+        watch: String,
+        /// Why the snapshot is being taken.
+        trigger: Trigger,
+    },
     /// A snapshot was written successfully.
     SnapshotCompleted {
         /// Stable name of the watch that was snapshotted.
@@ -82,6 +104,21 @@ pub enum Event {
         trigger: Trigger,
         /// Human-readable description of the failure.
         error: String,
+    },
+    /// A snapshot attempt concluded without a commit: the no-commit outcome
+    /// that closes a [`SnapshotStarted`](Event::SnapshotStarted) bracket when
+    /// neither [`SnapshotCompleted`](Event::SnapshotCompleted) nor
+    /// [`SnapshotFailed`](Event::SnapshotFailed) applies. The [`SkipReason`]
+    /// says why nothing was committed. Emitted so the started→outcome invariant
+    /// holds on every pass — a journaling subscriber closes its record on this
+    /// event exactly as it would on a completed or failed one.
+    SnapshotSkipped {
+        /// Stable name of the watch.
+        watch: String,
+        /// Why the snapshot was attempted.
+        trigger: Trigger,
+        /// Why nothing was committed.
+        reason: SkipReason,
     },
     /// Local snapshots were pushed to the remote.
     SyncPushed {
@@ -135,6 +172,14 @@ pub enum Event {
         to: WatchState,
         /// Optional human-readable reason for the transition.
         reason: Option<String>,
+        /// Set when this transition was caused by trouble ([`TroubleKind`]);
+        /// `None` for every other transition (a resolved-safe `Ok`, an
+        /// unsafe-repo `Paused`, ...). Carrying it here — rather than only on
+        /// [`WatchState::Attention`] — keeps the enum small and lets a
+        /// subscriber match on the kind without also matching the state, and
+        /// it costs nothing on the far more common non-trouble transitions
+        /// since `None` is a single tag byte.
+        trouble: Option<TroubleKind>,
     },
     /// The daemon finished starting up.
     DaemonStarted,
@@ -155,8 +200,10 @@ impl Event {
     /// wildcard, so adding a variant without a name fails to compile.
     pub fn name(&self) -> &'static str {
         match self {
+            Event::SnapshotStarted { .. } => "snapshot.started",
             Event::SnapshotCompleted { .. } => "snapshot.completed",
             Event::SnapshotFailed { .. } => "snapshot.failed",
+            Event::SnapshotSkipped { .. } => "snapshot.skipped",
             Event::SyncPushed { .. } => "sync.pushed",
             Event::SyncPulled { .. } => "sync.pulled",
             Event::SyncConflict { .. } => "sync.conflict",
@@ -203,6 +250,41 @@ impl fmt::Display for Trigger {
     }
 }
 
+/// Why a snapshot attempt committed nothing, reported on
+/// [`Event::SnapshotSkipped`].
+///
+/// A typed vocabulary rather than a free string, so subscribers can match on
+/// the cause. `#[non_exhaustive]` so finer reasons can be added without a
+/// breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// The sweep found nothing to commit: the tree was clean.
+    Clean,
+    /// The index lock stayed contended through every retry; the pending
+    /// snapshot was requeued for the next trigger (the lock is never deleted).
+    LockContended,
+    /// The repository became unsafe between the safe-state check and the
+    /// commit; the watch pauses and the pending snapshot is retried.
+    Unsafe,
+    /// A self-driving retry of an already-reported failure failed again. The
+    /// original [`Event::SnapshotFailed`] stands; per-tick repeats close their
+    /// bracket here instead of storming the bus with duplicate failures.
+    RetryStillFailing,
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            SkipReason::Clean => "clean",
+            SkipReason::LockContended => "lock-contended",
+            SkipReason::Unsafe => "unsafe",
+            SkipReason::RetryStillFailing => "retry-still-failing",
+        };
+        f.write_str(s)
+    }
+}
+
 /// The lifecycle state of a watch.
 ///
 /// The reason for any transition travels on
@@ -231,6 +313,38 @@ impl fmt::Display for WatchState {
             WatchState::Conflicted => "conflicted",
             WatchState::SyncError => "sync-error",
             WatchState::Attention => "attention",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Why a watch needs attention, reported on [`Event::WatchStateChanged`]
+/// alongside its `reason` string.
+///
+/// The one distinction a subscriber needs without parsing `reason`: whether
+/// the watcher/scheduler task that produces this watch's signals has itself
+/// died, versus every other condition. A daemon supervisor reacts to
+/// `SourceDied` by rebuilding the engine (the watch is otherwise permanently
+/// silent); it need not react to `Degraded` the same way. `#[non_exhaustive]`
+/// so finer kinds can be added later without a breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TroubleKind {
+    /// The watcher's or scheduler's per-watch task ended abnormally (panicked
+    /// or exited unexpectedly) and is no longer producing signals for this
+    /// watch.
+    SourceDied,
+    /// Any other condition needing attention: a backend error, a channel
+    /// overflow, a panicked backend call, and so on. The signal source
+    /// itself is still alive.
+    Degraded,
+}
+
+impl fmt::Display for TroubleKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TroubleKind::SourceDied => "source-died",
+            TroubleKind::Degraded => "degraded",
         };
         f.write_str(s)
     }
@@ -422,6 +536,13 @@ mod tests {
         // wildcard-free match inside `Event::name` itself.
         let cases = [
             (
+                Event::SnapshotStarted {
+                    watch: "w".to_string(),
+                    trigger: Trigger::Manual,
+                },
+                "snapshot.started",
+            ),
+            (
                 Event::SnapshotCompleted {
                     watch: "w".to_string(),
                     snapshot: "r".to_string(),
@@ -437,6 +558,14 @@ mod tests {
                     error: "e".to_string(),
                 },
                 "snapshot.failed",
+            ),
+            (
+                Event::SnapshotSkipped {
+                    watch: "w".to_string(),
+                    trigger: Trigger::Interval,
+                    reason: SkipReason::Clean,
+                },
+                "snapshot.skipped",
             ),
             (
                 Event::SyncPushed {
@@ -486,6 +615,7 @@ mod tests {
                     from: WatchState::Ok,
                     to: WatchState::Paused,
                     reason: None,
+                    trouble: None,
                 },
                 "watch.state_changed",
             ),
@@ -520,5 +650,13 @@ mod tests {
 
         assert_eq!(Resolver::Human.to_string(), "human");
         assert_eq!(Resolver::Ai.to_string(), "ai");
+
+        assert_eq!(SkipReason::Clean.to_string(), "clean");
+        assert_eq!(SkipReason::LockContended.to_string(), "lock-contended");
+        assert_eq!(SkipReason::Unsafe.to_string(), "unsafe");
+        assert_eq!(
+            SkipReason::RetryStillFailing.to_string(),
+            "retry-still-failing"
+        );
     }
 }

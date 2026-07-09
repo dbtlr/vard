@@ -27,12 +27,13 @@ pub use config::{
     parse_duration,
 };
 pub use engine::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_UNSAFE_REPOLL_INTERVAL,
-    DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder, EngineError, SharedBackend,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+    DEFAULT_UNSAFE_REPOLL_INTERVAL, DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder,
+    EngineError, EngineHandle, SharedBackend,
 };
 pub use event::{
-    DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
-    WatchState,
+    DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, SkipReason, Trigger,
+    TroubleKind, TryRecvError, WatchState,
 };
 pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
 pub use vcs::git::GitBackend;

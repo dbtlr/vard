@@ -24,10 +24,21 @@ ignore = "0.4"
 # TOML. See VRD-9.
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# Advisory `flock` single-instance locking and `kill(pid, 0)` liveness probes
+# for stale-lock recovery back the daemon shell (vard only). `fs` supplies
+# `flock`; `process` supplies `test_kill_process`/`Pid`. Kept default-features
+# off to stay dependency-light.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 clap_mangen = "0.3"
+# Structured logging for the daemon shell (vard only). `tracing` is the emit
+# API; `tracing-subscriber` renders to stderr via its `fmt` layer. The level is
+# set programmatically from `[daemon].log_level`, so the `env-filter` feature is
+# deliberately omitted — default features (fmt) are all the daemon needs.
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [profile.dist]
 inherits = "release"

@@ -13,10 +13,12 @@
 //! keys and sections are rejected with an error naming the offender, so a typo
 //! (`[default]`, `qiesce`) cannot silently change behavior. The known-future
 //! surface from spec §12 is explicitly tolerated as opaque values until its
-//! owning tasks land typed models: top-level `[daemon]` (VRD-14), `[ai]`, and
-//! `[update]`; `secret_scan`/`hook_timeout`/`hook_rate_limit` in `[defaults]`;
-//! and `secret_scan`/`hooks` in `[[watch]]`. The top-level `version` key
-//! remains the migration lever for real schema breaks.
+//! owning tasks land typed models: top-level `[ai]` and `[update]`;
+//! `secret_scan`/`hook_timeout`/`hook_rate_limit` in `[defaults]`; and
+//! `secret_scan`/`hooks` in `[[watch]]`. Top-level `[daemon]` is typed
+//! (VRD-14; see [`DaemonConfig`]) since it is binary-level per ADR 0003. The
+//! top-level `version` key remains the migration lever for real schema
+//! breaks.
 //!
 //! Durations are humantime strings (`"15m"`), deserialized through
 //! [`vard_core::parse_duration`] so the file layer and the SDK share one parser.
@@ -35,26 +37,81 @@ use crate::paths;
 /// The only config schema version this binary understands.
 const SUPPORTED_VERSION: i64 = 1;
 
+/// Default `[daemon].log_level`, absent an explicit value.
+///
+/// `[daemon]` is a binary-level concern (ADR 0003), so — unlike the
+/// `vard-core` `DEFAULT_*` constants `[defaults]` resolves against — this
+/// default lives in the binary crate rather than in `vard-core`.
+const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
+
+/// Default `[daemon].log_retention_days`, absent an explicit value.
+const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
+
 /// A parsed `config.toml`. Unknown keys are rejected; the known-future
 /// sections are carried opaquely (see the [module docs](self)).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Config {
-    /// Schema version. Probed before full deserialization; see
-    /// [`from_toml_str`](Config::from_toml_str).
+    /// Schema version. Read via the pre-parse probe in
+    /// [`from_toml_str`](Config::from_toml_str) rather than this field, which is
+    /// retained so the schema round-trips and tests can assert it.
+    #[allow(dead_code)]
     pub version: i64,
-    /// Tolerated opaquely; VRD-14 owns the typed `[daemon]` model
-    /// (log level, retention).
-    daemon: Option<toml::Value>,
+    /// The `[daemon]` section (spec §12). Absent entirely, or with only
+    /// some fields set, defaults fill in the rest — see [`DaemonConfig`].
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Tolerated opaquely; a later task adds the typed `[ai]` section.
+    #[allow(dead_code)]
     ai: Option<toml::Value>,
     /// Tolerated opaquely; a later task adds the typed `[update]` section.
+    #[allow(dead_code)]
     update: Option<toml::Value>,
     #[serde(default)]
     pub defaults: Defaults,
     /// Watches, one per `[[watch]]` table.
     #[serde(default, rename = "watch")]
     pub watches: Vec<WatchConfig>,
+}
+
+/// The `[daemon]` section (spec §12): binary-level daemon behavior — the
+/// daemon's own log verbosity and how long it retains its rotated logs.
+/// Typed here rather than in `vard-core` because `[daemon]` is a binary
+/// concern, not an engine one (ADR 0003).
+///
+/// Every field is optional in the file; a missing `[daemon]` section
+/// entirely, or a section with only some fields set, defaults the rest via
+/// the container-level `#[serde(default)]` below, which falls back to
+/// [`Default for DaemonConfig`](DaemonConfig#impl-Default-for-DaemonConfig).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct DaemonConfig {
+    pub log_level: LogLevel,
+    pub log_retention_days: u32,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        DaemonConfig {
+            log_level: DEFAULT_LOG_LEVEL,
+            log_retention_days: DEFAULT_LOG_RETENTION_DAYS,
+        }
+    }
+}
+
+/// The daemon's own log verbosity (`[daemon].log_level`).
+///
+/// A validated enum, not a free string: the file must spell one of the
+/// lowercase variants below, or deserialization fails with a clean,
+/// span-bearing serde error naming the offending value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 /// The `[defaults]` section: values inherited by any watch that does not set
@@ -72,10 +129,13 @@ pub(crate) struct Defaults {
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub sync_interval: Option<Duration>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     hook_timeout: Option<toml::Value>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     hook_rate_limit: Option<toml::Value>,
 }
 
@@ -108,13 +168,18 @@ pub(crate) struct WatchConfig {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Tolerated opaquely for the known-future spec §12 surface.
+    #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
     /// Tolerated opaquely; a later task adds typed `[watch.hooks]`.
+    #[allow(dead_code)]
     hooks: Option<toml::Value>,
 }
 
 impl Config {
     /// The default config path, `$XDG_CONFIG_HOME/vard/config.toml`.
+    // The daemon resolves paths via `DaemonPaths`; kept for future CLI callers
+    // (e.g. `vard config path`).
+    #[allow(dead_code)]
     pub fn default_path() -> Result<PathBuf, ConfigError> {
         paths::config_file().map_err(|e| ConfigError::Path(e.to_string()))
     }
@@ -463,13 +528,75 @@ channel = "stable"
     fn parses_spec_example_including_future_sections() {
         let config = Config::from_toml_str(SPEC_EXAMPLE).unwrap();
         assert_eq!(config.version, 1);
+        assert_eq!(config.daemon.log_level, LogLevel::Debug);
+        assert_eq!(config.daemon.log_retention_days, 30);
         assert_eq!(config.watches.len(), 2);
-        // Resolution succeeds despite [daemon], [ai], [update], [watch.hooks].
+        // Resolution succeeds despite [ai], [update], [watch.hooks].
         let specs = config
             .resolve_with_home(Some(Path::new("/home/u")))
             .unwrap();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].path(), Path::new("/home/u/notes"));
+    }
+
+    #[test]
+    fn missing_daemon_section_applies_defaults() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.daemon.log_level, DEFAULT_LOG_LEVEL);
+        assert_eq!(config.daemon.log_retention_days, DEFAULT_LOG_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn partial_daemon_section_defaults_unspecified_fields() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[daemon]
+log_level = "warn"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.daemon.log_level, LogLevel::Warn);
+        assert_eq!(config.daemon.log_retention_days, DEFAULT_LOG_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn invalid_log_level_is_a_clean_parse_error() {
+        let err = Config::from_toml_str(
+            r#"
+version = 1
+
+[daemon]
+log_level = "verbose"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Parse(msg) => {
+                assert!(msg.contains("log_level"), "got: {msg}");
+            }
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_key_in_daemon_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+version = 1
+
+[daemon]
+log_leveel = "warn"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("log_leveel"), "got: {err}");
     }
 
     #[test]
