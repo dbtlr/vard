@@ -22,15 +22,18 @@
 //!     .build()?;
 //!
 //! let mut events = engine.subscribe(); // same bus the hooks use
-//! engine.start().await?;
+//! let handle = engine.start().await?;
 //!
 //! while let Ok(ev) = events.recv().await {
 //!     match ev {
 //!         Event::SnapshotCompleted { watch, snapshot, .. } => { let _ = (watch, snapshot); }
 //!         Event::SyncConflict { watch, .. } => { let _ = watch; }
+//!         Event::DaemonStopped => break,
 //!         _ => {}
 //!     }
 //! }
+//!
+//! handle.shutdown().await; // drain in-flight passes, then Event::DaemonStopped
 //! # Ok(())
 //! # }
 //! ```
@@ -96,8 +99,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::task::JoinError;
-use tokio::time::timeout;
+use tokio::task::{JoinError, JoinHandle};
+use tokio::time::{Instant, timeout};
 
 use crate::config::{TriggerMode, WatchSpec};
 use crate::event::{Event, EventBus, EventReceiver, Trigger, WatchState};
@@ -130,6 +133,13 @@ pub const DEFAULT_UNSAFE_REPOLL_INTERVAL: Duration = Duration::from_secs(30);
 /// activity arrives.
 pub const DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS: u32 = 480;
 
+/// Default budget [`EngineHandle::shutdown`] gives the workers to drain any
+/// in-flight pass before it escalates to aborting them. A pass shells out to
+/// `git` (a commit on a large tree, a lock-retry backoff), so the window is
+/// generous; a worker still running when it elapses is aborted and shutdown
+/// completes regardless (see [`EngineHandle::shutdown`]).
+pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Tunable timing policy for a worker's retry and re-poll loops.
 ///
 /// The defaults are the `DEFAULT_*` constants in this module; the
@@ -141,6 +151,7 @@ struct EngineConfig {
     lock_retry_base: Duration,
     unsafe_repoll_interval: Duration,
     unsafe_repoll_max_attempts: u32,
+    shutdown_drain_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -150,6 +161,7 @@ impl Default for EngineConfig {
             lock_retry_base: DEFAULT_LOCK_RETRY_BASE,
             unsafe_repoll_interval: DEFAULT_UNSAFE_REPOLL_INTERVAL,
             unsafe_repoll_max_attempts: DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS,
+            shutdown_drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
         }
     }
 }
@@ -713,13 +725,18 @@ impl Engine {
         self.bus.subscribe()
     }
 
-    /// Arms every watch and spawns its worker, then returns.
+    /// Arms every watch, spawns its worker, and returns an [`EngineHandle`].
     ///
     /// Consumes the engine: its watches, handles, and bus move into the spawned
-    /// tasks, which run until the runtime stops. The returned future resolves
-    /// once all watches are armed and [`Event::DaemonStarted`] has been emitted;
-    /// the workers then run in the background. A host keeps the process alive by
-    /// holding a subscriber (or its own runtime) — this call does not block.
+    /// tasks, which run in the background. The returned future resolves once all
+    /// watches are armed and [`Event::DaemonStarted`] has been emitted. A host
+    /// keeps the process alive by holding a subscriber (or its own runtime) —
+    /// this call does not block.
+    ///
+    /// The returned [`EngineHandle`] owns the worker and dispatcher tasks. Call
+    /// [`shutdown`](EngineHandle::shutdown) to wind the engine down gracefully;
+    /// dropping the handle instead leaves the engine running detached (see
+    /// [`EngineHandle`]).
     ///
     /// # Errors
     ///
@@ -731,7 +748,7 @@ impl Engine {
     /// # Runtime
     ///
     /// Must be called from within a Tokio runtime.
-    pub async fn start(self) -> Result<(), EngineError> {
+    pub async fn start(self) -> Result<EngineHandle, EngineError> {
         let Engine { bus, watches, cfg } = self;
 
         let (watcher, watcher_rx) = Watcher::new();
@@ -781,14 +798,124 @@ impl Engine {
             prepared.push((worker, rx));
         }
 
-        for (worker, rx) in prepared {
-            tokio::spawn(worker.run(rx));
-        }
-        tokio::spawn(dispatch_watcher(watcher_rx, watcher_routes));
-        tokio::spawn(dispatch_scheduler(scheduler_rx, scheduler_routes));
+        let workers: Vec<JoinHandle<()>> = prepared
+            .into_iter()
+            .map(|(worker, rx)| tokio::spawn(worker.run(rx)))
+            .collect();
+        let dispatchers = vec![
+            tokio::spawn(dispatch_watcher(watcher_rx, watcher_routes)),
+            tokio::spawn(dispatch_scheduler(scheduler_rx, scheduler_routes)),
+        ];
 
         bus.emit(Event::DaemonStarted);
-        Ok(())
+        Ok(EngineHandle {
+            bus,
+            workers,
+            dispatchers,
+            drain_timeout: cfg.shutdown_drain_timeout,
+        })
+    }
+}
+
+/// A live [`Engine`]'s teardown lever, returned by [`Engine::start`].
+///
+/// It owns the engine's worker and dispatcher tasks. Two lifecycles are
+/// supported:
+///
+/// - **Graceful shutdown.** [`shutdown`](Self::shutdown) stops the dispatchers,
+///   drains each worker's in-flight pass, tears the watch handles down, and
+///   emits [`Event::DaemonStopped`] once every task has joined. It consumes the
+///   handle, so it cannot be called twice.
+/// - **Fire and forget.** Dropping the handle *without* calling
+///   [`shutdown`](Self::shutdown) leaves the engine running detached — the
+///   worker and dispatcher tasks keep running on the runtime, exactly as before
+///   this type existed. An embedder that just wants the engine to run for the
+///   life of the process can drop the handle and hold a subscriber instead.
+pub struct EngineHandle {
+    bus: EventBus,
+    workers: Vec<JoinHandle<()>>,
+    dispatchers: Vec<JoinHandle<()>>,
+    drain_timeout: Duration,
+}
+
+impl EngineHandle {
+    /// Winds the engine down gracefully, emitting [`Event::DaemonStopped`] once
+    /// every task has joined.
+    ///
+    /// The teardown is a cancellation drain, in order:
+    ///
+    /// 1. **Stop the dispatchers.** Both dispatch tasks are aborted and joined,
+    ///    which drops every per-watch route sender they held. No new trigger can
+    ///    reach a worker after this point.
+    /// 2. **Drain the workers.** With the dispatchers gone, each worker's input
+    ///    channel has no senders left, so its run loop observes the close and
+    ///    exits *after* finishing any pass already in flight — a snapshot mid-commit
+    ///    is never abandoned. A worker parked on its retry timer simply drains and
+    ///    exits. As each worker task ends it drops its [`WatchHandle`] and
+    ///    [`ScheduleHandle`], whose `Drop` impls disarm the notify backend and the
+    ///    tick task.
+    /// 3. **Emit [`Event::DaemonStopped`].** Every task has joined, so no further
+    ///    event can be emitted after it.
+    ///
+    /// # Drain timeout
+    ///
+    /// The worker drain is bounded by the configured drain timeout (default
+    /// [`DEFAULT_SHUTDOWN_DRAIN_TIMEOUT`], overridable with
+    /// [`EngineBuilder::shutdown_drain_timeout`]). A worker still running a pass
+    /// when the budget elapses is **aborted** rather than waited on forever;
+    /// shutdown then still joins it and emits [`Event::DaemonStopped`]. An aborted
+    /// pass may leave a `git` invocation running on its blocking thread, but no
+    /// async task is leaked and the engine is fully wound down.
+    ///
+    /// # Runtime
+    ///
+    /// Must be called from within the same Tokio runtime the engine was started
+    /// on.
+    pub async fn shutdown(self) {
+        let EngineHandle {
+            bus,
+            workers,
+            dispatchers,
+            drain_timeout,
+        } = self;
+
+        // 1. Stop the dispatchers first so no further trigger reaches a worker.
+        //    Aborting drops the route senders they hold; joining guarantees
+        //    those senders are gone before we wait on the workers, so each
+        //    worker's input channel is already closing.
+        for dispatcher in &dispatchers {
+            dispatcher.abort();
+        }
+        for dispatcher in dispatchers {
+            let _ = dispatcher.await;
+        }
+
+        // 2. Drain the workers. Each observes its now-senderless channel close
+        //    and exits after finishing any in-flight pass, dropping its watch
+        //    and schedule handles on the way out. Bound the wait: a worker still
+        //    running when the budget elapses is aborted so shutdown cannot hang.
+        let mut workers: Vec<Option<JoinHandle<()>>> = workers.into_iter().map(Some).collect();
+        let deadline = Instant::now() + drain_timeout;
+        for slot in workers.iter_mut() {
+            let handle = slot.as_mut().expect("worker slots start populated");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, handle).await {
+                Ok(_joined) => *slot = None,
+                // Budget spent: stop draining and abort whatever is left.
+                Err(_elapsed) => break,
+            }
+        }
+        for handle in workers.iter_mut().flatten() {
+            handle.abort();
+        }
+        for mut slot in workers {
+            if let Some(handle) = slot.take() {
+                let _ = handle.await;
+            }
+        }
+
+        // 3. Every task has joined, so this is provably the last event.
+        bus.emit(Event::DaemonStopped);
     }
 }
 
@@ -913,6 +1040,14 @@ impl EngineBuilder {
     /// Sets the cap on consecutive unsafe re-polls before waiting for activity.
     pub fn unsafe_repoll_max_attempts(mut self, attempts: u32) -> Self {
         self.cfg.unsafe_repoll_max_attempts = attempts;
+        self
+    }
+
+    /// Sets how long [`EngineHandle::shutdown`] waits for in-flight passes to
+    /// drain before aborting the workers (default
+    /// [`DEFAULT_SHUTDOWN_DRAIN_TIMEOUT`]).
+    pub fn shutdown_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.cfg.shutdown_drain_timeout = timeout;
         self
     }
 
@@ -1264,6 +1399,7 @@ mod tests {
             lock_retry_base: Duration::from_secs(2),
             unsafe_repoll_interval: Duration::from_secs(30),
             unsafe_repoll_max_attempts: 480,
+            shutdown_drain_timeout: Duration::from_secs(30),
         }
     }
 
