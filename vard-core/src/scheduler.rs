@@ -1,12 +1,12 @@
 //! The interval scheduler: turn a per-watch period into a tick signal.
 //!
-//! A schedule fires exactly one [`SchedulerSignal::Tick`] each time its watch's
-//! interval elapses (default [`WatchSpec::interval`]). The tick is the
-//! scheduler's whole job: it says "this watch's interval came due", and the
-//! snapshot engine consumes it. Whether that tick actually produces a
-//! snapshot — skipping the work when the tree is clean — is the engine's
-//! decision through the VCS layer, not the scheduler's. The scheduler just
-//! ticks.
+//! A schedule fires one [`SchedulerSignal::Tick`] each time its watch's
+//! interval comes due (the engine passes each watch's
+//! [`interval`](crate::WatchSpec::interval)). The tick is the scheduler's
+//! whole job: it says "this watch's interval came due", and the snapshot
+//! engine consumes it. Whether that tick actually produces a snapshot —
+//! skipping the work when the tree is clean — is the engine's decision
+//! through the VCS layer, not the scheduler's. The scheduler just ticks.
 //!
 //! This is the twin of the [watcher](crate::watcher): where the watcher signals
 //! "activity, then quiet", the scheduler signals "interval elapsed", per watch.
@@ -21,39 +21,53 @@
 //! one interval spreads that first wave out to whenever each watch's period
 //! naturally falls due.
 //!
-//! # Missed-tick coalescing
+//! # Missed ticks skip; queued ticks are the consumer's
 //!
-//! After the laptop sleeps and wakes — or a stalled consumer stops draining
-//! ticks — the wall-clock time for several intervals may pass at once. The
-//! scheduler collapses that missed window into a *single* tick and then resumes
-//! the normal cadence, aligned to the period; it never fires a backlog of one
-//! tick per missed interval. A watch that slept through six intervals wants one
-//! snapshot of where the tree landed, not six identical ones. This is
-//! [`MissedTickBehavior::Skip`] on the underlying [`tokio::time::interval`].
+//! Ticks are level-triggered and queue: the signal channel is unbounded and
+//! the tick task never waits for the consumer, so a consumer that stops
+//! draining for five intervals finds five queued `Tick`s when it resumes.
+//! Collapsing a queued run of identical ticks for the same watch is the
+//! consuming engine's job, not the scheduler's.
+//!
+//! The timer itself, though, never fires a backlog. When the tick *task* is
+//! the late party — the executor was starved, or the task was blocked long
+//! enough for several deadlines to pass in monotonic time — at most one tick
+//! fires for the whole missed window, and the cadence resumes aligned to the
+//! original period grid. This is [`MissedTickBehavior::Skip`] on the
+//! underlying [`tokio::time::interval`].
+//!
+//! Laptop sleep needs neither mechanism: the timer runs on the monotonic
+//! clock (`CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on macOS), which
+//! pauses during system suspend. After wake the timer has seen almost no
+//! elapsed time, so no backlog ever exists to coalesce — a watch that slept
+//! through six intervals of wall-clock time just finishes elapsing its
+//! current (paused) interval and ticks once, never six times.
 //!
 //! # Trigger mode is not the scheduler's concern
 //!
-//! [`arm`](Scheduler::arm) does **not** consult
-//! [`WatchSpec::trigger`](crate::TriggerMode): it arms a schedule for any watch
-//! handed to it. Which components a watch arms per its
-//! [`TriggerMode`](crate::TriggerMode) — events, interval, or both — is the
-//! engine's decision; the engine simply does not call `arm` for a watch whose
-//! mode excludes the interval trigger. Keeping the mode check out of here leaves
-//! the scheduler a pure per-watch timer.
+//! [`arm`](Scheduler::arm) does **not** consult the watch's
+//! [`TriggerMode`](crate::TriggerMode): it arms a schedule for whatever name
+//! and period it is handed. Which components a watch arms per its mode —
+//! events, interval, or both — is the engine's decision; the engine simply
+//! does not call `arm` for a watch whose mode excludes the interval trigger.
+//! Keeping the mode check out of here leaves the scheduler a pure per-watch
+//! timer.
 //!
 //! # Trouble reporting
 //!
 //! A schedule task that dies abnormally is reported as
-//! [`SchedulerSignal::Trouble`] by a supervisor, so a schedule can never
-//! silently turn into a zombie that looks armed but never ticks. A deliberate
-//! disarm (handle drop) is not abnormal and reports nothing.
+//! [`SchedulerSignal::Trouble`] by a supervisor; a deliberate disarm (handle
+//! drop) is not abnormal and reports nothing. Trouble travels the same
+//! channel as ticks, so the report reaches the consumer only while the
+//! [`SchedulerRx`] is alive — keeping that receiver alive and drained is the
+//! host's concern.
 //!
-//! # One schedule per purpose
+//! # One scheduler per purpose
 //!
-//! A watch gets one schedule per timed purpose: today only the snapshot
-//! interval, but a second pull-driven sync schedule (a different period, with
-//! jitter) is expected later and would arm as its own independent schedule over
-//! the same watch, distinguished by a label on the tick.
+//! A `Scheduler` carries one kind of tick. A second timed purpose — the
+//! pull-driven sync interval expected later, with its own period and jitter —
+//! arms a second `Scheduler` instance with its own receiver; the separate
+//! channel is the routing, so a tick never needs a purpose label.
 
 use std::time::Duration;
 
@@ -61,13 +75,12 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
-use crate::config::WatchSpec;
-
 /// What the scheduler reports on its one stream: an elapsed interval or trouble.
 ///
 /// `Tick` is emitted once each time a watch's interval comes due — the first
-/// one interval after arming, then on a steady cadence, with a slept-through
-/// window collapsed to a single tick (see the [module docs](self)).
+/// one interval after arming, then on a steady cadence (see the
+/// [module docs](self) for how a late timer task and a lagging consumer
+/// differ).
 ///
 /// `Trouble` means the schedule needs attention: its task died abnormally. A
 /// schedule that emits `Trouble` is no longer ticking, so the consumer should
@@ -104,13 +117,13 @@ pub type SchedulerRx = mpsc::UnboundedReceiver<SchedulerSignal>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SchedulerError {
-    /// The watch's interval was zero. A zero period cannot be scheduled — the
-    /// underlying timer rejects it — so the schedule is refused here rather
-    /// than spawning a task that would panic. [`WatchSpec`]'s builder already
-    /// rejects a zero interval, so this is defense in depth against a period of
-    /// zero reaching the timer regardless of how the spec was obtained.
+    /// The requested period was zero. A zero period cannot be scheduled — the
+    /// underlying timer panics on one — so the schedule is refused here
+    /// rather than spawning a task that would die. A period read off a
+    /// [`WatchSpec`](crate::WatchSpec) never trips this (its builder rejects
+    /// zero durations); a raw duration from any other source can.
     ZeroInterval {
-        /// Stable name of the watch whose interval was zero.
+        /// Stable name of the watch whose period was zero.
         watch: String,
     },
 }
@@ -130,11 +143,12 @@ impl std::error::Error for SchedulerError {}
 /// The per-schedule tick loop: one instance runs per armed schedule.
 ///
 /// Ticks on `period`, with the first tick one full `period` after the loop
-/// starts (`interval_at(now + period, period)`), and missed ticks skipped so a
-/// slept-through window collapses to one tick before the cadence resumes. Each
-/// tick sends one [`SchedulerSignal::Tick`]; the loop ends when the send fails,
-/// which means the consumer dropped its [`SchedulerRx`] and there is no one
-/// left to tick for.
+/// starts (`interval_at(now + period, period)`), and missed deadlines skipped
+/// so a late-polling task fires at most one tick for the whole missed window
+/// before the cadence resumes on the period grid. Each tick sends one
+/// [`SchedulerSignal::Tick`]; the loop ends when the send fails, which means
+/// the consumer dropped its [`SchedulerRx`] and there is no one left to tick
+/// for.
 async fn run_schedule(
     watch: String,
     period: Duration,
@@ -144,9 +158,10 @@ async fn run_schedule(
     // watch at daemon start, and an at-arm tick would stampede them all into a
     // snapshot at once.
     let mut ticker = interval_at(Instant::now() + period, period);
-    // Skip (not Burst): after suspend/resume or a stalled consumer, at most one
-    // tick fires for the whole missed window, then the cadence resumes aligned
-    // to the period — never a backlog of one tick per missed interval.
+    // Skip (not Burst): if this task polls late — executor starvation, a
+    // long-blocked runtime — at most one tick fires for the whole missed
+    // window, then the cadence resumes aligned to the period grid, never a
+    // backlog of one tick per missed deadline.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -165,7 +180,8 @@ async fn run_schedule(
 }
 
 /// Watches a schedule task and reports an abnormal end as
-/// [`SchedulerSignal::Trouble`], so a schedule can never die silently. A
+/// [`SchedulerSignal::Trouble`], so an abnormal death is surfaced rather than
+/// silent — for as long as the consumer holds its [`SchedulerRx`]. A
 /// deliberate abort (disarm) is not abnormal and reports nothing.
 fn supervise(
     watch: String,
@@ -191,8 +207,8 @@ fn supervise(
 /// removed while the scheduler runs. Every armed schedule feeds the single
 /// [`SchedulerRx`] returned alongside the scheduler.
 ///
-/// The scheduler is cheap to clone-by-handle: [`arm`](Scheduler::arm) takes
-/// `&self`, so one `Scheduler` value serves the whole process.
+/// [`arm`](Scheduler::arm) takes `&self`, so one `Scheduler` value serves the
+/// whole process.
 pub struct Scheduler {
     signal_tx: mpsc::UnboundedSender<SchedulerSignal>,
 }
@@ -204,30 +220,42 @@ impl Scheduler {
         (Scheduler { signal_tx }, signal_rx)
     }
 
-    /// Arms an interval schedule for `spec` and returns its handle.
+    /// Arms a schedule ticking as `watch` every `period`, and returns its
+    /// handle.
     ///
-    /// Uses [`spec.name()`](WatchSpec::name) as the tick's stable identity and
-    /// [`spec.interval()`](WatchSpec::interval) as the period. The first tick
-    /// fires one full interval later, not now (see the [module docs](self) for
-    /// why); thereafter it ticks on that period, coalescing missed ticks.
+    /// `watch` is the tick's stable identity and `period` its cadence; for a
+    /// snapshot-interval schedule the engine passes the watch's
+    /// [`name()`](crate::WatchSpec::name) and
+    /// [`interval()`](crate::WatchSpec::interval). The first tick fires one
+    /// full period later, not now (see the [module docs](self) for why);
+    /// thereafter it ticks on that period, skipping — never batching — missed
+    /// deadlines.
     ///
-    /// This does **not** consult [`spec.trigger()`](crate::TriggerMode): a
-    /// schedule is armed for whatever watch is passed. The engine decides which
-    /// watches get an interval schedule per their
-    /// [`TriggerMode`](crate::TriggerMode) and simply does not arm the ones
-    /// that exclude it.
+    /// This does **not** consult the watch's
+    /// [`TriggerMode`](crate::TriggerMode): a schedule is armed for whatever
+    /// name and period are passed. The engine decides which watches get an
+    /// interval schedule per their mode and simply does not arm the ones
+    /// whose mode excludes it.
     ///
-    /// Fails with [`SchedulerError::ZeroInterval`] if the interval is zero (a
-    /// zero period cannot be scheduled). [`WatchSpec`]'s builder already rejects
-    /// that, so a spec from the builder never trips it.
+    /// Fails with [`SchedulerError::ZeroInterval`] if `period` is zero (a
+    /// zero period cannot be scheduled).
+    ///
+    /// # No same-watch deduplication
+    ///
+    /// Arming the same watch twice is not detected here: both schedules arm,
+    /// and both tick — every tick is doubled. The engine owns arming each
+    /// watch's schedule exactly once.
     ///
     /// # Runtime
     ///
     /// Must be called from within a Tokio runtime: it spawns the schedule's
     /// tick task and its supervisor.
-    pub fn arm(&self, spec: &WatchSpec) -> Result<ScheduleHandle, SchedulerError> {
-        let watch = spec.name().to_string();
-        let period = spec.interval();
+    pub fn arm(
+        &self,
+        watch: impl Into<String>,
+        period: Duration,
+    ) -> Result<ScheduleHandle, SchedulerError> {
+        let watch = watch.into();
         if period.is_zero() {
             return Err(SchedulerError::ZeroInterval { watch });
         }
@@ -292,15 +320,6 @@ mod tests {
         }
     }
 
-    /// A watch spec with a given interval over a nominal path. The path is
-    /// never touched — the scheduler is a pure timer — so it need not exist.
-    fn spec(name: &str, interval: Duration) -> WatchSpec {
-        WatchSpec::builder(name, "/nonexistent/vard-scheduler-test")
-            .interval(interval)
-            .build()
-            .unwrap()
-    }
-
     // --- tick cadence (paused time) ------------------------------------------
 
     #[tokio::test(start_paused = true)]
@@ -349,14 +368,15 @@ mod tests {
         let (mut rx, _task) = spawn_schedule("w", period);
         settle().await;
 
-        // Model laptop sleep or a stalled consumer: several intervals of
-        // wall-clock time pass in a single jump.
+        // Model the tick task polling late: five periods of monotonic time
+        // pass before it next runs (executor starvation, a long-blocked
+        // runtime).
         tokio::time::advance(period * 5).await;
         settle().await;
         expect_tick(&mut rx, "w");
         assert!(
             rx.try_recv().is_err(),
-            "a slept-through window collapses to one tick, not a backlog of five"
+            "a missed window collapses to one tick, not a backlog of five"
         );
 
         // Cadence resumes aligned: the next tick is one period after the
@@ -368,6 +388,52 @@ mod tests {
             rx.try_recv().is_err(),
             "cadence resumes at one tick per period"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_ticks_realign_to_the_period_grid_not_the_late_poll() {
+        let period = Duration::from_secs(60);
+        let (mut rx, _task) = spawn_schedule("w", period);
+        settle().await;
+
+        // From the on-grid start, 2.5 periods pass in one jump: the deadlines
+        // at 1P and 2P were both missed when the task next polls, at t=2.5P.
+        tokio::time::advance(period * 5 / 2).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+        assert!(rx.try_recv().is_err(), "the missed window is one tick");
+
+        // Skip realigns to the grid: the next tick lands at t=3P, half a
+        // period away — not a full period after the late poll (t=3.5P, which
+        // is what Delay would give).
+        tokio::time::advance(period / 2 - Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no tick just short of the grid point"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ticks_queue_for_a_lagging_consumer_they_are_not_coalesced() {
+        let period = Duration::from_secs(60);
+        let (mut rx, _task) = spawn_schedule("w", period);
+        settle().await;
+
+        // The timer task keeps running on cadence while the consumer drains
+        // nothing: ticks are level-triggered and queue on the unbounded
+        // channel. Deduplicating a queued run is the consuming engine's job.
+        for _ in 0..5 {
+            tokio::time::advance(period).await;
+            settle().await;
+        }
+        for _ in 0..5 {
+            expect_tick(&mut rx, "w");
+        }
+        assert!(rx.try_recv().is_err(), "exactly the five emitted ticks");
     }
 
     #[tokio::test(start_paused = true)]
@@ -406,24 +472,43 @@ mod tests {
     // --- arm / disarm through the public surface (paused time) ---------------
 
     #[tokio::test(start_paused = true)]
-    async fn armed_schedule_ticks_on_its_interval() {
+    async fn armed_schedule_is_silent_until_one_full_period_then_ticks() {
         let period = Duration::from_secs(15 * 60);
         let (scheduler, mut rx) = Scheduler::new();
-        let handle = scheduler.arm(&spec("w", period)).unwrap();
-        settle().await;
+        let _handle = scheduler.arm("w", period).unwrap();
 
-        tokio::time::advance(period).await;
+        // Nothing at arm: arming at daemon start must not stampede a
+        // snapshot across every watch at once.
+        settle().await;
+        assert!(rx.try_recv().is_err(), "must not tick at arm");
+
+        tokio::time::advance(period - Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not tick before one full period elapses"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         expect_tick(&mut rx, "w");
+        assert!(rx.try_recv().is_err(), "exactly one tick at the period");
+    }
 
-        drop(handle);
+    #[tokio::test(start_paused = true)]
+    async fn zero_period_is_refused_at_arm() {
+        let (scheduler, _rx) = Scheduler::new();
+        match scheduler.arm("w", Duration::ZERO) {
+            Err(SchedulerError::ZeroInterval { watch }) => assert_eq!(watch, "w"),
+            other => panic!("expected ZeroInterval, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_handle_disarms_and_stops_ticks() {
         let period = Duration::from_secs(60);
         let (scheduler, mut rx) = Scheduler::new();
-        let handle = scheduler.arm(&spec("w", period)).unwrap();
+        let handle = scheduler.arm("w", period).unwrap();
         settle().await;
 
         // One tick lands while armed.
