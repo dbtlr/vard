@@ -16,6 +16,7 @@
 
 pub mod config;
 pub mod event;
+pub mod vcs;
 
 pub use config::{
     ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SYNC,
@@ -25,4 +26,10 @@ pub use config::{
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
     WatchState,
+};
+pub use vcs::git::GitBackend;
+pub use vcs::{
+    ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
+    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, UnsafeReason,
+    VcsBackend, VcsError, VcsRef,
 };

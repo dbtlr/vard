@@ -12,3 +12,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }
+# Real git repositories in tempdirs back the vcs backend's integration tests.
+# Dev-only: the crate's non-dev dependency tree stays tokio-only.
+tempfile = "3"
