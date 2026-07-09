@@ -33,6 +33,8 @@ use std::time::SystemTime;
 
 use crate::event::Trigger;
 
+pub mod git;
+
 /// The per-watch operational surface of a version-control backend.
 ///
 /// Every method borrows `&self`, returns `Result<_, VcsError>`, and is

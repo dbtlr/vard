@@ -27,6 +27,7 @@ pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, Trigger, TryRecvError,
     WatchState,
 };
+pub use vcs::git::GitBackend;
 pub use vcs::{
     ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
     RestoreTarget, SafeState, Snapshot, SnapshotId, UnsafeReason, VcsBackend, VcsError, VcsRef,
