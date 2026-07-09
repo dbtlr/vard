@@ -3,7 +3,7 @@
 //!
 //! [`Engine`] is the embeddable SDK entry point (the spec's §2a contract). A
 //! host builds it from validated [`WatchSpec`] values, subscribes to its
-//! [`EventBus`](crate::EventBus), and starts it:
+//! [`EventBus`], and starts it:
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -51,10 +51,10 @@
 //! triggers collapse into one due snapshot, and the flag records only the
 //! most-intentional [`Trigger`] that contributed (manual beats the protective
 //! pre-restore/pre-sync triggers, which beat filesystem events, which beat the
-//! interval timer — see [`trigger_priority`]). When a snapshot comes due the
+//! interval timer — most-intentional wins). When a snapshot comes due the
 //! worker:
 //!
-//! 1. Acquires the watch's [`MuteGuard`](crate::MuteGuard) so vard's own writes
+//! 1. Acquires the watch's [`MuteGuard`] so vard's own writes
 //!    do not feed back as fresh activity (self-suppression), and holds it across
 //!    the whole operation.
 //! 2. Re-checks [`is_safe_state`](VcsBackend::is_safe_state). An unsafe repo
@@ -427,7 +427,10 @@ impl Worker {
                 self.unsafe_paused = false;
                 self.repoll_attempts = 0;
                 self.repoll_exhausted = false;
-                self.set_state(WatchState::Ok, Some("repository returned to a safe state".into()));
+                self.set_state(
+                    WatchState::Ok,
+                    Some("repository returned to a safe state".into()),
+                );
                 if self.pending.is_some() {
                     self.run_pass().await;
                 }
@@ -680,9 +683,7 @@ async fn dispatch_scheduler(
 ) {
     while let Some(signal) = rx.recv().await {
         let (watch, input) = match signal {
-            SchedulerSignal::Tick { watch } => {
-                (watch, WatchInput::Trigger(Provenance::interval()))
-            }
+            SchedulerSignal::Tick { watch } => (watch, WatchInput::Trigger(Provenance::interval())),
             SchedulerSignal::Trouble { watch, detail } => (watch, WatchInput::Trouble { detail }),
         };
         if let Some(tx) = routes.get(&watch) {
@@ -804,10 +805,11 @@ impl EngineBuilder {
             let cw = match pending {
                 PendingWatch::Backend(spec, backend) => ConfiguredWatch { spec, backend },
                 PendingWatch::Git(spec) => {
-                    let backend = open_git_backend(&spec).map_err(|source| EngineError::Backend {
-                        watch: spec.name().to_string(),
-                        source,
-                    })?;
+                    let backend =
+                        open_git_backend(&spec).map_err(|source| EngineError::Backend {
+                            watch: spec.name().to_string(),
+                            source,
+                        })?;
                     ConfiguredWatch {
                         spec,
                         backend: Arc::new(backend),
@@ -865,7 +867,10 @@ impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EngineError::DuplicateWatch { name } => {
-                write!(f, "duplicate watch name {name:?}; watch names must be unique")
+                write!(
+                    f,
+                    "duplicate watch name {name:?}; watch names must be unique"
+                )
             }
             EngineError::Backend { watch, source } => {
                 write!(f, "watch {watch:?}: could not open backend: {source}")
@@ -1172,7 +1177,8 @@ mod tests {
         backend.script([Scripted::Commit(3)]); // then Clean by default on re-check
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
-        tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
 
         let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
         match ev {
@@ -1198,7 +1204,8 @@ mod tests {
         backend.script([Scripted::Clean]);
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
-        tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
         wait_snapshot_calls(&backend, 1).await;
         settle().await;
         // No event: an interval on a clean tree is a no-op.
@@ -1221,11 +1228,13 @@ mod tests {
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
         // First trigger enters the gated snapshot.
-        tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
         settle().await;
         // A burst of ten more triggers queues while the snapshot is in flight.
         for _ in 0..10 {
-            tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+            tx.send(WatchInput::Trigger(Provenance::interval()))
+                .unwrap();
         }
         settle().await;
 
@@ -1233,9 +1242,21 @@ mod tests {
 
         // Exactly two commits: the original and one coalesced follow-up.
         let first = advance_until_event(&mut events, Duration::from_secs(1)).await;
-        assert!(matches!(first, Event::SnapshotCompleted { files_changed: 1, .. }));
+        assert!(matches!(
+            first,
+            Event::SnapshotCompleted {
+                files_changed: 1,
+                ..
+            }
+        ));
         let second = advance_until_event(&mut events, Duration::from_secs(1)).await;
-        assert!(matches!(second, Event::SnapshotCompleted { files_changed: 2, .. }));
+        assert!(matches!(
+            second,
+            Event::SnapshotCompleted {
+                files_changed: 2,
+                ..
+            }
+        ));
 
         wait_snapshot_calls(&backend, 4).await;
         assert!(
@@ -1287,7 +1308,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_muted, "the worker must be muted during its own snapshot");
+        assert!(
+            saw_muted,
+            "the worker must be muted during its own snapshot"
+        );
 
         release.send(()).unwrap();
         let _ = advance_until_event(&mut events, Duration::from_secs(1)).await;
@@ -1311,7 +1335,8 @@ mod tests {
         backend.script([Scripted::Lock, Scripted::Lock, Scripted::Commit(1)]);
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
-        tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
 
         // If the retry loop were removed, the first lock would requeue and no
         // SnapshotCompleted would ever arrive — this asserts the retry.
@@ -1339,7 +1364,8 @@ mod tests {
         let cfg = test_cfg();
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), cfg);
 
-        tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        tx.send(WatchInput::Trigger(Provenance::interval()))
+            .unwrap();
 
         // Drive through all the backoffs; nothing ever completes.
         for _ in 0..200 {
@@ -1412,7 +1438,10 @@ mod tests {
             matches!(snap, Event::SnapshotCompleted { .. }),
             "the requeued snapshot runs once the repo is safe again"
         );
-        assert!(backend.safe_calls() >= 2, "the re-poll must have re-checked");
+        assert!(
+            backend.safe_calls() >= 2,
+            "the re-poll must have re-checked"
+        );
     }
 
     #[tokio::test(start_paused = true)]
