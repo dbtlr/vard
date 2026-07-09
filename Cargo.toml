@@ -11,6 +11,13 @@ repository = "https://github.com/dbtlr/vard"
 
 [workspace.dependencies]
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# Cross-platform filesystem notifications back vard-core's watcher: native
+# FSEvents/inotify/ReadDirectoryChanges via recommended_watcher, with a
+# PollWatcher fallback. `ignore` supplies gitignore-dialect exclude matching
+# (the same dialect git writes to .git/info/exclude), so a watch's exclude
+# patterns filter events exactly as git would ignore them.
+notify = "8"
+ignore = "0.4"
 # serde derive + toml back the binary's file-config layer (vard only). Duration
 # strings deserialize through vard-core's parser, so no humantime crate is
 # needed. toml is trimmed to parse+serde: vard reads config, it never writes
