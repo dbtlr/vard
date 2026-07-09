@@ -33,6 +33,11 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 clap_mangen = "0.3"
+# CLI output primitives (vard only). `anstyle` carries the ANSI-256 color
+# styles behind the palette; `terminal_size` supplies the width/height the
+# help renderer and pager need to wrap and page output on a TTY.
+anstyle = "1"
+terminal_size = "0.4"
 # Structured logging for the daemon shell (vard only). `tracing` is the emit
 # API; `tracing-subscriber` renders to stderr via its `fmt` layer. The level is
 # set programmatically from `[daemon].log_level`, so the `env-filter` feature is
