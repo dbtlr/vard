@@ -35,6 +35,6 @@ pub use vcs::{
     VcsBackend, VcsError, VcsRef,
 };
 pub use watcher::{
-    Activity, ArmMode, DEFAULT_POLL_INTERVAL, MuteGuard, WatchHandle, Watcher, WatcherError,
-    WatcherRx,
+    ArmMode, DEFAULT_POLL_INTERVAL, MuteGuard, WatchHandle, Watcher, WatcherError, WatcherRx,
+    WatcherSignal,
 };

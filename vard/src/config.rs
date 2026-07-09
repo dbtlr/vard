@@ -82,8 +82,8 @@ pub(crate) struct Defaults {
 /// One `[[watch]]` table. `name` and `path` are required. Of the optional
 /// fields, exactly five inherit from `[defaults]` before falling back to the
 /// core constants: `trigger`, `interval`, `quiesce`, `sync`, and
-/// `sync_interval`. `branch`, `remote`, and `exclude` have no `[defaults]`
-/// home (per spec §12) and fall back to the core defaults directly.
+/// `sync_interval`. `branch`, `remote`, `exclude`, and `poll_interval` have no
+/// `[defaults]` home and fall back to the core defaults directly.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WatchConfig {
@@ -99,6 +99,12 @@ pub(crate) struct WatchConfig {
     pub sync: Option<bool>,
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub sync_interval: Option<Duration>,
+    /// Forces the filesystem watcher to poll at this period instead of using
+    /// native events. Deliberately per-watch with no `[defaults]` counterpart:
+    /// polling compensates for one path's filesystem (a network mount, a
+    /// container bind), not a fleet-wide preference.
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub poll_interval: Option<Duration>,
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Tolerated opaquely for the known-future spec §12 surface.
@@ -228,6 +234,9 @@ impl Config {
             }
             if let Some(sync_interval) = watch.sync_interval.or(self.defaults.sync_interval) {
                 builder = builder.sync_interval(sync_interval);
+            }
+            if let Some(poll_interval) = watch.poll_interval {
+                builder = builder.poll_interval(poll_interval);
             }
             if let Some(branch) = &watch.branch {
                 builder = builder.branch(branch);
@@ -884,6 +893,80 @@ path = "/somewhere"
             Err(ConfigError::Io { .. }) => {}
             other => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn poll_interval_parses_and_reaches_the_spec() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "netfs"
+path = "/mnt/share"
+poll_interval = "45s"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].poll_interval(), Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn absent_poll_interval_stays_native() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "local"
+path = "/data/local"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].poll_interval(), None);
+    }
+
+    #[test]
+    fn zero_poll_interval_is_rejected_with_watch_attribution() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "netfs"
+path = "/mnt/share"
+poll_interval = "0s"
+"#,
+        )
+        .unwrap();
+        match config.resolve() {
+            Err(ConfigError::Watch { name, source }) => {
+                assert_eq!(name, "netfs");
+                assert!(
+                    source.to_string().contains("poll_interval"),
+                    "got: {source}"
+                );
+            }
+            other => panic!("expected Watch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_interval_has_no_defaults_home() {
+        // Polling is a property of one watch's filesystem, not a fleet-wide
+        // default; a [defaults] entry must be rejected like any unknown key.
+        let err = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+poll_interval = "45s"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("poll_interval"), "got: {err}");
     }
 
     #[test]

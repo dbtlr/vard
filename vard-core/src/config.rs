@@ -5,9 +5,9 @@
 //! in any host. The engine and every embedder take watches as validated
 //! [`WatchSpec`] values; there is no file I/O and no serde in this module (see
 //! the [crate docs](crate)). The binary's file-config layer and any SDK
-//! embedder both build [`WatchSpec`]s through the same [`builder`], so the
-//! default *values* live here as public constants — one source of truth shared
-//! across every host.
+//! embedder both build [`WatchSpec`]s through the same
+//! [`builder`](WatchSpec::builder), so the default *values* live here as
+//! public constants — one source of truth shared across every host.
 //!
 //! # Relation to the spec's SDK sketch
 //!

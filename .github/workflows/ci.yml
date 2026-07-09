@@ -35,6 +35,10 @@ jobs:
       - name: cargo clippy --workspace --all-targets -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # --- docs gate (`just doc`) ---
+      - name: cargo doc -D warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
       # --- supply-chain gates (`just audit` / `just deny`) ---
       - name: cargo audit
         run: cargo audit

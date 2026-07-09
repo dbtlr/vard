@@ -4,7 +4,7 @@ default: check
 check: fmt-check lint test
 
 # The full local gate: everything CI enforces, including supply-chain checks
-check-all: check audit deny
+check-all: check doc audit deny
 
 build:
     cargo build --workspace --locked
@@ -23,6 +23,10 @@ fmt-check:
 
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+
+# Docs gate: rustdoc warnings (e.g. broken intra-doc links) are errors
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Supply-chain: known-vulnerability scan (RustSec advisory DB)
 audit:
