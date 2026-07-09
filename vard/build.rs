@@ -9,7 +9,7 @@
 //! viable.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::CommandFactory;
 use clap_complete::{Shell, generate_to};
@@ -60,10 +60,10 @@ fn main() -> std::io::Result<()> {
     generate_to(Shell::Fish, &mut cmd, "vard", &completions_dir)?;
     generate_to(Nushell, &mut cmd, "vard", &completions_dir)?;
 
-    let man = Man::new(cmd);
-    let mut buffer = Vec::new();
-    man.render(&mut buffer)?;
-    std::fs::write(man_dir.join("vard.1"), buffer)?;
+    // clap_mangen renders one page per command, so walk the whole tree: the
+    // top-level page plus one for every (nested) subcommand — `vard.1`,
+    // `vard-run.1`, and any future `vard-<parent>-<child>.1`.
+    write_man_pages(&cmd, "vard", &man_dir)?;
 
     println!("cargo:rerun-if-changed=src/cli.rs");
     println!("cargo:rerun-if-changed=build.rs");
@@ -71,5 +71,28 @@ fn main() -> std::io::Result<()> {
     // come from the manifests — a version bump must regenerate the artifacts.
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=../Cargo.toml");
+    Ok(())
+}
+
+/// Render the roff manpage for `cmd` as `<full_name>.1`, then recurse into every
+/// visible subcommand as `<full_name>-<child>.1`. `full_name` is the dashed
+/// command path (`vard`, `vard-run`, …); the command is renamed to it so the
+/// page title matches the file name.
+fn write_man_pages(cmd: &clap::Command, full_name: &str, man_dir: &Path) -> std::io::Result<()> {
+    // clap's `Command::name` wants a `'static` string; in a short-lived build
+    // script, leaking the dashed name is the simplest way to satisfy that.
+    let leaked: &'static str = Box::leak(full_name.to_owned().into_boxed_str());
+    let named = cmd.clone().name(leaked);
+    let mut buffer = Vec::new();
+    Man::new(named).render(&mut buffer)?;
+    std::fs::write(man_dir.join(format!("{full_name}.1")), buffer)?;
+
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        let child_name = format!("{full_name}-{}", sub.get_name());
+        write_man_pages(sub, &child_name, man_dir)?;
+    }
     Ok(())
 }
