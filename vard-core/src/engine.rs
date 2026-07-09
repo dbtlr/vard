@@ -58,9 +58,9 @@
 //!    do not feed back as fresh activity (self-suppression), and holds it across
 //!    the whole operation.
 //! 2. Re-checks [`is_safe_state`](VcsBackend::is_safe_state). An unsafe repo
-//!    pauses the watch and arms a bounded re-poll that auto-resumes it once the
+//!    pauses the watch and arms a bounded retry that auto-resumes it once the
 //!    repo returns to safe — this works even for an `events`-only watch that
-//!    will receive no further signals, because the re-poll is a timer, not a
+//!    will receive no further signals, because the retry is a timer, not a
 //!    signal.
 //! 3. On a safe repo, calls [`snapshot`](VcsBackend::snapshot), retrying a
 //!    contended index lock with exponential backoff before requeueing (it never
@@ -69,11 +69,24 @@
 //! 4. Runs a **post-op dirtiness re-check**: because the sweep is a total
 //!    `add -A`, a clean tree yields nothing on a second pass, so re-snapshotting
 //!    converges — but a real write that landed during the muted window is caught
-//!    and snapshotted as a follow-up, never lost.
+//!    and snapshotted as a follow-up, never lost. The re-check is bounded to one
+//!    sweep under the mute so a misbehaving backend cannot livelock it.
+//!
+//! # Converging a stuck pending change
+//!
+//! Whenever a pass holds a pending change it could not snapshot — for **any**
+//! reason: an unsafe repo, a failed safe-state probe, or a hard snapshot
+//! failure — the worker preserves the change and arms a single bounded retry
+//! timer that re-attempts it until it converges, with no further external
+//! signal. The failure is surfaced once (on entry), not once per tick, and the
+//! retry budget is bounded so a permanently broken repository stops retrying and
+//! waits for fresh activity. A contended lock is the sole exception: it requeues
+//! and waits for the next trigger rather than self-driving, so an externally
+//! held lock is never hammered.
 //!
 //! Trouble from either signal source ([`WatcherSignal::Trouble`],
-//! [`SchedulerSignal::Trouble`]) moves the watch to
-//! [`WatchState::Attention`](crate::WatchState) and is surfaced on the bus, so
+//! [`SchedulerSignal::Trouble`]), and a panicked backend call, move the watch to
+//! [`WatchState::Attention`](crate::WatchState) and are surfaced on the bus, so
 //! nothing dies silently.
 
 use std::collections::HashMap;
@@ -83,6 +96,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinError;
 use tokio::time::timeout;
 
 use crate::config::{TriggerMode, WatchSpec};
@@ -101,15 +115,19 @@ pub const DEFAULT_LOCK_RETRY_ATTEMPTS: u32 = 5;
 /// the five attempts — ~30 s total, matching spec §3.
 pub const DEFAULT_LOCK_RETRY_BASE: Duration = Duration::from_secs(2);
 
-/// Default cadence at which a watch paused for an unsafe repository re-polls
-/// [`is_safe_state`](VcsBackend::is_safe_state) to auto-resume.
+/// Default cadence at which a worker holding an un-snapshotted pending change
+/// re-attempts it — re-polling [`is_safe_state`](VcsBackend::is_safe_state) and
+/// re-running the snapshot — so it converges without any further external
+/// signal. Covers an unsafe repository, a failed safe-state probe, and a hard
+/// snapshot failure alike.
 pub const DEFAULT_UNSAFE_REPOLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Default cap on consecutive unsafe re-polls before a paused watch stops
-/// polling and waits for fresh activity. At [`DEFAULT_UNSAFE_REPOLL_INTERVAL`]
-/// this is four hours of background polling — bounded, so an abandoned unsafe
-/// repository does not poll forever, yet long enough that a genuine mid-op
-/// pause always auto-resumes. The counter resets whenever new activity arrives.
+/// Default cap on consecutive self-driving retries before a stuck worker stops
+/// retrying and waits for fresh activity. At [`DEFAULT_UNSAFE_REPOLL_INTERVAL`]
+/// this is four hours of background retrying — bounded, so a permanently broken
+/// repository does not retry forever, yet long enough that a genuine mid-op
+/// pause or transient failure always converges. The counter resets whenever new
+/// activity arrives.
 pub const DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS: u32 = 480;
 
 /// Tunable timing policy for a worker's retry and re-poll loops.
@@ -289,6 +307,25 @@ enum PassResult {
     StillLocked,
     /// The backend failed for some other reason.
     Failed(VcsError),
+    /// The blocking backend call panicked; the detail is the join error text.
+    Panicked(String),
+}
+
+/// Why a worker is holding an un-snapshotted pending change and retrying it on
+/// the bounded timer rather than waiting for an external signal.
+///
+/// The single generalized retry loop converges any stuck pending change without
+/// a future trigger; the kind only decides how the condition is surfaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryKind {
+    /// The repository is unsafe to commit: reported as
+    /// [`WatchState::Paused`](crate::WatchState) and resolved with an `Ok`
+    /// transition once it returns to safe.
+    UnsafePause,
+    /// A safe-state probe or snapshot attempt failed:
+    /// [`Event::SnapshotFailed`] was emitted once on entry and the change is
+    /// retried silently (no per-tick failure storm).
+    Failure,
 }
 
 /// One per-watch worker: the serialized snapshot loop for a single watch.
@@ -305,29 +342,32 @@ struct Worker {
     pending: Option<Provenance>,
     /// The last reported lifecycle state (drives change-only event emission).
     state: WatchState,
-    /// Whether the watch is paused because the repository is unsafe to commit.
-    unsafe_paused: bool,
-    /// Consecutive unsafe re-polls since the last activity (bounds polling).
-    repoll_attempts: u32,
-    /// Whether the re-poll budget is spent; the worker then waits for activity.
-    repoll_exhausted: bool,
+    /// Set while the worker holds a pending change it could not snapshot and is
+    /// converging it on the bounded retry timer, without any external signal.
+    /// The kind records how the blocking condition is surfaced.
+    retry: Option<RetryKind>,
+    /// Consecutive retry ticks since the last activity (bounds self-driving
+    /// retry).
+    retry_attempts: u32,
+    /// Whether the retry budget is spent; the worker then waits for activity.
+    retry_exhausted: bool,
 }
 
 impl Worker {
     /// Runs the worker until its input channel closes (every signal source for
     /// this watch was dropped, i.e. the engine is shutting down).
     ///
-    /// The loop blocks for the next input, except while paused for an unsafe
-    /// repository, when it also wakes on the re-poll deadline so the watch can
-    /// auto-resume without any further signal.
+    /// The loop blocks for the next input, except while a pending change is
+    /// being retried, when it also wakes on the retry deadline so the change
+    /// converges without any further signal.
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<WatchInput>) {
         loop {
-            let waiting_on_repoll = self.unsafe_paused && !self.repoll_exhausted;
-            let input = if waiting_on_repoll {
+            let waiting_on_retry = self.retry.is_some() && !self.retry_exhausted;
+            let input = if waiting_on_retry {
                 match timeout(self.cfg.unsafe_repoll_interval, rx.recv()).await {
                     Ok(received) => received,
                     Err(_elapsed) => {
-                        self.repoll().await;
+                        self.retry_tick().await;
                         continue;
                     }
                 }
@@ -343,7 +383,9 @@ impl Worker {
                 self.apply(more);
             }
 
-            if self.pending.is_some() && !self.unsafe_paused {
+            // While retrying, the bounded timer (not a fresh input) drives the
+            // next attempt, so we do not hammer a still-broken repository.
+            if self.pending.is_some() && self.retry.is_none() {
                 self.run_pass().await;
             }
         }
@@ -353,10 +395,10 @@ impl Worker {
     fn apply(&mut self, input: WatchInput) {
         match input {
             WatchInput::Trigger(prov) => {
-                // Fresh activity gives a paused watch a new chance to resume.
-                if self.unsafe_paused {
-                    self.repoll_attempts = 0;
-                    self.repoll_exhausted = false;
+                // Fresh activity gives a retrying watch a new chance to converge.
+                if self.retry.is_some() {
+                    self.retry_attempts = 0;
+                    self.retry_exhausted = false;
                 }
                 self.pending = Some(coalesce(self.pending.take(), prov));
             }
@@ -368,21 +410,41 @@ impl Worker {
 
     /// Drives the pending snapshot to a committed (or converged) state, holding
     /// the self-suppression mute for the whole sequence.
+    ///
+    /// Any way the pass fails to snapshot the pending change — an unsafe repo, a
+    /// failed safe-state probe, or a hard snapshot failure — preserves the
+    /// pending change and arms the bounded retry timer, so the change converges
+    /// without any external signal (see [`retry_tick`](Self::retry_tick)). A
+    /// contended lock is the one exception: it requeues and waits for the next
+    /// trigger, never self-driving, so an externally held lock is not hammered.
     async fn run_pass(&mut self) {
         let _mute = self.mute.acquire();
 
+        // Bounds the post-op dirtiness re-check to a single converging sweep
+        // under the mute: a backend that never returns `Clean` must not livelock
+        // this loop while holding the mute.
+        let mut committed_in_pass = false;
+
         while let Some(prov) = self.pending.take() {
             match check_safe(Arc::clone(&self.backend)).await {
-                Ok(SafeState::Safe) => {}
-                Ok(SafeState::Unsafe(reason)) => {
+                Ok(Ok(SafeState::Safe)) => self.on_safe(),
+                Ok(Ok(SafeState::Unsafe(reason))) => {
                     self.pending = Some(prov);
                     self.enter_unsafe(reason);
                     return;
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     // The safe-state probe itself failed; do not commit into an
-                    // unknown state. Surface it and give up the pass.
-                    self.emit_failed(prov.trigger, &err);
+                    // unknown state. Preserve the pending change and converge it
+                    // on the bounded retry timer instead of dropping it.
+                    self.pending = Some(prov.clone());
+                    self.enter_failure(prov.trigger, &err);
+                    return;
+                }
+                Err(join) => {
+                    // The probe task panicked: surface it, move to Attention,
+                    // and stay alive to process later inputs.
+                    self.on_backend_panic(prov.trigger, &join.to_string());
                     return;
                 }
             }
@@ -390,11 +452,23 @@ impl Worker {
             match snapshot_with_retry(Arc::clone(&self.backend), self.cfg, &prov).await {
                 PassResult::Committed(outcome) => {
                     self.emit_completed(prov.trigger, &outcome);
-                    // Post-op dirtiness re-check: sweep again under the same
-                    // mute. A clean tree returns `Clean` and the loop converges;
-                    // a write that landed during the muted window is caught here
-                    // and snapshotted as a follow-up.
-                    self.pending = Some(Provenance::event());
+                    // A commit means any prior retry has converged.
+                    self.clear_retry();
+                    if committed_in_pass {
+                        // A second commit under the mute is a genuine
+                        // mute-window write. Requeue it (carrying this pass's
+                        // provenance) and return so the mute is released and the
+                        // outer loop handles it, rather than looping unbounded
+                        // under the mute.
+                        self.pending = Some(prov);
+                        return;
+                    }
+                    committed_in_pass = true;
+                    // Post-op dirtiness re-check: sweep once more under the same
+                    // mute, carrying this pass's provenance. A clean tree returns
+                    // `Clean` and the loop converges; a write that landed during
+                    // the muted window is caught and snapshotted as a follow-up.
+                    self.pending = Some(prov);
                 }
                 PassResult::Clean => {
                     // Nothing to commit: converged.
@@ -411,44 +485,91 @@ impl Worker {
                     return;
                 }
                 PassResult::Failed(err) => {
-                    self.emit_failed(prov.trigger, &err);
-                    // Do not requeue a hard failure; converge this pass.
+                    // Preserve the pending change and converge it on the bounded
+                    // retry timer instead of dropping a hard failure.
+                    self.pending = Some(prov.clone());
+                    self.enter_failure(prov.trigger, &err);
+                    return;
+                }
+                PassResult::Panicked(detail) => {
+                    self.on_backend_panic(prov.trigger, &detail);
+                    return;
                 }
             }
         }
     }
 
-    /// Re-checks the repository while paused, resuming the watch when it becomes
-    /// safe. Bounds the number of consecutive polls.
-    async fn repoll(&mut self) {
-        self.repoll_attempts += 1;
-        match check_safe(Arc::clone(&self.backend)).await {
-            Ok(SafeState::Safe) => {
-                self.unsafe_paused = false;
-                self.repoll_attempts = 0;
-                self.repoll_exhausted = false;
-                self.set_state(
-                    WatchState::Ok,
-                    Some("repository returned to a safe state".into()),
-                );
-                if self.pending.is_some() {
-                    self.run_pass().await;
-                }
-            }
-            Ok(SafeState::Unsafe(_)) | Err(_) => {
-                if self.repoll_attempts >= self.cfg.unsafe_repoll_max_attempts {
-                    self.repoll_exhausted = true;
-                }
-            }
+    /// One bounded retry tick for a stuck pending change: re-attempt the pass so
+    /// an unsafe pause, failed probe, or hard failure converges without any
+    /// external signal. Exhausts the budget once the cap is reached, after which
+    /// the worker waits for fresh activity.
+    async fn retry_tick(&mut self) {
+        self.retry_attempts += 1;
+        if self.pending.is_some() {
+            self.run_pass().await;
+        }
+        // Still stuck after this attempt and out of budget: stop self-driving
+        // and wait for activity, so a permanently broken repo does not retry
+        // forever. Fresh activity resets the budget (see [`apply`](Self::apply)).
+        if self.retry.is_some() && self.retry_attempts >= self.cfg.unsafe_repoll_max_attempts {
+            self.retry_exhausted = true;
         }
     }
 
-    /// Enters the unsafe-paused state, arming the re-poll loop.
+    /// Handles a safe repository at the top of a pass: resolves an unsafe pause
+    /// with an `Ok` transition and clears the retry. A failure retry is left
+    /// intact — a clean probe does not mean the snapshot will succeed — and is
+    /// cleared only when a snapshot actually commits.
+    fn on_safe(&mut self) {
+        if self.retry == Some(RetryKind::UnsafePause) {
+            self.set_state(
+                WatchState::Ok,
+                Some("repository returned to a safe state".into()),
+            );
+            self.clear_retry();
+        }
+    }
+
+    /// Clears any active retry state (a snapshot committed, or an unsafe pause
+    /// resolved).
+    fn clear_retry(&mut self) {
+        self.retry = None;
+        self.retry_attempts = 0;
+        self.retry_exhausted = false;
+    }
+
+    /// Enters (or stays in) the unsafe-paused retry, arming the bounded timer.
+    /// The `Paused` transition and the budget reset happen only on the first
+    /// entry, so a re-poll that still finds the repo unsafe neither re-emits nor
+    /// refills the budget.
     fn enter_unsafe(&mut self, reason: UnsafeReason) {
-        self.unsafe_paused = true;
-        self.repoll_attempts = 0;
-        self.repoll_exhausted = false;
+        if self.retry.is_none() {
+            self.retry_attempts = 0;
+            self.retry_exhausted = false;
+        }
+        self.retry = Some(RetryKind::UnsafePause);
         self.set_state(WatchState::Paused, Some(reason.to_string()));
+    }
+
+    /// Enters (or stays in) the failure retry after a probe or snapshot failed.
+    /// Emits [`Event::SnapshotFailed`] and resets the budget only on the first
+    /// entry, so a retry loop surfaces the failure once — never once per tick.
+    fn enter_failure(&mut self, trigger: Trigger, err: &VcsError) {
+        if self.retry.is_none() {
+            self.emit_failed(trigger, err);
+            self.retry_attempts = 0;
+            self.retry_exhausted = false;
+        }
+        self.retry = Some(RetryKind::Failure);
+    }
+
+    /// Surfaces a panicked backend call: emits [`Event::SnapshotFailed`], moves
+    /// the watch to [`WatchState::Attention`], and returns so the worker stays
+    /// alive to process later inputs (a detached panic must not kill the watch).
+    fn on_backend_panic(&mut self, trigger: Trigger, detail: &str) {
+        let msg = format!("backend task panicked: {detail}");
+        self.emit_failed_error(trigger, msg.clone());
+        self.set_state(WatchState::Attention, Some(msg));
     }
 
     /// Emits [`Event::SnapshotCompleted`] for a committed snapshot.
@@ -463,10 +584,16 @@ impl Worker {
 
     /// Emits [`Event::SnapshotFailed`] for a failed attempt.
     fn emit_failed(&self, trigger: Trigger, err: &VcsError) {
+        self.emit_failed_error(trigger, err.to_string());
+    }
+
+    /// Emits [`Event::SnapshotFailed`] with a raw error message (for conditions
+    /// that are not a [`VcsError`], such as a panicked backend task).
+    fn emit_failed_error(&self, trigger: Trigger, error: String) {
         self.bus.emit(Event::SnapshotFailed {
             watch: self.name.clone(),
             trigger,
-            error: err.to_string(),
+            error,
         });
     }
 
@@ -492,21 +619,22 @@ impl Worker {
 /// Takes the backend by value (a cheap [`Arc`] clone) rather than borrowing the
 /// worker, so the returned future stays `Send` — the worker holds a
 /// [`WatchHandle`], which is `Send` but not `Sync`.
-async fn check_safe(backend: SharedBackend) -> Result<SafeState, VcsError> {
-    tokio::task::spawn_blocking(move || backend.is_safe_state())
-        .await
-        .expect("is_safe_state task panicked")
+///
+/// A backend panic is returned as the outer [`JoinError`] rather than
+/// propagated, so the caller can surface it instead of aborting the detached
+/// worker task (which would kill the watch and leave its channel unread).
+async fn check_safe(backend: SharedBackend) -> Result<Result<SafeState, VcsError>, JoinError> {
+    tokio::task::spawn_blocking(move || backend.is_safe_state()).await
 }
 
 /// Runs [`snapshot`](VcsBackend::snapshot) off the async runtime. See
-/// [`check_safe`] for why it takes the backend by value.
+/// [`check_safe`] for why it takes the backend by value and returns the
+/// [`JoinError`] rather than propagating a panic.
 async fn call_snapshot(
     backend: SharedBackend,
     req: SnapshotRequest,
-) -> Result<Option<SnapshotOutcome>, VcsError> {
-    tokio::task::spawn_blocking(move || backend.snapshot(&req))
-        .await
-        .expect("snapshot task panicked")
+) -> Result<Result<Option<SnapshotOutcome>, VcsError>, JoinError> {
+    tokio::task::spawn_blocking(move || backend.snapshot(&req)).await
 }
 
 /// Calls [`snapshot`](VcsBackend::snapshot), retrying a contended lock with
@@ -525,17 +653,18 @@ async fn snapshot_with_retry(
 
     for attempt in 1..=cfg.lock_retry_attempts {
         match call_snapshot(Arc::clone(&backend), req.clone()).await {
-            Ok(Some(outcome)) => return PassResult::Committed(outcome),
-            Ok(None) => return PassResult::Clean,
-            Err(VcsError::UnsafeState(reason)) => return PassResult::Unsafe(reason),
-            Err(VcsError::LockContended { .. }) => {
+            Ok(Ok(Some(outcome))) => return PassResult::Committed(outcome),
+            Ok(Ok(None)) => return PassResult::Clean,
+            Ok(Err(VcsError::UnsafeState(reason))) => return PassResult::Unsafe(reason),
+            Ok(Err(VcsError::LockContended { .. })) => {
                 if attempt < cfg.lock_retry_attempts {
                     tokio::time::sleep(backoff(cfg, attempt)).await;
                     continue;
                 }
                 return PassResult::StillLocked;
             }
-            Err(other) => return PassResult::Failed(other),
+            Ok(Err(other)) => return PassResult::Failed(other),
+            Err(join) => return PassResult::Panicked(join.to_string()),
         }
     }
     // `lock_retry_attempts` is always >= 1, so the loop always returns.
@@ -640,9 +769,9 @@ impl Engine {
                 cfg,
                 pending: None,
                 state: WatchState::Ok,
-                unsafe_paused: false,
-                repoll_attempts: 0,
-                repoll_exhausted: false,
+                retry: None,
+                retry_attempts: 0,
+                retry_exhausted: false,
             };
             prepared.push((worker, rx));
         }
@@ -914,6 +1043,8 @@ mod tests {
         Lock,
         /// Return a hard command failure.
         Fail,
+        /// Panic inside the blocking snapshot call.
+        Panic,
     }
 
     /// A deterministic in-memory [`VcsBackend`] for driving worker scenarios.
@@ -923,7 +1054,13 @@ mod tests {
 
     struct FakeInner {
         safe: SafeState,
+        /// Scripted safe-state probe results, consumed before falling back to
+        /// `safe`. Lets a test make [`is_safe_state`] fail or flip over calls.
+        safe_results: VecDeque<Result<SafeState, VcsError>>,
         snapshots: VecDeque<Scripted>,
+        /// When set, every snapshot commits — models a backend that never
+        /// reports a clean tree (used to prove the post-op re-check is bounded).
+        always_commit: bool,
         snapshot_calls: usize,
         safe_calls: usize,
         /// The 1-based snapshot call that should block on `gate_rx`.
@@ -936,7 +1073,9 @@ mod tests {
             Arc::new(Self {
                 inner: Mutex::new(FakeInner {
                     safe: SafeState::Safe,
+                    safe_results: VecDeque::new(),
                     snapshots: VecDeque::new(),
+                    always_commit: false,
                     snapshot_calls: 0,
                     safe_calls: 0,
                     gate_on_call: None,
@@ -949,8 +1088,20 @@ mod tests {
             self.inner.lock().unwrap().snapshots.extend(results);
         }
 
+        /// Scripts a sequence of [`is_safe_state`] results consumed in order;
+        /// once exhausted the probe falls back to the fixed `safe` state.
+        fn script_safe(&self, results: impl IntoIterator<Item = Result<SafeState, VcsError>>) {
+            self.inner.lock().unwrap().safe_results.extend(results);
+        }
+
         fn set_safe(&self, safe: SafeState) {
             self.inner.lock().unwrap().safe = safe;
+        }
+
+        /// Makes every snapshot commit, so the post-op re-check never converges
+        /// on its own — used to prove the re-check is bounded under the mute.
+        fn set_always_commit(&self) {
+            self.inner.lock().unwrap().always_commit = true;
         }
 
         /// Arms a blocking gate on the given 1-based snapshot call, returning the
@@ -976,7 +1127,10 @@ mod tests {
         fn is_safe_state(&self) -> Result<SafeState, VcsError> {
             let mut inner = self.inner.lock().unwrap();
             inner.safe_calls += 1;
-            Ok(inner.safe.clone())
+            match inner.safe_results.pop_front() {
+                Some(scripted) => scripted,
+                None => Ok(inner.safe.clone()),
+            }
         }
 
         fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
@@ -989,7 +1143,11 @@ mod tests {
                 } else {
                     None
                 };
-                let result = inner.snapshots.pop_front().unwrap_or(Scripted::Clean);
+                let result = if inner.always_commit {
+                    Scripted::Commit(1)
+                } else {
+                    inner.snapshots.pop_front().unwrap_or(Scripted::Clean)
+                };
                 (result, gate)
             };
             // Block outside the lock so the test can inspect/mutate meanwhile.
@@ -997,6 +1155,7 @@ mod tests {
                 let _ = rx.recv();
             }
             match result {
+                Scripted::Panic => panic!("scripted backend panic"),
                 Scripted::Commit(files) => Ok(Some(SnapshotOutcome {
                     id: SnapshotId::new("deadbeef"),
                     summary: ChangeSummary {
@@ -1074,9 +1233,9 @@ mod tests {
             cfg,
             pending: None,
             state: WatchState::Ok,
-            unsafe_paused: false,
-            repoll_attempts: 0,
-            repoll_exhausted: false,
+            retry: None,
+            retry_attempts: 0,
+            retry_exhausted: false,
         };
         tokio::spawn(worker.run(rx));
         (tx, events, counter)
@@ -1093,10 +1252,18 @@ mod tests {
 
     /// Yields enough to let spawned tasks (and their blocking calls) progress
     /// without advancing the paused clock.
+    ///
+    /// The cooperative yields drive the current-thread runtime, but a worker's
+    /// backend calls run on a separate `spawn_blocking` thread. A brief real
+    /// sleep releases the OS core so that pool makes progress: without it a
+    /// busy-spinning poll loop can starve its own blocking threads under
+    /// parallel test load, which made the count/wait assertions flaky.
     async fn settle() {
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+        std::thread::sleep(Duration::from_micros(100));
+        tokio::task::yield_now().await;
     }
 
     /// Settles until the backend has seen at least `n` snapshot calls, so a
@@ -1389,17 +1556,253 @@ mod tests {
         assert_eq!(backend.snapshot_calls(), cfg.lock_retry_attempts as usize);
     }
 
+    /// Counts [`Event::SnapshotFailed`] drained so far without blocking.
+    fn drain_failures(events: &mut EventReceiver) -> usize {
+        let mut n = 0;
+        loop {
+            match events.try_recv() {
+                Ok(Event::SnapshotFailed { .. }) => n += 1,
+                Ok(_) => {}
+                Err(_) => return n,
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn snapshot_failure_is_reported() {
+    async fn snapshot_failure_is_preserved_and_retried_reporting_once() {
+        // A hard failure is surfaced once, the pending change is preserved, and
+        // it converges on the bounded retry timer with no further trigger — and
+        // the retry does not storm the bus with a failure per tick.
         let backend = FakeBackend::new();
-        backend.script([Scripted::Fail]);
+        backend.script([Scripted::Fail, Scripted::Commit(1)]);
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
         tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // The failure is reported once, tagged with its trigger.
         let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
         match ev {
             Event::SnapshotFailed { trigger, .. } => assert_eq!(trigger, Trigger::Event),
             other => panic!("expected SnapshotFailed, got {other:?}"),
+        }
+
+        // With no new trigger, the retry timer re-attempts and the change lands.
+        let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the preserved change must converge via the retry timer, got {ev:?}"
+        );
+
+        // Exactly one failure was emitted across the whole sequence.
+        settle().await;
+        assert_eq!(
+            drain_failures(&mut events),
+            0,
+            "no further SnapshotFailed after convergence (no per-tick storm)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn safe_probe_error_is_preserved_and_retried_until_safe() {
+        // The safe-state probe fails once, then succeeds. The pending change
+        // must not be dropped: it converges on the retry timer with no trigger.
+        let backend = FakeBackend::new();
+        backend.script_safe([
+            Err(VcsError::CommandFailed {
+                op: "status".into(),
+                status: Some(1),
+                stderr: "boom".into(),
+            }),
+            Ok(SafeState::Safe),
+        ]);
+        backend.script([Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotFailed { .. }),
+            "a failed safe-state probe is surfaced, got {ev:?}"
+        );
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the preserved change snapshots once the probe returns safe, got {ev:?}"
+        );
+        settle().await;
+        assert_eq!(
+            drain_failures(&mut events),
+            0,
+            "the probe error is reported once, not per retry tick"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_budget_exhausts_then_resumes_on_fresh_activity() {
+        // A permanently unsafe repo retries only up to the bound, then stops and
+        // waits for activity; a later trigger (with the repo now safe) resumes.
+        let backend = FakeBackend::new();
+        backend.set_safe(SafeState::Unsafe(UnsafeReason::MergeInProgress));
+        backend.script([Scripted::Commit(1)]);
+        let mut cfg = test_cfg();
+        cfg.unsafe_repoll_max_attempts = 2;
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), cfg);
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // Pauses on the unsafe repo.
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(matches!(
+            ev,
+            Event::WatchStateChanged {
+                to: WatchState::Paused,
+                ..
+            }
+        ));
+
+        // Drive well past the bounded retries; polling stops at the cap.
+        for _ in 0..50 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        settle().await;
+        let calls_after_exhaustion = backend.safe_calls();
+        for _ in 0..50 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        settle().await;
+        assert_eq!(
+            backend.safe_calls(),
+            calls_after_exhaustion,
+            "an exhausted retry budget stops polling until fresh activity"
+        );
+
+        // Fresh activity (repo now safe) resets the budget and resumes.
+        backend.set_safe(SafeState::Safe);
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Ok,
+                    ..
+                }
+            ),
+            "fresh activity re-arms the retry and the watch resumes, got {ev:?}"
+        );
+        let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the preserved change snapshots after resuming, got {ev:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_panic_is_surfaced_and_the_worker_survives() {
+        // A panicking backend call must not kill the detached worker: it is
+        // surfaced (SnapshotFailed + Attention) and a later trigger still works.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Panic, Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // The panic is surfaced as a failure and an attention transition.
+        let mut saw_failed = false;
+        let mut saw_attention = false;
+        for _ in 0..2 {
+            match advance_until_event(&mut events, Duration::from_secs(1)).await {
+                Event::SnapshotFailed { .. } => saw_failed = true,
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    ..
+                } => saw_attention = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_failed,
+            "a backend panic must be surfaced as SnapshotFailed"
+        );
+        assert!(
+            saw_attention,
+            "a backend panic must move the watch to Attention"
+        );
+
+        // The worker is still alive: a second, non-panicking trigger snapshots.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the worker must keep processing inputs after a backend panic, got {ev:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn always_committing_backend_does_not_livelock_under_the_mute() {
+        // A backend that never reports a clean tree must not livelock the post-op
+        // re-check while holding the mute: the re-check is bounded to one sweep,
+        // so a pass makes exactly two snapshot calls and releases the mute.
+        let backend = FakeBackend::new();
+        backend.set_always_commit();
+        let (tx, mut events, counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // Two commits: the original plus one bounded re-check.
+        let _ = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        let _ = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        wait_snapshot_calls(&backend, 2).await;
+
+        // The pass does not loop unbounded under the mute: calls stop at two and
+        // the mute is released.
+        for _ in 0..50 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        assert_eq!(
+            backend.snapshot_calls(),
+            2,
+            "the post-op re-check must be bounded to one sweep per pass"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "the mute must be released after the bounded pass"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mute_window_followup_keeps_the_pass_provenance() {
+        // A change captured in a Manual pass's mute window must be tagged with
+        // the pass's winning provenance (Manual), not hardcoded to Event.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1), Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance {
+            trigger: Trigger::Manual,
+            user_text: Some("checkpoint".into()),
+        }))
+        .unwrap();
+
+        let first = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match first {
+            Event::SnapshotCompleted { trigger, .. } => assert_eq!(trigger, Trigger::Manual),
+            other => panic!("expected SnapshotCompleted, got {other:?}"),
+        }
+        let second = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match second {
+            Event::SnapshotCompleted { trigger, .. } => assert_eq!(
+                trigger,
+                Trigger::Manual,
+                "the mute-window follow-up must keep the pass's provenance, not become Event"
+            ),
+            other => panic!("expected a follow-up SnapshotCompleted, got {other:?}"),
         }
     }
 
