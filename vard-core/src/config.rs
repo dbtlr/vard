@@ -9,13 +9,23 @@
 //! default *values* live here as public constants — one source of truth shared
 //! across every host.
 //!
+//! # Relation to the spec's SDK sketch
+//!
+//! The spec (§2a) illustrates the SDK with `WatchSpec::new(..)` and
+//! string-typed duration setters. The shipped API deliberately supersedes that
+//! sketch: construction is `WatchSpec::builder(name, path)`, duration setters
+//! take [`Duration`] values, and humantime strings are parsed explicitly via
+//! the public [`parse_duration`]. Typed durations keep the setters infallible
+//! and make the one fallible step (string parsing) explicit at the call site
+//! instead of deferring hidden errors to `build()`.
+//!
 //! [`TriggerMode`] is deliberately not named `Trigger`: [`Trigger`](crate::Trigger)
 //! is the event vocabulary describing *why* a snapshot happened, whereas
 //! `TriggerMode` is the *configuration* selecting which triggers a watch arms.
 
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -38,16 +48,23 @@ pub const DEFAULT_TRIGGER: TriggerMode = TriggerMode::Both;
 /// Default remote name a watch pushes to and pulls from.
 pub const DEFAULT_REMOTE: &str = "origin";
 
-/// How a watch decides when to take a snapshot.
+/// Which *automatic* snapshot triggers a watch arms.
+///
+/// This mode governs only the two background causes — filesystem-event
+/// snapshots and interval-timer snapshots. Manual snapshots
+/// ([`Trigger::Manual`](crate::Trigger)) and protective snapshots taken before
+/// a restore or sync ([`Trigger::PreRestore`](crate::Trigger),
+/// [`Trigger::PreSync`](crate::Trigger)) always run regardless of mode; the
+/// scheduler must not gate them on `TriggerMode`.
 ///
 /// Distinct from [`Trigger`](crate::Trigger), which reports why a snapshot was
 /// taken. This type is the *configuration* knob; `Trigger` is the *event*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum TriggerMode {
-    /// Snapshot only in response to observed filesystem changes.
+    /// Snapshot automatically only in response to observed filesystem changes.
     Events,
-    /// Snapshot only when the periodic interval elapses.
+    /// Snapshot automatically only when the periodic interval elapses.
     Interval,
     /// Arm both change and interval triggers. The default.
     #[default]
@@ -84,34 +101,22 @@ impl FromStr for TriggerMode {
 
 /// A validated description of one watch: what to watch and how to snapshot it.
 ///
-/// The only way to obtain a `WatchSpec` outside this crate is through the
-/// validating [`builder`](WatchSpec::builder) — the struct is `#[non_exhaustive]`,
-/// so hosts cannot bypass validation with a struct literal. Fields are public
-/// for reading; the engine consumes them directly.
+/// The only way to obtain a `WatchSpec` is through the validating
+/// [`builder`](WatchSpec::builder), and fields are private with read accessors,
+/// so a spec that exists is a spec that passed validation — it cannot be
+/// mutated out of its invariants after `build()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct WatchSpec {
-    /// Stable identity of the watch. Used to name state files, so its charset
-    /// is restricted (see [`WatchSpecBuilder::build`]).
-    pub name: String,
-    /// Directory the watch snapshots.
-    pub path: PathBuf,
-    /// Which triggers arm snapshots.
-    pub trigger: TriggerMode,
-    /// How long activity must settle before a change-triggered snapshot.
-    pub quiesce: Duration,
-    /// Interval between periodic snapshots.
-    pub interval: Duration,
-    /// Whether the watch syncs to a remote.
-    pub sync: bool,
-    /// Interval between background syncs.
-    pub sync_interval: Duration,
-    /// Gitignore-style patterns excluded from snapshots.
-    pub exclude: Vec<String>,
-    /// Branch the watch commits to. `None` adopts HEAD's branch at registration.
-    pub branch: Option<String>,
-    /// Remote the watch pushes to and pulls from.
-    pub remote: String,
+    name: String,
+    path: PathBuf,
+    trigger: TriggerMode,
+    quiesce: Duration,
+    interval: Duration,
+    sync: bool,
+    sync_interval: Duration,
+    exclude: Vec<String>,
+    branch: Option<String>,
+    remote: String,
 }
 
 impl WatchSpec {
@@ -121,14 +126,64 @@ impl WatchSpec {
     pub fn builder(name: impl Into<String>, path: impl Into<PathBuf>) -> WatchSpecBuilder {
         WatchSpecBuilder::new(name, path)
     }
+
+    /// Stable identity of the watch. Used to name state files, so its charset
+    /// is restricted (see [`WatchSpecBuilder::build`]).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Directory the watch snapshots.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Which automatic triggers arm snapshots.
+    pub fn trigger(&self) -> TriggerMode {
+        self.trigger
+    }
+
+    /// How long activity must settle before a change-triggered snapshot.
+    pub fn quiesce(&self) -> Duration {
+        self.quiesce
+    }
+
+    /// Interval between periodic snapshots.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Whether the watch syncs to a remote.
+    pub fn sync(&self) -> bool {
+        self.sync
+    }
+
+    /// Interval between background syncs.
+    pub fn sync_interval(&self) -> Duration {
+        self.sync_interval
+    }
+
+    /// Gitignore-style patterns excluded from snapshots.
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// Branch the watch commits to. `None` adopts HEAD's branch at registration.
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// Remote the watch pushes to and pulls from.
+    pub fn remote(&self) -> &str {
+        &self.remote
+    }
 }
 
 /// A fluent builder for [`WatchSpec`]. Obtain one from [`WatchSpec::builder`].
 ///
-/// Duration setters come in two forms: a `Duration`-typed setter and a `*_str`
-/// convenience that parses a humantime string (`"10s"`, `"15m"`). A parse error
-/// from a `*_str` setter is deferred — the first such error is stored and
-/// returned by [`build`](Self::build) — so chaining is never interrupted.
+/// Duration setters take [`Duration`] values; parse humantime strings with
+/// [`parse_duration`] first (see the [module docs](self) for why the API is
+/// shaped this way).
 #[derive(Clone, Debug)]
 pub struct WatchSpecBuilder {
     name: String,
@@ -141,7 +196,6 @@ pub struct WatchSpecBuilder {
     exclude: Vec<String>,
     branch: Option<String>,
     remote: String,
-    deferred: Option<ConfigError>,
 }
 
 impl WatchSpecBuilder {
@@ -157,23 +211,10 @@ impl WatchSpecBuilder {
             exclude: Vec::new(),
             branch: None,
             remote: DEFAULT_REMOTE.to_string(),
-            deferred: None,
         }
     }
 
-    /// Parses `s` as a humantime duration, stashing the first parse error for
-    /// [`build`](Self::build) and returning `None` on failure.
-    fn parse_deferred(&mut self, s: &str) -> Option<Duration> {
-        match parse_duration(s) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                self.deferred.get_or_insert(e);
-                None
-            }
-        }
-    }
-
-    /// Sets which triggers arm snapshots.
+    /// Sets which automatic triggers arm snapshots.
     pub fn trigger(mut self, trigger: TriggerMode) -> Self {
         self.trigger = trigger;
         self
@@ -185,25 +226,9 @@ impl WatchSpecBuilder {
         self
     }
 
-    /// Sets the quiescence window from a humantime string (e.g. `"10s"`).
-    pub fn quiesce_str(mut self, quiesce: &str) -> Self {
-        if let Some(d) = self.parse_deferred(quiesce) {
-            self.quiesce = d;
-        }
-        self
-    }
-
     /// Sets the periodic snapshot interval.
     pub fn interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
-        self
-    }
-
-    /// Sets the periodic snapshot interval from a humantime string (e.g. `"15m"`).
-    pub fn interval_str(mut self, interval: &str) -> Self {
-        if let Some(d) = self.parse_deferred(interval) {
-            self.interval = d;
-        }
         self
     }
 
@@ -216,14 +241,6 @@ impl WatchSpecBuilder {
     /// Sets the background sync interval.
     pub fn sync_interval(mut self, sync_interval: Duration) -> Self {
         self.sync_interval = sync_interval;
-        self
-    }
-
-    /// Sets the background sync interval from a humantime string (e.g. `"20m"`).
-    pub fn sync_interval_str(mut self, sync_interval: &str) -> Self {
-        if let Some(d) = self.parse_deferred(sync_interval) {
-            self.sync_interval = d;
-        }
         self
     }
 
@@ -247,16 +264,16 @@ impl WatchSpecBuilder {
 
     /// Validates the accumulated fields and produces a [`WatchSpec`].
     ///
-    /// Returns the first deferred `*_str` parse error if any, then enforces:
-    /// non-empty name; a name limited to ASCII alphanumerics and `-`, `_`, `.`
-    /// (safe for state-file names); non-empty path; and strictly positive
-    /// `quiesce`, `interval`, and `sync_interval`.
+    /// Enforces: non-empty name; a name limited to ASCII alphanumerics and
+    /// `-`, `_`, `.` and not the path-special `.` or `..` (safe for state-file
+    /// names); non-empty path; and strictly positive `quiesce`, `interval`,
+    /// and `sync_interval`.
     pub fn build(self) -> Result<WatchSpec, ConfigError> {
-        if let Some(err) = self.deferred {
-            return Err(err);
-        }
         if self.name.is_empty() {
             return Err(ConfigError::EmptyName);
+        }
+        if self.name == "." || self.name == ".." {
+            return Err(ConfigError::ReservedName { name: self.name });
         }
         if let Some(ch) = self
             .name
@@ -307,6 +324,12 @@ impl WatchSpecBuilder {
 pub enum ConfigError {
     /// The watch name was empty.
     EmptyName,
+    /// The watch name was `.` or `..`, which are path-special and unsafe as
+    /// state-file names.
+    ReservedName {
+        /// The reserved name.
+        name: String,
+    },
     /// The watch name contained a character outside the state-file-safe set.
     InvalidNameChar {
         /// The offending name.
@@ -339,6 +362,9 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::EmptyName => f.write_str("watch name must not be empty"),
+            ConfigError::ReservedName { name } => {
+                write!(f, "watch name {name:?} is reserved; pick another name")
+            }
             ConfigError::InvalidNameChar { name, ch } => write!(
                 f,
                 "watch name {name:?} contains invalid character {ch:?}; \
@@ -364,7 +390,10 @@ impl Error for ConfigError {}
 /// Parses a humantime-style duration string into a [`Duration`].
 ///
 /// Supports whitespace-separated segments of an integer followed by a unit,
-/// summed together (e.g. `"1h30m"`, `"90 s"`). Recognized units:
+/// summed together (e.g. `"1h30m"`, `"90 s"`). Segments must run from the
+/// largest unit down, each unit at most once — `"1h30m"` is valid, `"30m1h"`
+/// and `"1s1s"` are not, matching the humantime grammar this subsets.
+/// Recognized units:
 ///
 /// - `ns`
 /// - `us`
@@ -389,6 +418,9 @@ pub fn parse_duration(input: &str) -> Result<Duration, ConfigError> {
     let mut i = 0;
     let mut total = Duration::ZERO;
     let mut segments = 0usize;
+    // Magnitude rank of the previous segment's unit; each segment must rank
+    // strictly below it (largest unit first, no repeats).
+    let mut prev_rank: Option<u8> = None;
 
     while i < bytes.len() {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -422,16 +454,25 @@ pub fn parse_duration(input: &str) -> Result<Duration, ConfigError> {
             return Err(invalid("missing unit"));
         }
 
-        let seg = match unit {
-            "ns" => Duration::from_nanos(num),
-            "us" => Duration::from_micros(num),
-            "ms" => Duration::from_millis(num),
-            "s" | "sec" | "secs" | "second" | "seconds" => Duration::from_secs(num),
-            "m" | "min" | "mins" | "minute" | "minutes" => secs(num, 60, invalid)?,
-            "h" | "hr" | "hrs" | "hour" | "hours" => secs(num, 3600, invalid)?,
-            "d" | "day" | "days" => secs(num, 86_400, invalid)?,
+        let (rank, seg) = match unit {
+            "ns" => (0, Duration::from_nanos(num)),
+            "us" => (1, Duration::from_micros(num)),
+            "ms" => (2, Duration::from_millis(num)),
+            "s" | "sec" | "secs" | "second" | "seconds" => (3, Duration::from_secs(num)),
+            "m" | "min" | "mins" | "minute" | "minutes" => (4, secs(num, 60, invalid)?),
+            "h" | "hr" | "hrs" | "hour" | "hours" => (5, secs(num, 3600, invalid)?),
+            "d" | "day" | "days" => (6, secs(num, 86_400, invalid)?),
             other => return Err(invalid(&format!("unknown unit {other:?}"))),
         };
+
+        if let Some(prev) = prev_rank
+            && rank >= prev
+        {
+            return Err(invalid(
+                "units must run from largest to smallest without repeats",
+            ));
+        }
+        prev_rank = Some(rank);
 
         total = total
             .checked_add(seg)
@@ -465,16 +506,16 @@ mod tests {
         let spec = WatchSpec::builder("notes", "/home/u/notes")
             .build()
             .unwrap();
-        assert_eq!(spec.name, "notes");
-        assert_eq!(spec.path, PathBuf::from("/home/u/notes"));
-        assert_eq!(spec.trigger, DEFAULT_TRIGGER);
-        assert_eq!(spec.quiesce, DEFAULT_QUIESCE);
-        assert_eq!(spec.interval, DEFAULT_INTERVAL);
-        assert_eq!(spec.sync, DEFAULT_SYNC);
-        assert_eq!(spec.sync_interval, DEFAULT_SYNC_INTERVAL);
-        assert!(spec.exclude.is_empty());
-        assert_eq!(spec.branch, None);
-        assert_eq!(spec.remote, DEFAULT_REMOTE);
+        assert_eq!(spec.name(), "notes");
+        assert_eq!(spec.path(), Path::new("/home/u/notes"));
+        assert_eq!(spec.trigger(), DEFAULT_TRIGGER);
+        assert_eq!(spec.quiesce(), DEFAULT_QUIESCE);
+        assert_eq!(spec.interval(), DEFAULT_INTERVAL);
+        assert_eq!(spec.sync(), DEFAULT_SYNC);
+        assert_eq!(spec.sync_interval(), DEFAULT_SYNC_INTERVAL);
+        assert!(spec.exclude().is_empty());
+        assert_eq!(spec.branch(), None);
+        assert_eq!(spec.remote(), DEFAULT_REMOTE);
     }
 
     #[test]
@@ -496,17 +537,14 @@ mod tests {
             .remote("origin2")
             .build()
             .unwrap();
-        assert_eq!(spec.trigger, TriggerMode::Events);
-        assert_eq!(spec.quiesce, Duration::from_secs(3));
-        assert_eq!(spec.interval, Duration::from_secs(300));
-        assert!(!spec.sync);
-        assert_eq!(spec.sync_interval, Duration::from_secs(3600));
-        assert_eq!(
-            spec.exclude,
-            vec!["target".to_string(), "*.log".to_string()]
-        );
-        assert_eq!(spec.branch.as_deref(), Some("backup"));
-        assert_eq!(spec.remote, "origin2");
+        assert_eq!(spec.trigger(), TriggerMode::Events);
+        assert_eq!(spec.quiesce(), Duration::from_secs(3));
+        assert_eq!(spec.interval(), Duration::from_secs(300));
+        assert!(!spec.sync());
+        assert_eq!(spec.sync_interval(), Duration::from_secs(3600));
+        assert_eq!(spec.exclude(), ["target".to_string(), "*.log".to_string()]);
+        assert_eq!(spec.branch(), Some("backup"));
+        assert_eq!(spec.remote(), "origin2");
     }
 
     #[test]
@@ -515,6 +553,24 @@ mod tests {
             WatchSpec::builder("", "/p").build(),
             Err(ConfigError::EmptyName)
         );
+    }
+
+    #[test]
+    fn build_rejects_dot_and_dotdot_names() {
+        // "." and ".." pass the charset check but are path-special; a state
+        // file named after them would escape or collide with its directory.
+        for name in [".", ".."] {
+            assert_eq!(
+                WatchSpec::builder(name, "/p").build(),
+                Err(ConfigError::ReservedName {
+                    name: name.to_string()
+                }),
+                "expected reserved name {name:?} to be rejected"
+            );
+        }
+        // Names merely containing dots stay valid.
+        assert!(WatchSpec::builder("a.b", "/p").build().is_ok());
+        assert!(WatchSpec::builder(".hidden", "/p").build().is_ok());
     }
 
     #[test]
@@ -563,27 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn build_surfaces_deferred_duration_parse_error() {
-        match WatchSpec::builder("n", "/p").quiesce_str("nope").build() {
-            Err(ConfigError::InvalidDuration { value, .. }) => assert_eq!(value, "nope"),
-            other => panic!("expected InvalidDuration, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn duration_str_setters_parse_spec_examples() {
-        let spec = WatchSpec::builder("n", "/p")
-            .quiesce_str("10s")
-            .interval_str("15m")
-            .sync_interval_str("20m")
-            .build()
-            .unwrap();
-        assert_eq!(spec.quiesce, Duration::from_secs(10));
-        assert_eq!(spec.interval, Duration::from_secs(15 * 60));
-        assert_eq!(spec.sync_interval, Duration::from_secs(20 * 60));
-    }
-
-    #[test]
     fn parse_duration_accepts_spec_examples_and_units() {
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(900));
@@ -594,6 +629,20 @@ mod tests {
             Duration::from_secs(3600 + 1800)
         );
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn parse_duration_requires_strictly_descending_unique_units() {
+        // The humantime grammar this parser subsets orders segments from the
+        // largest unit down, with no repeats.
+        assert!(parse_duration("1h30m").is_ok());
+        assert!(parse_duration("1h30m10s").is_ok());
+        for bad in ["1s1s", "30m1h", "5m5m5m"] {
+            assert!(
+                parse_duration(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 
     #[test]

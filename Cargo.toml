@@ -13,9 +13,10 @@ repository = "https://github.com/dbtlr/vard"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 # serde derive + toml back the binary's file-config layer (vard only). Duration
 # strings deserialize through vard-core's parser, so no humantime crate is
-# needed. See VRD-9.
+# needed. toml is trimmed to parse+serde: vard reads config, it never writes
+# TOML. See VRD-9.
 serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"
