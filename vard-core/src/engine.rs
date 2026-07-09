@@ -1094,6 +1094,21 @@ mod tests {
         }
     }
 
+    /// Settles until the backend has seen at least `n` snapshot calls, so a
+    /// count assertion does not race the converging re-check's blocking call.
+    async fn wait_snapshot_calls(backend: &FakeBackend, n: usize) {
+        for _ in 0..500 {
+            if backend.snapshot_calls() >= n {
+                return;
+            }
+            settle().await;
+        }
+        panic!(
+            "snapshot_calls never reached {n} (was {})",
+            backend.snapshot_calls()
+        );
+    }
+
     /// Advances the paused clock in bounded steps until `events` yields a value,
     /// letting the worker's blocking calls and backoff/re-poll sleeps progress.
     async fn advance_until_event(events: &mut EventReceiver, step: Duration) -> Event {
@@ -1171,7 +1186,7 @@ mod tests {
             }
             other => panic!("expected SnapshotCompleted, got {other:?}"),
         }
-        settle().await;
+        wait_snapshot_calls(&backend, 2).await;
         assert!(events.try_recv().is_err(), "exactly one snapshot");
         // One commit plus one converging re-check.
         assert_eq!(backend.snapshot_calls(), 2);
@@ -1184,6 +1199,7 @@ mod tests {
         let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
 
         tx.send(WatchInput::Trigger(Provenance::interval())).unwrap();
+        wait_snapshot_calls(&backend, 1).await;
         settle().await;
         // No event: an interval on a clean tree is a no-op.
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
@@ -1221,7 +1237,7 @@ mod tests {
         let second = advance_until_event(&mut events, Duration::from_secs(1)).await;
         assert!(matches!(second, Event::SnapshotCompleted { files_changed: 2, .. }));
 
-        settle().await;
+        wait_snapshot_calls(&backend, 4).await;
         assert!(
             events.try_recv().is_err(),
             "ten queued triggers must collapse into one follow-up, not ten"
