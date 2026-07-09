@@ -71,15 +71,37 @@ jobs:
       - name: vard --version
         run: ./target/release/vard --version
 
-      - name: vard --help
-        run: ./target/release/vard --help
+      # Help must render through the custom CLI Help Output v2 path, not clap.
+      # Assert markers that only the v2 renderer emits so a regression to clap
+      # help (or a broken interceptor) fails loudly.
+      - name: vard help renders through the v2 path
+        run: |
+          ./target/release/vard -h | grep -q 'For full help, run'
+          ./target/release/vard --help | grep -q '^EXAMPLES$'
+          ./target/release/vard run --help | grep -q '^LIFECYCLE AND SIGNALS$'
+          # Color must respect the environment conventions: forced on emits
+          # ANSI escapes; NO_COLOR suppresses them even under --color always.
+          esc=$(printf '\033')
+          ./target/release/vard --color always -h | grep -q "$esc"
+          if NO_COLOR=1 ./target/release/vard --color always -h | grep -q "$esc"; then
+            echo "::error::NO_COLOR did not suppress ANSI output"; exit 1
+          fi
 
       # build.rs generates these on every build profile; the release build
-      # above has already run it for this job's target dir.
-      - name: completions + manpage artifacts exist and are non-empty
+      # above has already run it for this job's target dir. Assert the expected
+      # command strings appear so a stale or truncated artifact fails loudly
+      # instead of passing a bare non-empty check.
+      - name: completions + manpage artifacts name the run subcommand
         run: |
-          test -s target/completions/vard.bash
-          test -s target/completions/_vard
-          test -s target/completions/vard.fish
-          test -s target/completions/vard.nu
-          test -s target/man/vard.1
+          for f in \
+            target/completions/vard.bash \
+            target/completions/_vard \
+            target/completions/vard.fish \
+            target/completions/vard.nu \
+            target/man/vard.1; do
+            test -s "$f"
+            grep -q 'run' "$f" || { echo "::error::$f is missing the 'run' subcommand — stale artifact?"; exit 1; }
+          done
+          # build.rs recurses subcommands into per-command manpages.
+          test -s target/man/vard-run.1
+          grep -q 'run' target/man/vard-run.1 || { echo "::error::vard-run.1 is missing 'run' — stale artifact?"; exit 1; }
