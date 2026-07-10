@@ -182,10 +182,9 @@ pub(crate) struct WatchConfig {
 }
 
 impl Config {
-    /// The default config path, `$XDG_CONFIG_HOME/vard/config.toml`.
-    // The daemon resolves paths via `DaemonPaths`; kept for future CLI callers
-    // (e.g. `vard config path`).
-    #[allow(dead_code)]
+    /// The default config path, `$XDG_CONFIG_HOME/vard/config.toml`. The daemon
+    /// resolves paths via `DaemonPaths`; this is the CLI locator behind
+    /// `vard config path`.
     pub fn default_path() -> Result<PathBuf, ConfigError> {
         paths::config_file().map_err(|e| ConfigError::Path(e.to_string()))
     }

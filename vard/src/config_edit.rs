@@ -1,7 +1,7 @@
 //! Comment-preserving, atomic mutation of `config.toml`.
 //!
 //! The [read layer](crate::config) parses `config.toml` into a typed, validated
-//! [`Config`](crate::config::Config). This module is its write counterpart: the
+//! [`Config`]. This module is its write counterpart: the
 //! `vard watch add/remove/pause/resume` commands edit the file *in place*
 //! through [`toml_edit`], so a user's comments, key ordering, and formatting
 //! survive a mutation untouched — only the bytes that must change, change.
@@ -29,9 +29,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
-use crate::config::SUPPORTED_VERSION;
+use crate::command::CmdError;
+use crate::config::{Config, ConfigError, SUPPORTED_VERSION};
 
 /// The TOML key under which watches are stored (`[[watch]]`). Matches the read
 /// layer's `#[serde(rename = "watch")]`.
@@ -216,6 +217,164 @@ pub(crate) fn set_paused(doc: &mut DocumentMut, name: &str, paused: bool) -> boo
         table.remove("paused");
     }
     true
+}
+
+// --- generic dotted scalar keys (`vard config get/set/unset`) --------------
+
+/// Reads the scalar value addressed by a dotted `key` (e.g. `daemon.log_level`),
+/// as a display string. `None` when the path does not resolve, and
+/// `Some(Err(..))` — a present-but-not-scalar answer — when the key names a
+/// table or array rather than a settable scalar. Only the value the file
+/// actually holds is returned; inherited defaults are not materialized here.
+pub(crate) fn get_dotted(doc: &DocumentMut, key: &str) -> Option<Result<String, KeyNotScalar>> {
+    let item = item_at(doc, key)?;
+    Some(match item.as_value().and_then(scalar_to_string) {
+        Some(text) => Ok(text),
+        None => Err(KeyNotScalar),
+    })
+}
+
+/// The addressed key exists but names a table or array, not a scalar value.
+pub(crate) struct KeyNotScalar;
+
+/// Sets the scalar `key` to `raw`, creating intermediate tables as needed and
+/// preserving the rest of the document. The value's TOML type is inferred from
+/// `raw` (see [`infer_value`]); correctness of the *typed* result is the
+/// caller's to check via [`commit_document`]. Returns an error only when a path
+/// segment already exists as a non-table (so it cannot be descended into).
+pub(crate) fn set_dotted(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<(), String> {
+    let segments: Vec<&str> = key.split('.').collect();
+    let (last, parents) = segments
+        .split_last()
+        .expect("split on a non-empty key yields at least one segment");
+    let mut table: &mut Table = doc.as_table_mut();
+    for seg in parents {
+        let entry = table
+            .entry(seg)
+            .or_insert_with(|| Item::Table(Table::new()));
+        table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("config key {seg:?} is not a table"))?;
+    }
+    table[last] = value(infer_value(raw));
+    Ok(())
+}
+
+/// Removes the scalar `key`, leaving any now-empty parent table in place (the
+/// file stays otherwise byte-for-byte unchanged). Returns `false` when the key
+/// was not present.
+pub(crate) fn unset_dotted(doc: &mut DocumentMut, key: &str) -> bool {
+    let segments: Vec<&str> = key.split('.').collect();
+    let (last, parents) = segments
+        .split_last()
+        .expect("split on a non-empty key yields at least one segment");
+    let mut table: &mut Table = doc.as_table_mut();
+    for seg in parents {
+        match table.get_mut(seg).and_then(Item::as_table_mut) {
+            Some(next) => table = next,
+            None => return false,
+        }
+    }
+    table.remove(last).is_some()
+}
+
+/// Resolves a dotted path to the item it addresses, descending table-like nodes.
+fn item_at<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
+    let mut segments = key.split('.');
+    let mut item = doc.as_table().get(segments.next()?)?;
+    for seg in segments {
+        item = item.as_table_like()?.get(seg)?;
+    }
+    Some(item)
+}
+
+/// Renders a scalar [`Value`] to its display string (a bare string keeps its
+/// contents, other scalars their TOML spelling). `None` for arrays and inline
+/// tables, which are not settable scalars.
+fn scalar_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.value().clone()),
+        Value::Integer(i) => Some(i.value().to_string()),
+        Value::Float(f) => Some(f.value().to_string()),
+        Value::Boolean(b) => Some(b.value().to_string()),
+        Value::Datetime(d) => Some(d.value().to_string()),
+        Value::Array(_) | Value::InlineTable(_) => None,
+    }
+}
+
+/// Infers a TOML scalar from a command-line string: `true`/`false` a boolean, a
+/// bare integer a number, everything else a string. The typed result is only a
+/// candidate — schema validation ([`document_validity`]) decides whether it is
+/// acceptable for the key, so this never needs a per-key type table.
+fn infer_value(raw: &str) -> Value {
+    if raw == "true" {
+        Value::from(true)
+    } else if raw == "false" {
+        Value::from(false)
+    } else if let Ok(n) = raw.parse::<i64>() {
+        Value::from(n)
+    } else {
+        Value::from(raw)
+    }
+}
+
+// --- validate-before-write (shared by `watch` and `config`) ----------------
+
+impl From<EditError> for CmdError {
+    fn from(e: EditError) -> Self {
+        CmdError::err(e.to_string())
+    }
+}
+
+/// Re-parses a serialized document through the read layer and resolves every
+/// watch, returning the first validation error. Mirrors the daemon's
+/// validate-before-swap discipline and subsumes per-field gaps (defaults
+/// inheritance, duplicate names/paths). Paused watches are validated too (via
+/// `resolve_all`).
+pub(crate) fn document_validity(text: &str) -> Result<(), ConfigError> {
+    Config::from_toml_str(text)?.resolve_all()?;
+    Ok(())
+}
+
+/// Validates the exact bytes a mutation is about to write, then writes them —
+/// applying the "never break a working config" invariant relative to the
+/// config's validity *before* the edit (`pre_edit_invalid`):
+///
+/// * post-edit valid → write and succeed (a clean edit, or a repair that made an
+///   invalid config valid again — either way, silently).
+/// * pre-edit valid, post-edit invalid → refuse (exit 2): the CLI must never
+///   turn a working config into a broken one that would wedge the daemon.
+/// * pre-edit invalid, post-edit invalid → write anyway, warn, and exit 1
+///   (attention): the config was already broken, so blocking an unrelated edit
+///   would only trap the user — the natural repair path must be allowed.
+///
+/// Returns `Ok(None)` when written clean and `Ok(Some(attention))` when written
+/// with the still-invalid warning — the caller must finish its post-write work
+/// and then surface the carried attention, so a write that landed is never
+/// reported as if it hadn't.
+pub(crate) fn commit_document(
+    doc: &DocumentMut,
+    config_file: &Path,
+    pre_edit_invalid: bool,
+) -> Result<Option<CmdError>, CmdError> {
+    let text = doc.to_string();
+    match document_validity(&text) {
+        Ok(()) => {
+            write_atomic(config_file, doc)?;
+            Ok(None)
+        }
+        Err(e) if pre_edit_invalid => {
+            write_atomic(config_file, doc)?;
+            Ok(Some(CmdError::attention(format!(
+                "wrote {}, but the config is still not fully valid: {e}",
+                config_file.display()
+            ))))
+        }
+        Err(e) => Err(CmdError::err(format!(
+            "refusing to write {}: the edit would make a valid config invalid: {e}",
+            config_file.display()
+        ))),
+    }
 }
 
 /// Serializes `doc` and installs it at `path` through the shared durable
@@ -525,6 +684,92 @@ path = "/home/u/notes"
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn set_dotted_creates_a_table_and_preserves_comments() {
+        let original = "version = 1\n\n# keep me\n[defaults]\ninterval = \"15m\"  # inline\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+        set_dotted(&mut doc, "daemon.log_level", "debug").unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("# keep me"), "comment lost: {text}");
+        assert!(text.contains("# inline"), "inline comment lost: {text}");
+        assert!(text.contains("log_level = \"debug\""), "got: {text}");
+    }
+
+    #[test]
+    fn set_dotted_infers_bool_and_integer_and_string() {
+        let mut doc = new_document();
+        set_dotted(&mut doc, "defaults.sync", "true").unwrap();
+        set_dotted(&mut doc, "daemon.log_retention_days", "30").unwrap();
+        set_dotted(&mut doc, "defaults.interval", "15m").unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("sync = true"), "bool not inferred: {text}");
+        assert!(
+            text.contains("log_retention_days = 30"),
+            "int not inferred: {text}"
+        );
+        assert!(
+            text.contains("interval = \"15m\""),
+            "string not inferred: {text}"
+        );
+    }
+
+    #[test]
+    fn get_dotted_reads_scalars_and_reports_missing_and_non_scalar() {
+        let doc = "version = 1\n\n[daemon]\nlog_level = \"info\"\nlog_retention_days = 14\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            get_dotted(&doc, "daemon.log_level")
+                .unwrap()
+                .ok()
+                .as_deref(),
+            Some("info")
+        );
+        assert_eq!(
+            get_dotted(&doc, "daemon.log_retention_days")
+                .unwrap()
+                .ok()
+                .as_deref(),
+            Some("14")
+        );
+        // A missing key is None.
+        assert!(get_dotted(&doc, "defaults.interval").is_none());
+        // The bare table is present but not a scalar.
+        assert!(get_dotted(&doc, "daemon").unwrap().is_err());
+    }
+
+    #[test]
+    fn unset_dotted_removes_a_key_and_reports_a_missing_one() {
+        let mut doc = "version = 1\n\n[defaults]\ninterval = \"15m\"\nquiesce = \"10s\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(unset_dotted(&mut doc, "defaults.interval"));
+        let text = doc.to_string();
+        assert!(!text.contains("interval"), "got: {text}");
+        assert!(text.contains("quiesce = \"10s\""), "sibling kept: {text}");
+        // Removing an absent key reports false.
+        assert!(!unset_dotted(&mut doc, "defaults.nope"));
+        assert!(!unset_dotted(&mut doc, "ai.model"));
+    }
+
+    #[test]
+    fn unset_dotted_may_leave_an_empty_table() {
+        let mut doc = "version = 1\n\n[ai]\nmodel = \"claude\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(unset_dotted(&mut doc, "ai.model"));
+        // The now-empty [ai] table remains — simple and harmless.
+        let text = doc.to_string();
+        assert!(text.contains("[ai]"), "empty table left in place: {text}");
+        assert!(!text.contains("model"), "got: {text}");
+    }
+
+    #[test]
+    fn document_validity_flags_a_missing_version() {
+        assert!(document_validity("version = 1\n").is_ok());
+        assert!(document_validity("[daemon]\nlog_level = \"info\"\n").is_err());
     }
 
     #[test]

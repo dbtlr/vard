@@ -31,7 +31,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use toml_edit::DocumentMut;
 use vard_core::{GitBackend, TriggerMode, WatchSpec};
 
 use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
@@ -83,12 +82,6 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
     };
 
     finish(result)
-}
-
-impl From<config_edit::EditError> for CmdError {
-    fn from(e: config_edit::EditError) -> Self {
-        CmdError::err(e.to_string())
-    }
 }
 
 // --- add -------------------------------------------------------------------
@@ -190,7 +183,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         config_edit::load_document(&paths.config_file)?.unwrap_or_else(config_edit::new_document);
     // The config's validity *before* this edit decides how strictly the result
     // is judged (see [`commit_document`]).
-    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
+    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
 
     // Realize the repository plan under the lock: perform any authorized init,
     // then seed vard's default excludes into the repo's resolved exclude file
@@ -221,7 +214,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     }
     // Validate the exact bytes to be written before committing them, so the CLI
     // can never take a valid config to invalid and wedge the daemon's reloads.
-    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
@@ -415,13 +408,13 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while removing".to_string()))?;
-    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
+    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
     if !config_edit::remove_watch(&mut doc, &name) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be removed"
         )));
     }
-    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     // --purge drops vard's own per-watch metadata; the repository is never
     // touched, purge or not. This must run whenever the removal was written —
@@ -536,13 +529,13 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
-    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
+    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
     if !config_edit::set_paused(&mut doc, &name, paused) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be updated"
         )));
     }
-    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let human = if was == paused {
         format!(
@@ -585,60 +578,6 @@ fn require_config(paths: &WatchPaths, op: &str) -> Result<Config, CmdError> {
             paths.config_file.display()
         ))
     })
-}
-
-/// Re-parses a serialized document through the read layer and resolves every
-/// watch, returning the first validation error. This mirrors the daemon's
-/// validate-before-swap discipline and subsumes per-field gaps (defaults
-/// inheritance, duplicate names/paths) that the pre-mutation checks do not see.
-/// Paused watches are validated too (via `resolve_all`).
-fn document_validity(text: &str) -> Result<(), ConfigError> {
-    Config::from_toml_str(text)?.resolve_all()?;
-    Ok(())
-}
-
-/// Validates the exact bytes a mutation is about to write, then writes them —
-/// applying the "never break a working config" invariant relative to the
-/// config's validity *before* the edit (`pre_edit_invalid`):
-///
-/// * post-edit valid → write and succeed (a clean edit, or a repair that made an
-///   invalid config valid again — either way, silently).
-/// * pre-edit valid, post-edit invalid → refuse (exit 2): the CLI must never
-///   turn a working config into a broken one that would wedge the daemon.
-/// * pre-edit invalid, post-edit invalid → write anyway, warn, and exit 1
-///   (attention): the config was already broken, so blocking an unrelated
-///   pause/remove would only trap the user — the natural repair path (e.g.
-///   `remove`-ing one of a pair of duplicate paths) must be allowed to proceed.
-///
-/// Returns `Ok(None)` when written clean and `Ok(Some(attention))` when
-/// written with the still-invalid warning — the caller must finish its
-/// post-write work (purge, output) and then surface the carried attention, so
-/// a write that landed is never reported as if it hadn't.
-fn commit_document(
-    doc: &DocumentMut,
-    config_file: &Path,
-    pre_edit_invalid: bool,
-) -> Result<Option<CmdError>, CmdError> {
-    let text = doc.to_string();
-    match document_validity(&text) {
-        Ok(()) => {
-            config_edit::write_atomic(config_file, doc)?;
-            Ok(None)
-        }
-        Err(e) if pre_edit_invalid => {
-            // The edit did not introduce the breakage, so honor it — but flag
-            // that the config is still not fully valid.
-            config_edit::write_atomic(config_file, doc)?;
-            Ok(Some(CmdError::attention(format!(
-                "wrote {}, but the config is still not fully valid: {e}",
-                config_file.display()
-            ))))
-        }
-        Err(e) => Err(CmdError::err(format!(
-            "refusing to write {}: the edit would make a valid config invalid: {e}",
-            config_file.display()
-        ))),
-    }
 }
 
 fn home_dir() -> Option<PathBuf> {
