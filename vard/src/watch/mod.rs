@@ -35,11 +35,10 @@ use toml_edit::DocumentMut;
 use vard_core::{GitBackend, TriggerMode, WatchSpec};
 
 use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
+use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, finish};
 use crate::config::{Config, ConfigError, ResolvedWatch, WatchConfig};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::journal::Journal;
-use crate::output::format;
-use crate::output::palette::{self, Palette};
 use crate::output::record::{self, Record, RecordField};
 use crate::paths::{self, HomeNotFound};
 
@@ -61,50 +60,9 @@ impl WatchPaths {
     }
 }
 
-/// Resolved output settings shared by every command's emitter.
-struct OutCtx {
-    format: OutputFormat,
-    palette: Palette,
-    term_width: usize,
-}
-
-/// A command failure carrying the message to print and the process exit code
-/// (2 for an error, 1 for "attention needed" such as a declined `git init`).
-struct CmdError {
-    message: String,
-    code: u8,
-}
-
-impl CmdError {
-    /// An error (exit code 2).
-    fn err(message: impl Into<String>) -> Self {
-        CmdError {
-            message: message.into(),
-            code: 2,
-        }
-    }
-
-    /// An "attention needed" outcome (exit code 1): the command did not fail,
-    /// but it also did not complete — e.g. the user declined to initialize a
-    /// repository.
-    fn attention(message: impl Into<String>) -> Self {
-        CmdError {
-            message: message.into(),
-            code: 1,
-        }
-    }
-}
-
-impl From<config_edit::EditError> for CmdError {
-    fn from(e: config_edit::EditError) -> Self {
-        CmdError::err(e.to_string())
-    }
-}
-
-type CmdResult = Result<(), CmdError>;
-
 /// Production entry point for `vard watch <subcommand>`. Resolves paths and
-/// output settings, dispatches, and maps the result to an exit code.
+/// output settings, dispatches, and maps the result to an exit code — all via
+/// the shared [command-outcome layer](crate::command).
 pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     let paths = match WatchPaths::from_xdg() {
         Ok(paths) => paths,
@@ -114,12 +72,7 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
         }
     };
 
-    let is_tty = io::stdout().is_terminal();
-    let out = OutCtx {
-        format: format::resolve(format, is_tty),
-        palette: palette::resolve_with_tty(color, is_tty),
-        term_width: term_width(),
-    };
+    let out = OutCtx::resolve(color, format);
 
     let result = match cmd {
         WatchCommand::Add(args) => cmd_add(&paths, &out, args),
@@ -129,12 +82,12 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
         WatchCommand::Resume(args) => cmd_set_paused(&paths, &out, &args.target, false),
     };
 
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("vard: {}", err.message);
-            ExitCode::from(err.code)
-        }
+    finish(result)
+}
+
+impl From<config_edit::EditError> for CmdError {
+    fn from(e: config_edit::EditError) -> Self {
+        CmdError::err(e.to_string())
     }
 }
 
@@ -699,44 +652,7 @@ fn opt_duration(raw: Option<&str>) -> Result<Option<Duration>, CmdError> {
         .transpose()
 }
 
-fn term_width() -> usize {
-    terminal_size::terminal_size()
-        .map(|(w, _)| w.0 as usize)
-        .unwrap_or(80)
-}
-
-/// Emits a list of records in the resolved format.
+/// Emits the watch list in the resolved format, under the `watches` noun.
 fn emit_list(out: &OutCtx, records: &[Record]) -> CmdResult {
-    let mut w = io::stdout().lock();
-    let res = match out.format {
-        OutputFormat::Records => {
-            record::render_records(&mut w, &out.palette, records, "watches", out.term_width)
-        }
-        OutputFormat::Json => record::render_json(&mut w, records),
-        OutputFormat::Jsonl => record::render_jsonl(&mut w, records),
-    };
-    finish_write(res)
-}
-
-/// Emits a single command result: a human line in the records form, or a single
-/// JSON object in the machine forms.
-fn emit_action(out: &OutCtx, human: &str, record: &Record) -> CmdResult {
-    let mut w = io::stdout().lock();
-    let res = match out.format {
-        OutputFormat::Records => writeln!(w, "{human}"),
-        OutputFormat::Json | OutputFormat::Jsonl => {
-            record::write_json_object(&mut w, record).and_then(|()| w.write_all(b"\n"))
-        }
-    };
-    finish_write(res)
-}
-
-/// Folds a write result into a [`CmdResult`], treating a broken pipe (the reader
-/// went away, e.g. `| head`) as success rather than an error.
-fn finish_write(res: io::Result<()>) -> CmdResult {
-    match res {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(CmdError::err(format!("writing output: {e}"))),
-    }
+    emit_records(out, records, "watches")
 }

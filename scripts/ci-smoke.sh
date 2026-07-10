@@ -61,6 +61,11 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" watch -h | grep -q 'For full help, run' || fail "vard watch -h missing the v2 short-help footer"
 "$VARD" watch add --help | grep -q 'canonicalized path' || fail "vard watch add --help missing its prose"
 
+# The snapshot/history commands (VRD-16) render help through the same v2 path.
+"$VARD" snapshot -h | grep -q 'For full help, run' || fail "vard snapshot -h missing the v2 short-help footer"
+"$VARD" restore --help | grep -q 'protective snapshot' || fail "vard restore --help missing its prose"
+"$VARD" diff --help | grep -q 'text-only' || fail "vard diff --help missing the text-only note"
+
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
 # Requires git on PATH (the release-artifact job has it).
@@ -83,6 +88,30 @@ grep -q 'vard managed excludes' "$WDIR/.git/info/exclude" || fail "vard watch ad
 "$VARD" watch pause smoke >/dev/null || fail "vard watch pause failed"
 grep -q 'paused = true' "$XDG_CONFIG_HOME/vard/config.toml" || fail "vard watch pause did not persist paused = true"
 "$VARD" watch resume smoke >/dev/null || fail "vard watch resume failed"
+
+# Snapshot/log round-trip (VRD-16), no daemon: an in-process snapshot must land
+# a real commit, leave the operation journal compacted (no dangling begin), and
+# be visible in the log. A second snapshot with no changes must be a clean no-op.
+echo "smoke snapshot content" > "$WDIR/note.txt"
+"$VARD" --format json snapshot smoke | grep -q '"status":"committed"' || fail "vard snapshot did not commit"
+test "$(git -C "$WDIR" rev-list --count HEAD)" = "1" || fail "vard snapshot did not land exactly one commit"
+# The in-process snapshot MUST have written a journal for the watch, and it must
+# be compacted to empty (no dangling begin). nullglob keeps a missing journal
+# from making the loop vacuously pass on the literal glob pattern.
+shopt -s nullglob
+journals=("$XDG_STATE_HOME"/vard/journal/*.journal)
+shopt -u nullglob
+test "${#journals[@]}" -gt 0 || fail "no operation journal was written for the in-process snapshot"
+for j in "${journals[@]}"; do
+  test ! -s "$j" || fail "operation journal $j holds a dangling begin after a clean snapshot"
+done
+"$VARD" --format json log smoke | grep -q '"trigger":"manual"' || fail "vard log did not show the manual snapshot"
+"$VARD" --format json snapshot smoke | grep -q '"status":"no changes"' || fail "second snapshot was not a clean no-op"
+# diff is text-only: an explicit --format json must be rejected (exit 2).
+if "$VARD" --format json diff smoke >/dev/null 2>&1; then
+  fail "vard --format json diff should be rejected as text-only"
+fi
+
 "$VARD" watch remove smoke >/dev/null || fail "vard watch remove failed"
 test -d "$WDIR/.git" || fail "vard watch remove touched the repository"
 test "$("$VARD" --format json watch list)" = "[]" || fail "vard watch list not empty after remove"

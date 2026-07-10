@@ -89,7 +89,29 @@ pub trait VcsBackend {
 
     /// Returns the raw unified diff between two references, or between one
     /// reference and the current work tree when `to` is `None`.
-    fn diff(&self, from: &VcsRef, to: Option<&VcsRef>) -> Result<String, VcsError>;
+    ///
+    /// When `pathspec` is `Some`, the diff is scoped to that single path,
+    /// matched as a literal (git pathspec magic disabled) so paths with spaces
+    /// or leading `:` are handled verbatim — the same literal matching the
+    /// scoped [`restore`](Self::restore) uses, so a `--file` diff preview and
+    /// the restore it previews agree exactly.
+    fn diff(
+        &self,
+        from: &VcsRef,
+        to: Option<&VcsRef>,
+        pathspec: Option<&std::path::Path>,
+    ) -> Result<String, VcsError>;
+
+    /// Reports whether `rev` resolves to a commit in this repository, without
+    /// side effects. Used to validate a caller-supplied `--ref` *before* a
+    /// destructive operation takes any protective snapshot, so a typo fails
+    /// cleanly with nothing changed.
+    fn verify_ref(&self, rev: &VcsRef) -> Result<bool, VcsError>;
+
+    /// Reports whether `path` exists at `rev` (as a tracked blob or tree).
+    /// Lets a `--file` restore preview pre-check exactly what the real restore
+    /// checks, so both agree on a path absent at the chosen revision.
+    fn path_exists_at(&self, rev: &VcsRef, path: &std::path::Path) -> Result<bool, VcsError>;
 
     /// Restores the work tree (or a single path within it) to a prior
     /// reference.
@@ -317,6 +339,11 @@ pub struct LogFilter {
     /// Keep only snapshots committed at or after this time (see the type docs
     /// for the exact boundary behavior).
     pub since: Option<SystemTime>,
+    /// Keep only snapshots committed at or before this time (git's `--until`,
+    /// inclusive at the boundary like `since`). Combined with `limit = Some(1)`
+    /// this asks git directly for "the newest snapshot as of a past instant"
+    /// rather than fetching the whole history and scanning it.
+    pub until: Option<SystemTime>,
     /// Keep at most this many of the most-recent snapshots.
     pub limit: Option<usize>,
 }

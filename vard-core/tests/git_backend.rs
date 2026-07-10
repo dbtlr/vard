@@ -532,6 +532,7 @@ fn log_respects_limit() {
     let snaps = backend
         .log(&LogFilter {
             since: None,
+            until: None,
             limit: Some(2),
         })
         .unwrap();
@@ -551,6 +552,7 @@ fn log_respects_since_bounds() {
         backend
             .log(&LogFilter {
                 since: Some(past),
+                until: None,
                 limit: None,
             })
             .unwrap()
@@ -561,6 +563,7 @@ fn log_respects_since_bounds() {
         backend
             .log(&LogFilter {
                 since: Some(future),
+                until: None,
                 limit: None,
             })
             .unwrap()
@@ -588,11 +591,54 @@ fn log_since_boundary_is_inclusive() {
 
     let at = |secs: u64| LogFilter {
         since: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+        until: None,
         limit: None,
     };
     assert_eq!(backend.log(&at(t)).unwrap().len(), 1, "exact boundary");
     assert_eq!(backend.log(&at(t - 1)).unwrap().len(), 1, "just before");
     assert!(backend.log(&at(t + 1)).unwrap().is_empty(), "just after");
+}
+
+#[test]
+fn log_until_with_limit_one_picks_newest_at_or_before() {
+    // Two commits at pinned times; `--until` + max-count=1 asks git for the
+    // newest snapshot as of a past instant, without fetching the whole history.
+    let (tmp, backend) = new_repo();
+    let commit_at = |msg: &str, content: &str, t: u64| {
+        write(tmp.path(), "a.txt", content);
+        git_ok(tmp.path(), &["add", "-A"]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["commit", "-m", msg])
+            .env("GIT_COMMITTER_DATE", format!("@{t} +0000"))
+            .env("GIT_AUTHOR_DATE", format!("@{t} +0000"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    let early = 1_700_000_000u64;
+    let late = early + 3_600;
+    commit_at("early", "early\n", early);
+    commit_at("late", "late\n", late);
+
+    let newest_by = |secs: u64| {
+        backend
+            .log(&LogFilter {
+                since: None,
+                until: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+                limit: Some(1),
+            })
+            .unwrap()
+    };
+    // Between the two commits: the early one is the newest at-or-before.
+    let mid = newest_by(early + 60);
+    assert_eq!(mid.len(), 1);
+    assert_eq!(mid[0].subject, "early");
+    // At or after the late commit: the late one wins.
+    assert_eq!(newest_by(late).len(), 1);
+    // Before either commit: nothing.
+    assert!(newest_by(early - 1).is_empty());
 }
 
 // --- diff ------------------------------------------------------------------
@@ -606,7 +652,7 @@ fn diff_between_two_snapshots_shows_the_change() {
     let second = snap_id(&backend, Trigger::Manual);
 
     let diff = backend
-        .diff(&VcsRef::from(&first), Some(&VcsRef::from(&second)))
+        .diff(&VcsRef::from(&first), Some(&VcsRef::from(&second)), None)
         .unwrap();
     assert!(diff.contains("-old"), "diff was: {diff}");
     assert!(diff.contains("+new"), "diff was: {diff}");
@@ -619,8 +665,68 @@ fn diff_against_working_tree_when_to_is_none() {
     let first = snap_id(&backend, Trigger::Manual);
     // Uncommitted working-tree edit.
     write(tmp.path(), "a.txt", "working\n");
-    let diff = backend.diff(&VcsRef::from(&first), None).unwrap();
+    let diff = backend.diff(&VcsRef::from(&first), None, None).unwrap();
     assert!(diff.contains("+working"), "diff was: {diff}");
+}
+
+#[test]
+fn diff_scoped_to_a_literal_path_with_spaces() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "keep.txt", "keep\n");
+    write(tmp.path(), "with space.txt", "old\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "keep.txt", "changed\n");
+    write(tmp.path(), "with space.txt", "new\n");
+
+    // A literal pathspec scopes the diff to just the space-containing file, and
+    // the other changed file is excluded.
+    let scoped = backend
+        .diff(
+            &VcsRef::from(&first),
+            None,
+            Some(std::path::Path::new("with space.txt")),
+        )
+        .unwrap();
+    assert!(scoped.contains("with space.txt"), "diff was: {scoped}");
+    assert!(scoped.contains("+new"), "diff was: {scoped}");
+    assert!(!scoped.contains("keep.txt"), "diff was: {scoped}");
+}
+
+#[test]
+fn verify_ref_distinguishes_real_and_bogus_revisions() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "a.txt", "1\n");
+    let c1 = snap_id(&backend, Trigger::Manual);
+    assert!(backend.verify_ref(&VcsRef::from(&c1)).unwrap());
+    assert!(backend.verify_ref(&VcsRef::new("HEAD")).unwrap());
+    assert!(!backend.verify_ref(&VcsRef::new("deadbeef")).unwrap());
+    assert!(!backend.verify_ref(&VcsRef::new("no-such-branch")).unwrap());
+}
+
+#[test]
+fn path_exists_at_reports_presence_at_a_revision() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "a.txt", "1\n");
+    let c1 = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "later.txt", "new\n");
+    let c2 = snap_id(&backend, Trigger::Manual);
+
+    assert!(
+        backend
+            .path_exists_at(&VcsRef::from(&c1), std::path::Path::new("a.txt"))
+            .unwrap()
+    );
+    // later.txt was added after c1, so it is absent there but present at c2.
+    assert!(
+        !backend
+            .path_exists_at(&VcsRef::from(&c1), std::path::Path::new("later.txt"))
+            .unwrap()
+    );
+    assert!(
+        backend
+            .path_exists_at(&VcsRef::from(&c2), std::path::Path::new("later.txt"))
+            .unwrap()
+    );
 }
 
 // --- restore ---------------------------------------------------------------

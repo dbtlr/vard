@@ -1,18 +1,26 @@
-//! Single-instance enforcement for the daemon via an exclusive advisory
-//! `flock` on [`paths::lock_file`].
+//! Single-instance enforcement via an exclusive advisory `flock` on
+//! [`paths::lock_file`], plus the role discriminator that lets a CLI command
+//! tell a daemon holder from a peer CLI holder.
 //!
-//! Exactly one `vard` daemon may own a given state directory at a time.
-//! Acquisition takes a non-blocking exclusive `flock`: the first daemon wins,
-//! a second startup fails fast with the holder's PID for a clear diagnostic.
+//! # The lock proves *someone* holds it — the role says *who*
+//!
+//! The `flock` alone proves only that some `vard` process holds the lock, not
+//! that it is the daemon. That distinction matters: a CLI `snapshot` may only
+//! hand its work to a *daemon* (which owns the repositories); a second
+//! concurrent CLI holding the lock in-process must be waited on, not handed a
+//! request it will never drain. So the lock file records a **role** beside the
+//! PID — `"daemon"` or `"cli"` — and every acquirer writes its own. A holder
+//! whose role is unreadable is treated as a peer CLI, never as a daemon, so a
+//! command never falsely reports "handed to the daemon".
 //!
 //! # Why `flock`, not a PID file
 //!
 //! `flock` is tied to the open file description, so the kernel releases it
 //! automatically when the holding process exits — crash, `kill -9`, or clean
 //! shutdown alike. A daemon that dies without running `Drop` therefore leaves
-//! no stale lock behind, which a bare PID file cannot promise. The PID we
-//! write into the file is diagnostics only (so contention can name the
-//! holder); the lock itself is what enforces exclusion.
+//! no stale lock behind, which a bare PID file cannot promise. The PID and role
+//! written into the file are diagnostics and dispatch only; the lock itself is
+//! what enforces exclusion.
 //!
 //! The lock file is deliberately left on disk when the guard drops: `flock`
 //! needs no unlink to release, and removing the file would race a concurrent
@@ -22,11 +30,64 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 
 use crate::paths;
+
+/// How long a CLI/daemon acquirer sleeps between retries while a peer holds the
+/// lock. Short enough to feel responsive, long enough not to spin.
+const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The role recorded in the lock file, so a contending CLI can tell a daemon
+/// holder (route work to it) from a peer CLI (wait for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRole {
+    /// The long-lived `vard run` daemon.
+    Daemon,
+    /// A transient CLI command holding the lock for one in-process operation.
+    Cli,
+}
+
+impl LockRole {
+    /// The token written into the lock file.
+    fn as_str(self) -> &'static str {
+        match self {
+            LockRole::Daemon => "daemon",
+            LockRole::Cli => "cli",
+        }
+    }
+
+    /// Parses a role token, `None` for anything unrecognized (an old or
+    /// corrupt lock file), which callers treat conservatively as a peer CLI.
+    fn parse(s: &str) -> Option<LockRole> {
+        match s.trim() {
+            "daemon" => Some(LockRole::Daemon),
+            "cli" => Some(LockRole::Cli),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for LockRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The outcome of a CLI's attempt to acquire the instance lock for an
+/// in-process operation (see [`InstanceLock::acquire_for_cli`]).
+pub(crate) enum CliLock {
+    /// The lock is ours; perform the operation in-process while holding it.
+    Acquired(InstanceLock),
+    /// A daemon owns the repositories; route the work to it as a request.
+    DaemonHeld,
+    /// A peer CLI held the lock for the whole retry budget; the caller reports
+    /// an honest "another vard command is running; retry" rather than proceeding.
+    BusyPeerCli,
+}
 
 /// A held single-instance lock. The exclusive `flock` lives as long as this
 /// guard: dropping it closes the underlying descriptor, which releases the
@@ -42,20 +103,20 @@ pub(crate) struct InstanceLock {
 }
 
 impl InstanceLock {
-    /// Acquires the daemon's single-instance lock at the default location,
-    /// `$XDG_STATE_HOME/vard/vard.lock`.
+    /// Acquires the single-instance lock at the default location,
+    /// `$XDG_STATE_HOME/vard/vard.lock`, recording `role`.
     // The daemon resolves paths through `DaemonPaths` and calls `acquire_at`;
     // this XDG convenience is kept for future callers (e.g. `vard status`).
     #[allow(dead_code)]
-    pub(crate) fn acquire() -> Result<InstanceLock, LockError> {
+    pub(crate) fn acquire(role: LockRole) -> Result<InstanceLock, LockError> {
         let path = paths::lock_file().map_err(|e| LockError::Path(e.to_string()))?;
-        Self::acquire_at(&path)
+        Self::acquire_at(&path, role)
     }
 
     /// [`acquire`](Self::acquire) against an explicit path, so tests inject a
-    /// tempdir instead of the real XDG state directory. Creates parent
-    /// directories as needed.
-    pub(crate) fn acquire_at(path: &Path) -> Result<InstanceLock, LockError> {
+    /// tempdir instead of the real XDG state directory. Records `role` in the
+    /// lock file and creates parent directories as needed.
+    pub(crate) fn acquire_at(path: &Path, role: LockRole) -> Result<InstanceLock, LockError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| LockError::Io {
                 path: path.to_path_buf(),
@@ -64,7 +125,7 @@ impl InstanceLock {
         }
 
         // Open read+write (not truncating): on contention we still want to read
-        // the incumbent's PID out of the file.
+        // the incumbent's PID and role out of the file.
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -81,9 +142,11 @@ impl InstanceLock {
             // `EWOULDBLOCK` is `EAGAIN` on every platform rustix targets, so
             // matching one covers contention.
             Err(Errno::WOULDBLOCK) => {
+                let (holder, role) = read_holder(path);
                 return Err(LockError::Held {
                     path: path.to_path_buf(),
-                    holder: read_pid(path),
+                    holder,
+                    role,
                 });
             }
             Err(errno) => {
@@ -94,8 +157,8 @@ impl InstanceLock {
             }
         }
 
-        // Lock is ours: replace any stale contents with our own PID.
-        write_pid(&mut file, std::process::id()).map_err(|source| LockError::Io {
+        // Lock is ours: replace any stale contents with our own PID and role.
+        write_holder(&mut file, std::process::id(), role).map_err(|source| LockError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -104,6 +167,63 @@ impl InstanceLock {
             file,
             path: path.to_path_buf(),
         })
+    }
+
+    /// Acquires the lock for a CLI in-process operation, retrying a *peer CLI*
+    /// holder for up to `budget` before giving up. A *daemon* holder
+    /// short-circuits to [`CliLock::DaemonHeld`] (route the work to it); a
+    /// holder whose role is unreadable is treated as a peer CLI — never a
+    /// daemon — so a command never falsely claims it handed work to a daemon.
+    pub(crate) fn acquire_for_cli(path: &Path, budget: Duration) -> Result<CliLock, LockError> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match Self::acquire_at(path, LockRole::Cli) {
+                Ok(lock) => return Ok(CliLock::Acquired(lock)),
+                Err(LockError::Held {
+                    role: Some(LockRole::Daemon),
+                    ..
+                }) => return Ok(CliLock::DaemonHeld),
+                // A peer CLI (or an unreadable role): wait its turn, up to budget.
+                Err(LockError::Held { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Ok(CliLock::BusyPeerCli);
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Acquires the lock for the daemon. A duplicate *daemon* holder fails
+    /// immediately (no point waiting on a peer that will not exit); a transient
+    /// *CLI* holder is retried for up to `cli_wait` before failing, so a daemon
+    /// starting a beat after a CLI `snapshot` took the lock in-process does not
+    /// spuriously refuse to start. The returned [`LockError::Held`] carries the
+    /// holder's role so the caller can word the message correctly.
+    pub(crate) fn acquire_for_daemon(
+        path: &Path,
+        cli_wait: Duration,
+    ) -> Result<InstanceLock, LockError> {
+        let deadline = Instant::now() + cli_wait;
+        loop {
+            match Self::acquire_at(path, LockRole::Daemon) {
+                Ok(lock) => return Ok(lock),
+                // Another daemon: do not wait, it is not going anywhere.
+                err @ Err(LockError::Held {
+                    role: Some(LockRole::Daemon),
+                    ..
+                }) => return err,
+                // A transient CLI (or unreadable role): retry briefly.
+                Err(e @ LockError::Held { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// The lock file's path, for diagnostics.
@@ -124,22 +244,31 @@ impl Drop for InstanceLock {
     }
 }
 
-/// Truncates `file` and writes `pid` followed by a newline, leaving the file
-/// positioned at the end.
-fn write_pid(file: &mut File, pid: u32) -> std::io::Result<()> {
+/// Truncates `file` and writes the holder record — the PID on the first line
+/// and the role on the second — leaving the file positioned at the end.
+fn write_holder(file: &mut File, pid: u32, role: LockRole) -> std::io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    writeln!(file, "{pid}")?;
+    writeln!(file, "{pid}\n{role}")?;
     file.flush()
 }
 
-/// Best-effort read of the PID recorded in the lock file at `path`. Returns
-/// `None` when the file is missing, empty, or does not hold a bare integer —
-/// the caller must render a sensible message regardless.
-fn read_pid(path: &Path) -> Option<u32> {
+/// Best-effort read of the PID and role recorded in the lock file at `path`:
+/// the first line is the PID, the second the role. Either component is `None`
+/// when the file is missing, empty, or malformed — the caller renders a
+/// sensible message regardless, and an absent role is treated as a peer CLI.
+fn read_holder(path: &Path) -> (Option<u32>, Option<LockRole>) {
     let mut buf = String::new();
-    File::open(path).ok()?.read_to_string(&mut buf).ok()?;
-    buf.trim().parse().ok()
+    if File::open(path)
+        .and_then(|mut f| f.read_to_string(&mut buf))
+        .is_err()
+    {
+        return (None, None);
+    }
+    let mut lines = buf.lines();
+    let pid = lines.next().and_then(|l| l.trim().parse().ok());
+    let role = lines.next().and_then(LockRole::parse);
+    (pid, role)
 }
 
 /// Why acquiring the single-instance lock failed.
@@ -158,12 +287,15 @@ pub(crate) enum LockError {
     },
     /// Another `vard` instance already holds the lock. `holder` is the PID read
     /// from the file, best-effort — it may be absent if the file is empty or
-    /// unreadable.
+    /// unreadable. `role` is the holder's recorded role (daemon or CLI), absent
+    /// when unreadable — in which case callers assume a peer CLI.
     Held {
         /// The lock file path.
         path: PathBuf,
         /// The holding process's PID, if it could be read.
         holder: Option<u32>,
+        /// The holding process's role, if it could be read.
+        role: Option<LockRole>,
     },
 }
 
@@ -177,12 +309,15 @@ impl fmt::Display for LockError {
             LockError::Held {
                 path,
                 holder: Some(pid),
+                ..
             } => write!(
                 f,
                 "another vard instance is already running (PID {pid}; lock {})",
                 path.display()
             ),
-            LockError::Held { path, holder: None } => write!(
+            LockError::Held {
+                path, holder: None, ..
+            } => write!(
                 f,
                 "another vard instance is already running (holder PID unknown; lock {})",
                 path.display()
@@ -211,25 +346,68 @@ mod tests {
     }
 
     #[test]
-    fn acquire_creates_parents_and_writes_pid() {
+    fn acquire_creates_parents_and_writes_pid_and_role() {
         let (_dir, path) = temp_lock_path();
-        let lock = InstanceLock::acquire_at(&path).unwrap();
+        let lock = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
         assert_eq!(lock.path(), path);
-        // The PID is written for diagnostics.
-        assert_eq!(read_pid(&path), Some(std::process::id()));
+        // Both the PID and the role are written for diagnostics and dispatch.
+        assert_eq!(
+            read_holder(&path),
+            (Some(std::process::id()), Some(LockRole::Daemon))
+        );
     }
 
     #[test]
-    fn second_acquire_contends_and_reports_holder_pid() {
+    fn second_acquire_contends_and_reports_holder_pid_and_role() {
         // `flock` locks are per open file description, so a second open+flock
         // of the same path — even in this same process — contends.
         let (_dir, path) = temp_lock_path();
-        let _held = InstanceLock::acquire_at(&path).unwrap();
-        match InstanceLock::acquire_at(&path) {
-            Err(LockError::Held { holder, .. }) => {
+        let _held = InstanceLock::acquire_at(&path, LockRole::Cli).unwrap();
+        match InstanceLock::acquire_at(&path, LockRole::Daemon) {
+            Err(LockError::Held { holder, role, .. }) => {
                 assert_eq!(holder, Some(std::process::id()));
+                assert_eq!(
+                    role,
+                    Some(LockRole::Cli),
+                    "the incumbent's role is read back"
+                );
             }
             other => panic!("expected Held contention error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acquire_for_cli_sees_a_daemon_holder_as_daemon_held() {
+        let (_dir, path) = temp_lock_path();
+        let _daemon = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        match InstanceLock::acquire_for_cli(&path, Duration::from_millis(200)).unwrap() {
+            CliLock::DaemonHeld => {}
+            _ => panic!("a daemon holder must be reported as DaemonHeld"),
+        }
+    }
+
+    #[test]
+    fn acquire_for_cli_times_out_against_a_peer_cli() {
+        let (_dir, path) = temp_lock_path();
+        let _peer = InstanceLock::acquire_at(&path, LockRole::Cli).unwrap();
+        // A peer CLI never yields, so the bounded retry reports busy — never a
+        // false DaemonHeld and never an orphaned request.
+        match InstanceLock::acquire_for_cli(&path, Duration::from_millis(150)).unwrap() {
+            CliLock::BusyPeerCli => {}
+            _ => panic!("a peer CLI holder past the budget must be BusyPeerCli"),
+        }
+    }
+
+    #[test]
+    fn acquire_for_daemon_rejects_a_duplicate_daemon_immediately() {
+        let (_dir, path) = temp_lock_path();
+        let _daemon = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        match InstanceLock::acquire_for_daemon(&path, Duration::from_secs(5)) {
+            Err(LockError::Held {
+                role: Some(LockRole::Daemon),
+                ..
+            }) => {}
+            other => panic!("a duplicate daemon must fail as a daemon holder, got {other:?}"),
         }
     }
 
@@ -237,7 +415,7 @@ mod tests {
     fn releasing_the_lock_allows_reacquire() {
         let (_dir, path) = temp_lock_path();
         {
-            let _held = InstanceLock::acquire_at(&path).unwrap();
+            let _held = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
         } // guard dropped here, releasing the flock
 
         // A fresh acquire now succeeds. The retry tolerates a test-only race:
@@ -248,7 +426,7 @@ mod tests {
         // window is a pure test artifact. Retry briefly rather than flake.
         let mut last = None;
         for _ in 0..100 {
-            match InstanceLock::acquire_at(&path) {
+            match InstanceLock::acquire_at(&path, LockRole::Daemon) {
                 Ok(_reacquired) => return,
                 Err(e) => last = Some(e),
             }
@@ -262,6 +440,7 @@ mod tests {
         let err = LockError::Held {
             path: PathBuf::from("/state/vard.lock"),
             holder: None,
+            role: None,
         };
         let msg = err.to_string();
         assert!(msg.contains("holder PID unknown"), "got: {msg}");

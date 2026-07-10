@@ -1225,7 +1225,18 @@ impl EngineBuilder {
 /// Opens the git backend for a [`watch`](EngineBuilder::watch) spec, applying
 /// the branch policy: use the configured branch, else adopt the repository's
 /// current branch.
-fn open_git_backend(spec: &WatchSpec) -> Result<GitBackend, VcsError> {
+///
+/// Public so a host (the `vard` binary's `snapshot`/`log`/`diff`/`restore`
+/// commands) opens a watch's backend through the *same* branch policy the
+/// engine uses.
+///
+/// For a watch with an **explicitly configured** [`branch`](WatchSpec::branch),
+/// this guarantees the CLI operates on exactly the branch the daemon commits to.
+/// For an adopt-current-branch watch (`branch` unset), the branch is whatever
+/// `HEAD` names at open time — so the daemon (which opened at its startup) and a
+/// later CLI invocation bind at *different* moments and could disagree if the
+/// user switched branches in between. Configure a branch to pin the two together.
+pub fn open_git_backend(spec: &WatchSpec) -> Result<GitBackend, VcsError> {
     let branch = match spec.branch() {
         Some(branch) => branch.to_string(),
         None => GitBackend::detect(spec.path())?
@@ -1466,8 +1477,21 @@ mod tests {
             &self,
             _from: &crate::vcs::VcsRef,
             _to: Option<&crate::vcs::VcsRef>,
+            _pathspec: Option<&std::path::Path>,
         ) -> Result<String, VcsError> {
             Ok(String::new())
+        }
+
+        fn verify_ref(&self, _rev: &crate::vcs::VcsRef) -> Result<bool, VcsError> {
+            unimplemented!("verify_ref is out of scope for the snapshot engine")
+        }
+
+        fn path_exists_at(
+            &self,
+            _rev: &crate::vcs::VcsRef,
+            _path: &std::path::Path,
+        ) -> Result<bool, VcsError> {
+            unimplemented!("path_exists_at is out of scope for the snapshot engine")
         }
 
         fn restore(&self, _target: &crate::vcs::RestoreTarget) -> Result<(), VcsError> {

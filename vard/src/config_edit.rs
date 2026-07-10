@@ -25,7 +25,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
@@ -218,60 +218,17 @@ pub(crate) fn set_paused(doc: &mut DocumentMut, name: &str, paused: bool) -> boo
     true
 }
 
-/// Serializes `doc` and installs it at `path` atomically and durably: write to
-/// a temporary file in the same directory, `fsync` it, `rename(2)` it into
-/// place, then `fsync` the parent directory. The daemon, which watches this
+/// Serializes `doc` and installs it at `path` through the shared durable
+/// atomic-write recipe ([`atomic::write`](crate::atomic::write)): temp file,
+/// `fsync`, `rename(2)`, directory `fsync`. The daemon, which watches this
 /// file, therefore never observes a partial write, and a crash immediately
 /// after cannot leave a truncated or lost config — the source of truth for
-/// every watch.
-///
-/// When `path` is a symlink, it is resolved first (via [`fs::canonicalize`]) so
-/// the temp+rename happens in the *real* target's directory: the rename
-/// replaces the target the symlink points at, leaving the symlink itself
-/// intact. A not-yet-existing config resolves to itself.
+/// every watch. A symlinked `path` is resolved first so the link is preserved.
 pub(crate) fn write_atomic(path: &Path, doc: &DocumentMut) -> Result<(), EditError> {
-    // Resolve through a symlink so we edit the real file (preserving the link);
-    // a missing file has no link to preserve and resolves to itself.
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let io_err = |source| EditError::Io {
-        path: target.clone(),
+    crate::atomic::write(path, doc.to_string().as_bytes()).map_err(|source| EditError::Io {
+        path: path.to_path_buf(),
         source,
-    };
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir).map_err(io_err)?;
-
-    // Temp name in the same directory so the rename is same-filesystem (hence
-    // atomic). The leading dot and pid keep concurrent writers from colliding.
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config.toml".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
-
-    let text = doc.to_string();
-    if let Err(source) = write_and_sync(&tmp, text.as_bytes()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(io_err(source));
-    }
-    if let Err(source) = fs::rename(&tmp, &target) {
-        let _ = fs::remove_file(&tmp);
-        return Err(io_err(source));
-    }
-    // fsync the directory so the rename itself is durable. Best-effort: some
-    // filesystems reject an fsync on a directory, which does not make the write
-    // any less committed than the file fsync already made it.
-    if let Ok(dir_file) = File::open(dir) {
-        let _ = dir_file.sync_all();
-    }
-    Ok(())
-}
-
-/// Writes `bytes` to `path` and `fsync`s the file before returning, so its
-/// contents are on stable storage before the caller renames it into place.
-fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
+    })
 }
 
 /// Everything that can go wrong reading or writing the config for a mutation.
