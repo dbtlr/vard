@@ -291,8 +291,12 @@ impl Config {
 
         let mut seen_names: HashSet<String> = HashSet::new();
         // Expanded path -> name of the first watch using it. Textual equality
-        // only: catching canonicalization-level collisions (symlinks, case
-        // folding) is the daemon's job at registration time.
+        // only: catching canonicalization-level collisions (symlinks, `..`, case
+        // folding) is deferred to the daemon, which dedups by canonical journal
+        // key when it builds the engine specs (see `daemon::dedup_aliased_specs`)
+        // — there it can canonicalize live paths and skip a later aliased watch,
+        // which a config-parse validation must not do (a hand-edited alias must
+        // not fail the whole config).
         let mut seen_paths: HashMap<PathBuf, String> = HashMap::new();
         let mut resolved = Vec::with_capacity(self.watches.len());
 

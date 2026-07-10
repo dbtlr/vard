@@ -91,20 +91,81 @@ use crate::paths::{self, HomeNotFound};
 use crate::request::{self, Request, RequestKind};
 
 /// One supervised watch's durable identity: its stable config `name` (how the
-/// engine and request files refer to it) and its repository `path` (how its
-/// operation journal is keyed — see [`Journal`]). Carried through the supervisor
-/// so a bus event, which names only the watch, can be journaled by path.
+/// engine and request files refer to it), its repository `path` (used to drive
+/// recovery), and — computed **once** at construction — its canonical
+/// `identity` path and `journal_key` filename. Caching the latter two is what
+/// keeps a bus event's `begin`/`complete` addressing the same journal file even
+/// if the directory is removed mid-operation, and spares a canonicalize syscall
+/// per event and per reload membership check (see [`journal::identity_path`]).
 #[derive(Debug, Clone)]
 struct WatchIdentity {
     name: String,
     path: PathBuf,
+    /// The canonical-or-textual identity path, recorded in `begin`'s `path=`.
+    identity: PathBuf,
+    /// The journal filename key, cached from [`identity`](Self::identity).
+    journal_key: String,
 }
 
 impl WatchIdentity {
-    /// This watch's journal filename key, for comparing membership across a
-    /// reload (which watches survived, which were removed).
-    fn journal_key(&self) -> String {
-        journal::journal_file_name(&self.path)
+    /// Builds an identity for a watch rooted at `path`, resolving its canonical
+    /// identity and journal key once.
+    fn new(name: String, path: PathBuf) -> WatchIdentity {
+        let identity = journal::identity_path(&path);
+        let journal_key = journal::journal_file_name_for_identity(&identity);
+        WatchIdentity {
+            name,
+            path,
+            identity,
+            journal_key,
+        }
+    }
+
+    /// This watch's journal for the given directory, built from the cached
+    /// identity and key so no canonicalization happens per event.
+    fn journal(&self, journal_dir: &Path) -> Journal {
+        Journal::for_identity_in_dir(journal_dir, &self.identity, &self.journal_key)
+    }
+
+    /// The set of journal keys across a slice of identities — the "which watches
+    /// own a journal" membership used by the reload recovery filter and the
+    /// drain-on-remove survivor check.
+    fn key_set(watches: &[WatchIdentity]) -> std::collections::HashSet<String> {
+        watches.iter().map(|w| w.journal_key.clone()).collect()
+    }
+}
+
+/// The supervised watch identities plus a name→identity index, so a bus event
+/// (which carries only the watch *name*) is journaled by its cached path key in
+/// O(1) rather than a linear scan that re-canonicalizes. Rebuilt atomically on
+/// each engine swap. Derefs to the identity slice so the iterating callers
+/// (request fan-out, membership sets) read it as a plain `&[WatchIdentity]`.
+struct WatchSet {
+    watches: Vec<WatchIdentity>,
+    by_name: std::collections::HashMap<String, usize>,
+}
+
+impl WatchSet {
+    fn new(watches: Vec<WatchIdentity>) -> WatchSet {
+        let by_name = watches
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.name.clone(), i))
+            .collect();
+        WatchSet { watches, by_name }
+    }
+
+    /// The identity for `name`, or `None` when the current engine no longer
+    /// supervises it.
+    fn by_name(&self, name: &str) -> Option<&WatchIdentity> {
+        self.by_name.get(name).map(|&i| &self.watches[i])
+    }
+}
+
+impl std::ops::Deref for WatchSet {
+    type Target = [WatchIdentity];
+    fn deref(&self) -> &[WatchIdentity] {
+        &self.watches
     }
 }
 
@@ -493,15 +554,37 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
         .iter()
         .map(|rw| (rw.spec.name(), rw.spec.path()))
         .collect();
-    let report = journal::reconcile_journals(&paths.journal_dir, &owners, SweepOpts::new());
+    let report = journal::reconcile_journals(
+        &paths.journal_dir,
+        &owners,
+        SweepOpts::new(),
+        RecoveryOpts::new(),
+    );
     if report.is_noop() {
         return;
     }
     for (from, to) in &report.migrated {
         info!(from = %from.display(), to = %to.display(), "migrated a legacy journal to its path key");
     }
+    for (journal_path, rep) in &report.recovered {
+        // The orphan sweep recovered a since-removed watch's stale lock from the
+        // path encoded in its own journal. A removed lock is warn-worthy; a
+        // foreign or unsettled one is info.
+        match rep {
+            RecoveryReport::LockRemoved { .. } => {
+                warn!(journal = %journal_path.display(), report = %rep, "recovered a stale git lock from an orphan journal");
+            }
+            _ => info!(journal = %journal_path.display(), report = %rep, "orphan journal recovery"),
+        }
+    }
     for path in &report.gc_deleted {
-        info!(journal = %path.display(), "swept an orphan journal past its retention window");
+        info!(journal = %path.display(), "swept a clean orphan journal past its retention window");
+    }
+    for path in &report.retained {
+        // A dangling orphan the sweep could not settle (legacy record with no
+        // encoded path, or a lock recovery could not prove ours): retained as
+        // live evidence and surfaced so an operator can clean it up by hand.
+        warn!(journal = %path.display(), "retained a dangling orphan journal; recovery could not settle it — manual cleanup may be needed");
     }
     for trouble in &report.trouble {
         warn!(detail = %trouble, "journal reconciliation hiccup");
@@ -515,21 +598,7 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
 fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = &'a WatchSpec>) {
     for spec in specs {
         let journal = Journal::for_repo_in_dir(&paths.journal_dir, spec.path());
-        let report = journal.recover(spec.path(), RecoveryOpts::new());
-        match report {
-            RecoveryReport::Clean => {}
-            RecoveryReport::LockRemoved { .. } => {
-                warn!(watch = spec.name(), report = %report, "recovered a stale git lock");
-            }
-            // A foreign lock is currently wedging a watched repo — operator
-            // significant, even though it is not ours to remove.
-            RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
-                warn!(watch = spec.name(), report = %report, "journal recovery");
-            }
-            other => {
-                info!(watch = spec.name(), report = %other, "journal recovery");
-            }
-        }
+        journal.recover_and_log(spec.path(), spec.name(), "startup");
     }
 }
 
@@ -538,14 +607,14 @@ fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = 
 /// identities (name for request fan-out, path for journaling).
 async fn build_started_engine_from_specs(
     specs: Vec<WatchSpec>,
-) -> Result<(EngineHandle, EventReceiver, Vec<WatchIdentity>), EngineError> {
-    let watches: Vec<WatchIdentity> = specs
-        .iter()
-        .map(|spec| WatchIdentity {
-            name: spec.name().to_string(),
-            path: spec.path().to_path_buf(),
-        })
-        .collect();
+) -> Result<(EngineHandle, EventReceiver, WatchSet), EngineError> {
+    let specs = dedup_aliased_specs(specs);
+    let watches = WatchSet::new(
+        specs
+            .iter()
+            .map(|spec| WatchIdentity::new(spec.name().to_string(), spec.path().to_path_buf()))
+            .collect(),
+    );
     let mut builder = Engine::builder();
     for spec in specs {
         builder = builder.watch(spec);
@@ -554,6 +623,41 @@ async fn build_started_engine_from_specs(
     let events = engine.subscribe();
     let handle = engine.start().await?;
     Ok((handle, events, watches))
+}
+
+/// Drops any active watch whose journal key collides with an earlier one's —
+/// the canonical-path aliasing that [`Config::resolve_all`](crate::config::Config::resolve_all)'s
+/// textual duplicate-path check cannot catch (two config paths that differ as
+/// text but canonicalize to one repo: a symlink, a `..` segment, case folding on
+/// a case-insensitive filesystem). Two such watches would share one journal
+/// file, so a crash on one could clean or condemn the other's lock.
+///
+/// First in config order wins; a later colliding watch is **skipped** with a
+/// loud warn naming both watches and the shared repository. It is deliberately
+/// not a hard error: a hand-edited alias must not take every other watch down
+/// with it. This is the check `config.rs` defers to "the daemon at registration
+/// time"; it runs on both the initial build and every reload, since both funnel
+/// through here.
+fn dedup_aliased_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
+    let mut winners: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(specs.len());
+    let mut kept = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let key = journal::journal_file_name(spec.path());
+        if let Some(winner) = winners.get(&key) {
+            warn!(
+                skipped = spec.name(),
+                kept = %winner,
+                repo = %spec.path().display(),
+                "two watches resolve to the same canonical repository; skipping the later one \
+                 (they would share one operation journal)"
+            );
+            continue;
+        }
+        winners.insert(key, spec.name().to_string());
+        kept.push(spec);
+    }
+    kept
 }
 
 /// Loads the current config from disk and starts a fresh engine from it, for a
@@ -572,7 +676,7 @@ async fn build_started_engine_from_specs(
 async fn build_started_engine(
     paths: &DaemonPaths,
     known: &[WatchIdentity],
-) -> Option<(EngineHandle, EventReceiver, Vec<WatchIdentity>)> {
+) -> Option<(EngineHandle, EventReceiver, WatchSet)> {
     let config = match Config::load(&paths.config_file) {
         Ok(config) => config,
         Err(err) => {
@@ -612,8 +716,7 @@ async fn build_started_engine(
         info!("reload: all watches are paused; running idle");
     }
 
-    let known_keys: std::collections::HashSet<String> =
-        known.iter().map(WatchIdentity::journal_key).collect();
+    let known_keys = WatchIdentity::key_set(known);
     recover_stale_locks(
         paths,
         specs
@@ -635,7 +738,7 @@ async fn build_started_engine(
 struct RebuildOutcome {
     handle: EngineHandle,
     events: EventReceiver,
-    watches: Vec<WatchIdentity>,
+    watches: WatchSet,
     /// Whether a fresh engine actually replaced the old one.
     rebuilt: bool,
     /// Whether the new engine reported failure (a dead signal source or a
@@ -647,10 +750,16 @@ struct RebuildOutcome {
 
 /// Builds a fresh engine and, on success, drains the old one before swapping to
 /// it; on any failure it keeps the old engine. The new engine is started before
-/// the old is drained, so there is a brief window where both are armed — benign,
-/// since concurrent git commits serialize on the index lock — but it guarantees
-/// a valid `(handle, events)` at all times, honoring "keep the old engine on any
-/// reload error".
+/// the old is drained, so there is a brief window where both are armed. What is
+/// benign about that window is only the *git level*: two concurrent commits on
+/// one repo serialize on its `index.lock`, so no data is corrupted. The
+/// *journal* level is not automatically safe — a surviving/renamed watch keeps
+/// the same path-keyed journal across the swap, so the old engine's buffered
+/// bracket and the new engine's live one would write the same file. The drain
+/// below skips journaling for keys the new engine owns, which guarantees the old
+/// bracket cannot truncate the new engine's live `begin` (no cross-engine
+/// truncation). Either way a valid `(handle, events)` exists at all times,
+/// honoring "keep the old engine on any reload error".
 ///
 /// While the old engine drains (up to its shutdown budget), the *new* engine's
 /// bus is pumped concurrently through the same log/journal path the supervisor
@@ -661,7 +770,7 @@ async fn try_rebuild(
     paths: &DaemonPaths,
     old_handle: EngineHandle,
     mut old_events: EventReceiver,
-    old_watches: Vec<WatchIdentity>,
+    old_watches: WatchSet,
 ) -> RebuildOutcome {
     match build_started_engine(paths, &old_watches).await {
         Some((handle, mut events, watches)) => {
@@ -695,8 +804,17 @@ async fn try_rebuild(
             }
             // The old engine has fully shut down: its buffered tail names the OLD
             // watches, so drain it against those identities to close every
-            // journal bracket a removed watch left open.
-            drain_remaining_events(paths, &mut old_events, &old_watches);
+            // journal bracket a removed watch left open. But a watch that
+            // *survives* into the new engine (same journal key — including a
+            // rename, which now shares the path-keyed file) has already re-armed
+            // there and may hold a live `begin`; the old engine's buffered
+            // bracket for that same key must NOT touch the journal, or its
+            // `complete`/`compact` would truncate the new engine's live record
+            // and leave an unrecoverable wedge on a later crash. So the drain
+            // skips journaling for keys the new engine owns (VRD-37's op lock
+            // will make this seam explicit).
+            let superseded = WatchIdentity::key_set(&watches);
+            drain_remaining_events(paths, &mut old_events, &old_watches, &superseded);
             // Drain-on-remove: a watch present before this reload but gone now
             // (removed or relinked to a new path) has, by here, settled its
             // in-flight bracket via the shutdown join above. Run recovery
@@ -735,25 +853,25 @@ async fn try_rebuild(
 /// recovery sees either a clean journal (nothing to do) or a dangling record
 /// whose lock it proves ours and cleans. This is the daemon half of
 /// drain-on-remove; the no-daemon half runs synchronously in `vard watch
-/// remove`. Every outcome is logged; nothing here can fail the daemon.
+/// remove`. Every outcome is logged through the shared
+/// [`recover_and_log`](Journal::recover_and_log) so its levels match every other
+/// drain/recover site; nothing here can fail the daemon.
+///
+/// A watch that was merely *paused* (still defined, so still supervised as a
+/// resolved watch but filtered out of the active engine specs) is included in
+/// `after` only if it stays active, so pausing a watch does make it look
+/// "removed" here for one drain. That is deliberate and safe: the paused watch
+/// took no in-flight operation, so recovery finds its journal clean and does
+/// nothing, while its journal file is retained (a paused watch still owns it and
+/// the orphan sweep never touches a configured key).
 fn drain_removed_watches(paths: &DaemonPaths, before: &[WatchIdentity], after: &[WatchIdentity]) {
-    let surviving: std::collections::HashSet<String> =
-        after.iter().map(WatchIdentity::journal_key).collect();
+    let surviving = WatchIdentity::key_set(after);
     for removed in before
         .iter()
-        .filter(|w| !surviving.contains(&w.journal_key()))
+        .filter(|w| !surviving.contains(&w.journal_key))
     {
-        let journal = Journal::for_repo_in_dir(&paths.journal_dir, &removed.path);
-        let report = journal.recover(&removed.path, RecoveryOpts::new());
-        match report {
-            RecoveryReport::Clean => {}
-            RecoveryReport::LockRemoved { .. } => {
-                warn!(watch = %removed.name, report = %report, "drained a removed watch's stale git lock");
-            }
-            other => {
-                info!(watch = %removed.name, report = %other, "drain-on-remove recovery");
-            }
-        }
+        let journal = removed.journal(&paths.journal_dir);
+        journal.recover_and_log(&removed.path, &removed.name, "drain-on-remove");
     }
 }
 
@@ -763,17 +881,24 @@ fn drain_removed_watches(paths: &DaemonPaths, before: &[WatchIdentity], after: &
 /// complete tail of the stream — draining it here guarantees each journal
 /// `begin` written earlier meets the outcome that completes it, instead of
 /// dangling because the supervisor stopped reading mid-bracket.
+///
+/// `superseded` names journal keys the *new* engine already owns after a reload:
+/// for those, an old buffered bracket is still logged but NOT journaled, so it
+/// cannot truncate the new engine's live record on a shared path-keyed file (see
+/// [`try_rebuild`]). On the final shutdown drain there is no new engine, so the
+/// set is empty and every bracket journals as before.
 fn drain_remaining_events(
     paths: &DaemonPaths,
     events: &mut EventReceiver,
-    watches: &[WatchIdentity],
+    watches: &WatchSet,
+    superseded: &std::collections::HashSet<String>,
 ) {
     use vard_core::TryRecvError;
     loop {
         match events.try_recv() {
             Ok(event) => {
                 log_event(&event);
-                journal_event(paths, watches, &event);
+                journal_event(paths, watches, &event, superseded);
             }
             Err(TryRecvError::Lagged(skipped)) => {
                 warn!(skipped, "event bus lagged during shutdown drain");
@@ -809,7 +934,7 @@ async fn supervise(
     paths: DaemonPaths,
     mut handle: EngineHandle,
     mut events: EventReceiver,
-    mut watches: Vec<WatchIdentity>,
+    mut watches: WatchSet,
     shutdown: Arc<Notify>,
     reload: Arc<Notify>,
     poll_interval: Duration,
@@ -917,8 +1042,14 @@ async fn supervise(
     info!("shutting down");
     handle.shutdown().await;
     // The drain finishes any in-flight pass, so trailing events (including the
-    // final DaemonStopped) are logged and their journal brackets closed.
-    drain_remaining_events(&paths, &mut events, &watches);
+    // final DaemonStopped) are logged and their journal brackets closed. No new
+    // engine follows a shutdown, so no journal key is superseded.
+    drain_remaining_events(
+        &paths,
+        &mut events,
+        &watches,
+        &std::collections::HashSet::new(),
+    );
     // Clean shutdown: remove the health file BEFORE the caller releases the
     // instance lock, so `vard notify` sees either a running daemon with a live
     // document or no daemon at all — never a stale problem set presented as
@@ -953,12 +1084,13 @@ fn schedule_rebuild(
 fn handle_bus(
     received: Result<Event, RecvError>,
     paths: &DaemonPaths,
-    watches: &[WatchIdentity],
+    watches: &WatchSet,
 ) -> Action {
     match received {
         Ok(event) => {
             log_event(&event);
-            journal_event(paths, watches, &event);
+            // Live events from the current engine: no journal key is superseded.
+            journal_event(paths, watches, &event, &std::collections::HashSet::new());
             if is_source_died(&event) {
                 Action::EngineFailure
             } else {
@@ -1080,35 +1212,47 @@ fn log_event(event: &Event) {
 /// not crash the daemon or interrupt snapshotting.
 ///
 /// The journal is keyed by the watch's repository path, but a bus event carries
-/// only the watch *name*, so the path is looked up in `watches`. A name with no
-/// match (an event for a watch the current engine no longer supervises) is
-/// skipped rather than journaled under a guessed key.
-fn journal_event(paths: &DaemonPaths, watches: &[WatchIdentity], event: &Event) {
-    let repo_path = |watch: &str| watches.iter().find(|w| w.name == watch).map(|w| &w.path);
-    match event {
-        Event::SnapshotStarted { watch, .. } => {
-            let Some(path) = repo_path(watch) else {
-                warn!(%watch, "journal begin skipped: no path for this watch");
-                return;
-            };
-            let journal = Journal::for_repo_in_dir(&paths.journal_dir, path);
-            if let Err(err) = journal.begin("snapshot") {
-                warn!(%watch, error = %err, "journal begin failed");
-            }
-        }
+/// only the watch *name*, so the identity is looked up by name in `watches`
+/// (an O(1) index, using the cached journal key — no per-event canonicalize). A
+/// name with no match (an event for a watch the current engine no longer
+/// supervises) is skipped rather than journaled under a guessed key.
+///
+/// `superseded` names journal keys the current call must NOT write: during a
+/// reload drain, the old engine's buffered brackets for a key the new engine now
+/// owns are logged but not journaled, so they cannot truncate the new engine's
+/// live record on a shared path-keyed file (see [`drain_remaining_events`]).
+fn journal_event(
+    paths: &DaemonPaths,
+    watches: &WatchSet,
+    event: &Event,
+    superseded: &std::collections::HashSet<String>,
+) {
+    let (watch, is_begin) = match event {
+        Event::SnapshotStarted { watch, .. } => (watch, true),
         Event::SnapshotCompleted { watch, .. }
         | Event::SnapshotFailed { watch, .. }
-        | Event::SnapshotSkipped { watch, .. } => {
-            let Some(path) = repo_path(watch) else {
-                warn!(%watch, "journal complete skipped: no path for this watch");
-                return;
-            };
-            let journal = Journal::for_repo_in_dir(&paths.journal_dir, path);
-            if let Err(err) = journal.complete() {
-                warn!(%watch, error = %err, "journal complete failed");
-            }
-        }
-        _ => {}
+        | Event::SnapshotSkipped { watch, .. } => (watch, false),
+        _ => return,
+    };
+    let verb = if is_begin { "begin" } else { "complete" };
+    let Some(identity) = watches.by_name(watch) else {
+        warn!(%watch, "journal {verb} skipped: no path for this watch");
+        return;
+    };
+    if superseded.contains(&identity.journal_key) {
+        // The new engine owns this path-keyed journal now; leave its live record
+        // alone. Git-level serialization on index.lock is unaffected.
+        debug!(%watch, "journal {verb} skipped: superseded by the new engine's journal");
+        return;
+    }
+    let journal = identity.journal(&paths.journal_dir);
+    let result = if is_begin {
+        journal.begin("snapshot")
+    } else {
+        journal.complete()
+    };
+    if let Err(err) = result {
+        warn!(%watch, error = %err, "journal {verb} failed");
     }
 }
 
@@ -1703,42 +1847,10 @@ mod tests {
         }
     }
 
-    /// A dead PID: spawn `true` and reap it.
-    fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("true").spawn().expect("spawn");
-        let pid = child.id();
-        child.wait().expect("reap");
-        pid
-    }
+    use crate::journal::test_support::plant_crashed;
 
-    /// A repo with an aged `.git/index.lock` and a dangling path-keyed journal
-    /// whose `ts` matches the lock — a crash-mid-operation residue.
-    fn plant_crashed(journal_dir: &Path, repo: &Path) -> PathBuf {
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let lock = repo.join(".git").join("index.lock");
-        std::fs::write(&lock, b"lock").unwrap();
-        let ok = std::process::Command::new("touch")
-            .args(["-t", "202001010000"])
-            .arg(&lock)
-            .status()
-            .expect("touch")
-            .success();
-        assert!(ok);
-        let ts = std::fs::metadata(&lock)
-            .unwrap()
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let journal = Journal::for_repo_in_dir(journal_dir, repo);
-        std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
-        std::fs::write(
-            journal.path(),
-            format!("begin snapshot pid={} ts={ts}\n", dead_pid()),
-        )
-        .unwrap();
-        lock
+    fn id(name: &str, path: &Path) -> WatchIdentity {
+        WatchIdentity::new(name.to_string(), path.to_path_buf())
     }
 
     #[test]
@@ -1757,13 +1869,9 @@ mod tests {
         };
         let removed_repo = root.path().join("removed");
         let kept_repo = root.path().join("kept");
-        let removed_lock = plant_crashed(&paths.journal_dir, &removed_repo);
-        let kept_lock = plant_crashed(&paths.journal_dir, &kept_repo);
+        let (_, removed_lock) = plant_crashed(&paths.journal_dir, &removed_repo);
+        let (_, kept_lock) = plant_crashed(&paths.journal_dir, &kept_repo);
 
-        let id = |name: &str, path: &Path| WatchIdentity {
-            name: name.to_string(),
-            path: path.to_path_buf(),
-        };
         let before = vec![id("removed", &removed_repo), id("kept", &kept_repo)];
         // "kept" survives under a new NAME but the same PATH — a rename.
         let after = vec![id("kept-renamed", &kept_repo)];
@@ -1778,6 +1886,102 @@ mod tests {
             kept_lock.exists(),
             "a renamed watch (same path key) is not a removal and must not be drained"
         );
+    }
+
+    #[test]
+    fn cached_journal_key_is_stable_after_the_directory_is_removed() {
+        // An identity built while the directory exists keys off its canonical
+        // path. If the directory is then removed, the cached key must not flip to
+        // the textual fallback — recomputing it would truncate the wrong file on
+        // `complete`. The cache is what guarantees stability.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let identity = id("w", &repo);
+        let key_before = identity.journal_key.clone();
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        // Recomputing from scratch now takes the textual fallback and differs...
+        assert_ne!(
+            key_before,
+            journal::journal_file_name(&repo),
+            "canonical vs textual key differ once the dir is gone (the hazard)"
+        );
+        // ...but the cached identity is unchanged, so begin/complete agree.
+        assert_eq!(identity.journal_key, key_before, "the cached key is stable");
+    }
+
+    #[test]
+    fn survivor_key_skip_spares_the_new_engines_live_begin() {
+        // The reload-drain hazard: the old engine's buffered `complete` for a
+        // key the NEW engine still owns must NOT compact the shared path-keyed
+        // journal, or it would erase the new engine's live `begin`. With the key
+        // marked superseded, the old bracket is skipped and the begin survives.
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let paths = DaemonPaths {
+            config_file: state.join("config.toml"),
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            health_file: state.join("health"),
+        };
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let watches = WatchSet::new(vec![id("w", &repo)]);
+
+        // The new engine has a live begin on this journal.
+        let journal = watches[0].journal(&paths.journal_dir);
+        journal.begin("snapshot").unwrap();
+        assert!(journal.path().metadata().unwrap().len() > 0);
+
+        // An old-engine completion for the SAME (surviving) key is superseded:
+        // logged but not journaled, so the live begin is untouched.
+        let superseded = WatchIdentity::key_set(&watches);
+        let done = Event::SnapshotCompleted {
+            watch: "w".to_string(),
+            snapshot: "abc123".to_string(),
+            files_changed: 1,
+            trigger: vard_core::Trigger::Event,
+        };
+        journal_event(&paths, &watches, &done, &superseded);
+        assert!(
+            journal.path().metadata().unwrap().len() > 0,
+            "a superseded completion must not truncate the new engine's begin"
+        );
+
+        // Without the skip, the same completion compacts the journal.
+        journal_event(&paths, &watches, &done, &std::collections::HashSet::new());
+        assert_eq!(
+            journal.path().metadata().unwrap().len(),
+            0,
+            "a non-superseded completion closes the bracket as usual"
+        );
+    }
+
+    #[test]
+    fn aliased_specs_skip_the_later_colliding_watch_deterministically() {
+        // Two specs whose paths canonicalize to one repository (a directory and
+        // a symlink to it) share a journal key. The dedup keeps the first in
+        // config order and drops the second, deterministically.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let first = WatchSpec::builder("first", &real).build().unwrap();
+        let second = WatchSpec::builder("second", &link).build().unwrap();
+        let kept = dedup_aliased_specs(vec![first, second]);
+        assert_eq!(kept.len(), 1, "the aliased later watch is skipped");
+        assert_eq!(kept[0].name(), "first", "first in config order wins");
+
+        // Reversing config order flips the winner — the rule is positional.
+        let first = WatchSpec::builder("first", &real).build().unwrap();
+        let second = WatchSpec::builder("second", &link).build().unwrap();
+        let kept = dedup_aliased_specs(vec![second, first]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name(), "second");
     }
 
     #[tokio::test(flavor = "multi_thread")]

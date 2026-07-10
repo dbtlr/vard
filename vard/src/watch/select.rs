@@ -116,6 +116,15 @@ pub(crate) fn select_watch_with_home(
 /// is `target`'s pre-computed canonical form (or `None` when it does not
 /// canonicalize), so a caller resolving one selector against many watches
 /// canonicalizes it once.
+///
+/// This is a **pairwise** identity rule and is deliberately distinct from the
+/// journal's single-path key ([`journal::identity_path`](crate::journal::identity_path)):
+/// here the fallback to textual equality fires when *either side* fails to
+/// canonicalize, so a live directory still matches a stale config entry that
+/// cannot resolve. The journal keys one path in isolation and cannot express
+/// that either-side fallback — it always canonicalizes-or-textual on the one
+/// path it holds. The two rules must not be merged; the journal side carries the
+/// mirror of this note.
 pub(crate) fn config_path_identifies(
     config_path: &Path,
     home: Option<&Path>,
