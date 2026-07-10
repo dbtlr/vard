@@ -180,6 +180,23 @@ pub(crate) struct WatchConfig {
 }
 
 impl Config {
+    /// Loads the config at `path`, treating a missing file as `None` (an empty
+    /// configuration) rather than an error. The single "load, tolerating a
+    /// missing file" helper shared by the mutating `watch` commands and the
+    /// read-only `status` command; a present-but-invalid config is still an
+    /// error.
+    pub fn load_optional(path: &Path) -> Result<Option<Config>, ConfigError> {
+        match Config::load(path) {
+            Ok(config) => Ok(Some(config)),
+            Err(ConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Reads and parses the config file at `path`. Does not watch for changes
     /// or hot-reload — that is VRD-14.
     pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {

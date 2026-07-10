@@ -106,7 +106,12 @@ fn paused_and_healthy_watches_render_their_states() {
     // Daemon not running ⇒ exit 1, but the per-watch projection still renders.
     assert_eq!(code(&out), 1);
     let s = stdout(&out);
-    assert!(s.contains("active: ok"), "healthy watch state, got: {s}");
+    // With no daemon, an unpaused watch is `unknown` (nothing is monitoring it),
+    // not `ok`; a config-paused watch still shows `paused`.
+    assert!(
+        s.contains("active: unknown"),
+        "unmonitored watch state, got: {s}"
+    );
     assert!(
         s.contains("sleeping: paused"),
         "paused watch state, got: {s}"
@@ -128,13 +133,15 @@ fn json_shape_leads_with_a_null_named_daemon_row() {
     let s = stdout(&out);
     // A JSON array a status bar can parse.
     assert!(s.trim_start().starts_with('['), "got: {s}");
-    // The daemon row: null watch name, the daemon kind, its state.
+    // The daemon row: null watch name, null kind, a `daemon: true` flag, its state.
     assert!(s.contains(r#""name":null"#), "got: {s}");
-    assert!(s.contains(r#""kind":"daemon""#), "got: {s}");
+    assert!(s.contains(r#""kind":null"#), "got: {s}");
+    assert!(s.contains(r#""daemon":true"#), "got: {s}");
     assert!(s.contains(r#""state":"not-running""#), "got: {s}");
-    // The watch row: real name, ok state.
+    // The watch row: real name, `unknown` state (no daemon), a `daemon: false` flag.
     assert!(s.contains(r#""name":"active""#), "got: {s}");
-    assert!(s.contains(r#""state":"ok""#), "got: {s}");
+    assert!(s.contains(r#""state":"unknown""#), "got: {s}");
+    assert!(s.contains(r#""daemon":false"#), "got: {s}");
     assert!(
         s.contains(r#""elapsed_seconds""#),
         "stable field set, got: {s}"
@@ -156,8 +163,8 @@ fn selector_narrows_to_one_watch() {
 
     let out = env.vard(&["--format", "records", "status", "a"]);
     let s = stdout(&out);
-    assert!(s.contains("a: ok"), "got: {s}");
-    assert!(!s.contains("b: ok"), "selector must narrow, got: {s}");
+    assert!(s.contains("a: unknown"), "got: {s}");
+    assert!(!s.contains("b: unknown"), "selector must narrow, got: {s}");
 }
 
 #[test]

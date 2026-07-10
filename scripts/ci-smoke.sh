@@ -97,7 +97,8 @@ grep -q 'paused = true' "$XDG_CONFIG_HOME/vard/config.toml" || fail "vard watch 
 "$VARD" watch resume smoke >/dev/null || fail "vard watch resume failed"
 
 # vard status (VRD-17): no daemon runs in the smoke env, so status reports the
-# stopped daemon and exits 1, while still projecting the configured watch as ok.
+# stopped daemon and exits 1. With nothing monitoring it, the configured watch
+# projects to `unknown` (not `ok` — that would falsely imply it is being watched).
 if status_out="$("$VARD" --format records status)"; then
   fail "vard status with no daemon must exit non-zero, not 0"
 else
@@ -105,8 +106,8 @@ else
 fi
 printf '%s\n' "$status_out" | grep -q 'daemon: not running' \
   || fail "vard status did not report the stopped daemon"
-printf '%s\n' "$status_out" | grep -q 'smoke: ok' \
-  || fail "vard status did not project the smoke watch as ok"
+printf '%s\n' "$status_out" | grep -q 'smoke: unknown' \
+  || fail "vard status did not project the unmonitored smoke watch as unknown"
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 "$VARD" config path | grep -q 'config.toml' || fail "vard config path did not print the location"

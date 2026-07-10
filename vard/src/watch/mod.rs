@@ -35,7 +35,7 @@ use vard_core::{GitBackend, TriggerMode, WatchSpec};
 
 use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
 use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, finish};
-use crate::config::{Config, ConfigError, ResolvedWatch, WatchConfig};
+use crate::config::{Config, ResolvedWatch, WatchConfig};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::journal::Journal;
 use crate::output::record::{self, Record, RecordField};
@@ -562,11 +562,7 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
 
 /// Loads and validates the config, or `None` when the file does not exist.
 fn load_config(config_file: &Path) -> Result<Option<Config>, CmdError> {
-    match Config::load(config_file) {
-        Ok(config) => Ok(Some(config)),
-        Err(ConfigError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(CmdError::err(err.to_string())),
-    }
+    Config::load_optional(config_file).map_err(|e| CmdError::err(e.to_string()))
 }
 
 /// Like [`load_config`], but a missing file is an error naming the failed

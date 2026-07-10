@@ -47,7 +47,7 @@ use crate::command;
 use crate::health::{self, HealthProblem, HealthReport};
 use crate::output::glyphs::{self, Glyph};
 use crate::output::palette::{self, Palette};
-use crate::output::primitives::sanitize_controls;
+use crate::output::primitives::clean_line;
 use crate::output::record::{self, Record, RecordField, format_duration};
 use crate::paths;
 
@@ -209,9 +209,9 @@ fn human_line(problem: &NotifyProblem, palette: &Palette, now: u64, ascii: bool)
             since,
             ..
         } => {
-            let watch = clean(watch);
-            let state = clean(state);
-            let summary = clean(summary);
+            let watch = clean_line(watch);
+            let state = clean_line(state);
+            let summary = clean_line(summary);
             let elapsed = format_duration(Duration::from_secs(now.saturating_sub(*since)));
             format!("{glyph} vard: '{watch}' {state} (for {elapsed}) — {summary}")
         }
@@ -237,25 +237,6 @@ fn human_line(problem: &NotifyProblem, palette: &Palette, now: u64, ascii: bool)
             )
         }
     }
-}
-
-/// Flattens any newlines/whitespace runs to a single line, then strips control
-/// characters. Applied to every file-derived field before it reaches a prompt.
-fn clean(s: &str) -> String {
-    sanitize_controls(&flatten_ws(s))
-}
-
-/// Collapses a possibly multi-line string into one line: each non-empty line is
-/// trimmed and joined with `"; "`, then any internal whitespace run collapses to
-/// a single space. So a multi-line git error renders as one prompt line.
-fn flatten_ws(s: &str) -> String {
-    let joined = s
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
-    joined.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Builds the machine-form records: one object per problem with a stable field
