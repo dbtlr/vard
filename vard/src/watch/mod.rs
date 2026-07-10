@@ -268,7 +268,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     }
     // Validate the exact bytes to be written before committing them, so the CLI
     // can never take a valid config to invalid and wedge the daemon's reloads.
-    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
@@ -281,7 +281,8 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
             RecordField::bool("relinked", relinked),
         ],
     };
-    emit_action(out, &human, &record)
+    emit_action(out, &human, &record)?;
+    warning.map_or(Ok(()), Err)
 }
 
 /// Resolves the repository decision for `path` *without holding the config
@@ -467,10 +468,11 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
             "watch {name:?} vanished from the config before it could be removed"
         )));
     }
-    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     // --purge drops vard's own per-watch metadata; the repository is never
-    // touched, purge or not.
+    // touched, purge or not. This must run whenever the removal was written —
+    // after it, the watch no longer exists for a retry to select.
     if args.purge {
         purge_metadata(paths, &name)?;
     }
@@ -488,7 +490,8 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
             RecordField::bool("purged", args.purge),
         ],
     };
-    emit_action(out, &human, &record)
+    emit_action(out, &human, &record)?;
+    warning.map_or(Ok(()), Err)
 }
 
 /// Drops vard's per-watch metadata (its operation journal) for `name`. Absent
@@ -586,7 +589,7 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
             "watch {name:?} vanished from the config before it could be updated"
         )));
     }
-    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let human = if was == paused {
         format!(
@@ -605,7 +608,8 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
             RecordField::bool("paused", paused),
         ],
     };
-    emit_action(out, &human, &record)
+    emit_action(out, &human, &record)?;
+    warning.map_or(Ok(()), Err)
 }
 
 // --- shared helpers --------------------------------------------------------
@@ -652,21 +656,30 @@ fn document_validity(text: &str) -> Result<(), ConfigError> {
 ///   (attention): the config was already broken, so blocking an unrelated
 ///   pause/remove would only trap the user — the natural repair path (e.g.
 ///   `remove`-ing one of a pair of duplicate paths) must be allowed to proceed.
-fn commit_document(doc: &DocumentMut, config_file: &Path, pre_edit_invalid: bool) -> CmdResult {
+///
+/// Returns `Ok(None)` when written clean and `Ok(Some(attention))` when
+/// written with the still-invalid warning — the caller must finish its
+/// post-write work (purge, output) and then surface the carried attention, so
+/// a write that landed is never reported as if it hadn't.
+fn commit_document(
+    doc: &DocumentMut,
+    config_file: &Path,
+    pre_edit_invalid: bool,
+) -> Result<Option<CmdError>, CmdError> {
     let text = doc.to_string();
     match document_validity(&text) {
         Ok(()) => {
             config_edit::write_atomic(config_file, doc)?;
-            Ok(())
+            Ok(None)
         }
         Err(e) if pre_edit_invalid => {
             // The edit did not introduce the breakage, so honor it — but flag
             // that the config is still not fully valid.
             config_edit::write_atomic(config_file, doc)?;
-            Err(CmdError::attention(format!(
+            Ok(Some(CmdError::attention(format!(
                 "wrote {}, but the config is still not fully valid: {e}",
                 config_file.display()
-            )))
+            ))))
         }
         Err(e) => Err(CmdError::err(format!(
             "refusing to write {}: the edit would make a valid config invalid: {e}",

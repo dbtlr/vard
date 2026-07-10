@@ -507,6 +507,40 @@ fn pause_on_an_already_invalid_config_writes_but_warns() {
 }
 
 #[test]
+fn remove_purge_on_an_already_invalid_config_still_purges_and_reports() {
+    // The attention outcome (config was already invalid, stays invalid) must
+    // not short-circuit the post-write steps: once the removal is written the
+    // watch can no longer be selected, so a skipped purge would orphan its
+    // journal with no CLI path to clean it, and a suppressed success line
+    // would report a landed write as if it hadn't happened.
+    let env = Env::new();
+    write_config(
+        &env,
+        "version = 1\n\n[[watch]]\nname = \"one\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"two\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"other\"\npath = \"/b\"\n",
+    );
+
+    let out = env.vard(&["watch", "remove", "other", "--purge"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("still not fully valid"),
+        "the remaining invalidity must be flagged: {}",
+        stderr(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"purged\":true"),
+        "the purge confirmation must still be reported: {stdout}"
+    );
+    assert!(
+        !env.config_text().contains("other"),
+        "the removal must be written: {}",
+        env.config_text()
+    );
+}
+
+#[test]
 fn add_that_breaks_a_valid_config_is_refused() {
     // Starting from a valid config, an add that would make it invalid (here a
     // [defaults] interval of 0s that every inheriting watch rejects) is a hard
