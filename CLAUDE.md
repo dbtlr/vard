@@ -48,6 +48,10 @@ cargo build -p vard --release --locked && scripts/ci-smoke.sh
 CI's lint job additionally enforces `cargo audit` and `cargo deny check`; run
 them too when touching dependencies (`Cargo.toml`/`Cargo.lock`).
 
+CI also runs a `cross` job that compiles the four release triples and a
+dist-profile (thin LTO) build for each OS; it is not part of the local gate
+loop above.
+
 `scripts/ci-smoke.sh` is the single source of truth for post-build smoke
 assertions, shared by CI (`.github/workflows/ci.yml`) and local runs; it asserts
 on the release binary's real behavior, so it must pass against a fresh
