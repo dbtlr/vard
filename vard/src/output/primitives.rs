@@ -112,7 +112,11 @@ pub fn record_block(
 /// terminal escape sequences into records/TTY output. Applied at the primitives
 /// layer, every records consumer inherits it. The JSON path escapes separately
 /// (see [`super::record`]) and is left untouched.
-fn sanitize_controls(s: &str) -> String {
+///
+/// Exposed to the crate so a command building a one-off human line by hand (e.g.
+/// `vard notify`) can apply the same protection the record primitives apply
+/// automatically.
+pub(crate) fn sanitize_controls(s: &str) -> String {
     s.chars()
         .map(|c| {
             let cp = c as u32;

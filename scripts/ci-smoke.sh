@@ -112,6 +112,36 @@ if "$VARD" --format json diff smoke >/dev/null 2>&1; then
   fail "vard --format json diff should be rejected as text-only"
 fi
 
+# vard notify (VRD-18): the shell-prompt health hook. No daemon is running in
+# the smoke env, so notify must report the daemon-not-running line and exit 1
+# (not 0) — the exit code is the contract prompts/tmux/cron branch on.
+if notify_out="$("$VARD" notify)"; then
+  fail "vard notify with no daemon must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard notify with no daemon must exit 1"
+fi
+printf '%s\n' "$notify_out" | grep -q 'daemon not running' \
+  || fail "vard notify did not report the stopped daemon"
+# --format json yields the machine shape: a non-empty problems array carrying
+# the daemon-not-running object (an empty array is the healthy case, not this).
+if notify_json="$("$VARD" notify --format json)"; then
+  fail "vard notify --format json with no daemon must exit non-zero"
+else
+  test "$?" -eq 1 || fail "vard notify --format json with no daemon must exit 1"
+fi
+printf '%s\n' "$notify_json" | grep -q '"state":"daemon-not-running"' \
+  || fail "vard notify --format json missing the daemon-not-running object"
+# Performance contract (structural): notify must not depend on config.toml — it
+# reads only the health file and the lock. Move the config aside and prove it
+# still runs and reports identically.
+mv "$XDG_CONFIG_HOME/vard/config.toml" "$SMOKE_TMP/config-away.toml"
+if "$VARD" notify >/dev/null 2>&1; then
+  fail "vard notify without a config must still exit non-zero (daemon not running)"
+else
+  test "$?" -eq 1 || fail "vard notify must not require config.toml (should exit 1 with it removed)"
+fi
+mv "$SMOKE_TMP/config-away.toml" "$XDG_CONFIG_HOME/vard/config.toml"
+
 "$VARD" watch remove smoke >/dev/null || fail "vard watch remove failed"
 test -d "$WDIR/.git" || fail "vard watch remove touched the repository"
 test "$("$VARD" --format json watch list)" = "[]" || fail "vard watch list not empty after remove"

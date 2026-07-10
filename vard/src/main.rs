@@ -5,9 +5,11 @@ mod command;
 mod config;
 mod config_edit;
 mod daemon;
+mod health;
 mod help;
 mod instance;
 mod journal;
+mod notify;
 mod output;
 mod paths;
 mod request;
@@ -50,6 +52,7 @@ fn main() -> ExitCode {
         Some(Command::Log(args)) => cmd::log::run(args, cli.color, cli.format),
         Some(Command::Diff(args)) => cmd::diff::run(args, cli.color, cli.format),
         Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
+        Some(Command::Notify) => notify::run(cli.color, cli.format),
         None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }

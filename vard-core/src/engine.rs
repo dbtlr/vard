@@ -95,8 +95,8 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinHandle};
@@ -174,6 +174,62 @@ impl Default for EngineConfig {
 /// `dyn` backend satisfies. Sharing (rather than owning) lets the same value be
 /// cloned into each blocking call while the worker keeps serializing them.
 pub type SharedBackend = Arc<dyn VcsBackend + Send + Sync>;
+
+/// A point-in-time snapshot of one watch's lifecycle truth, returned by
+/// [`EngineHandle::watch_states`].
+///
+/// This is the *queryable* projection of engine state a host renders into
+/// health or status output, rather than reconstructing state from the
+/// [`Event`] stream — which is lossy, since a slow subscriber can miss a
+/// [`Event::WatchStateChanged`]. A `watch_states` call always reflects the
+/// engine's own current truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchStatus {
+    /// The watch's stable name.
+    pub name: String,
+    /// The watch's current lifecycle state.
+    pub state: WatchState,
+    /// The [`TroubleKind`] of the transition that put the watch in `state`, when
+    /// that transition was caused by trouble; `None` otherwise (a healthy `Ok`,
+    /// an unsafe-repo auto-pause, ...).
+    pub trouble: Option<TroubleKind>,
+    /// The human-readable reason recorded for the current state, when one was
+    /// given.
+    pub reason: Option<String>,
+    /// When the watch entered `state`.
+    ///
+    /// **Engine-local and not persisted.** It is stamped `SystemTime::now()` on
+    /// each transition and lives only in memory, so a daemon restart or engine
+    /// rebuild resets it: a watch that has genuinely been blocked for hours
+    /// reads as freshly entered right after a restart. A host that needs
+    /// restart-stable "since" must persist its own timestamp.
+    pub entered_at: SystemTime,
+}
+
+/// The per-worker mutable status cell the [`EngineHandle`] reads through
+/// [`watch_states`](EngineHandle::watch_states). A worker owns one `Arc` clone
+/// and mirrors every state transition into it under the lock; the handle holds
+/// the other clone and reads it. Cheap: touched only on an actual transition
+/// (which the engine already emits sparingly) and on an explicit query.
+#[derive(Debug)]
+struct SharedStatus {
+    state: WatchState,
+    trouble: Option<TroubleKind>,
+    reason: Option<String>,
+    entered_at: SystemTime,
+}
+
+impl SharedStatus {
+    /// A freshly-started worker's status: healthy, entered now.
+    fn new() -> SharedStatus {
+        SharedStatus {
+            state: WatchState::Ok,
+            trouble: None,
+            reason: None,
+            entered_at: SystemTime::now(),
+        }
+    }
+}
 
 /// Why a snapshot is due: the winning [`Trigger`] and any user-supplied text.
 ///
@@ -367,6 +423,15 @@ struct Worker {
     pending: Option<Provenance>,
     /// The last reported lifecycle state (drives change-only event emission).
     state: WatchState,
+    /// The trouble reported with `state` — part of the change-only dedup key:
+    /// an Attention→Attention transition with a DIFFERENT trouble (e.g.
+    /// snapshots-failing → source-died) is a real change subscribers depend on
+    /// (the daemon's dead-source rebuild matches the SourceDied event).
+    trouble: Option<TroubleKind>,
+    /// The shared status cell the [`EngineHandle`] reads: mirrors `state` (and
+    /// its trouble/reason/entered_at) on every transition so a host can query
+    /// per-watch truth without reconstructing it from the event stream.
+    status: Arc<StdMutex<SharedStatus>>,
     /// Set while the worker holds a pending change it could not snapshot and is
     /// converging it on the bounded retry timer, without any external signal.
     /// The kind records how the blocking condition is surfaced.
@@ -386,6 +451,7 @@ impl Worker {
     /// being retried, when it also wakes on the retry deadline so the change
     /// converges without any further signal.
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<WatchInput>) {
+        self.probe_initial_state().await;
         loop {
             let waiting_on_retry = self.retry.is_some() && !self.retry_exhausted;
             let input = if waiting_on_retry {
@@ -413,6 +479,27 @@ impl Worker {
             if self.pending.is_some() && self.retry.is_none() {
                 self.run_pass().await;
             }
+        }
+    }
+
+    /// Probes the repository's safe state once at worker start and enters the
+    /// blocked (unsafe-pause) state immediately if it is unsafe.
+    ///
+    /// Without this, a daemon restart or engine rebuild would start every watch
+    /// at `Ok` and only discover a genuinely blocked repository on the next
+    /// trigger — so a restart mid-merge would *amnesia* the block back to healthy
+    /// until something happened to write. Entering the state up front keeps the
+    /// queryable projection ([`watch_states`](EngineHandle::watch_states)) honest
+    /// from the first instant.
+    ///
+    /// No retry timer is armed and no pending change exists yet: the first real
+    /// trigger drives the normal safe re-check that resumes the watch. A probe
+    /// error (or panic) at startup is left as `Ok` — no snapshot was attempted,
+    /// so there is nothing to fail yet; the first real pass surfaces any genuine
+    /// problem.
+    async fn probe_initial_state(&mut self) {
+        if let Ok(Ok(SafeState::Unsafe(reason))) = check_safe(Arc::clone(&self.backend)).await {
+            self.set_state(WatchState::Paused, None, Some(reason.to_string()));
         }
     }
 
@@ -489,6 +576,9 @@ impl Worker {
                     self.emit_completed(prov.trigger, &outcome);
                     // A commit means any prior retry has converged.
                     self.clear_retry();
+                    // A successful commit clears a snapshots-failing (or blocked)
+                    // state: the watch is demonstrably healthy again.
+                    self.recover_to_ok();
                     if committed_in_pass {
                         // A second commit under the mute is a genuine
                         // mute-window write. Requeue it (carrying this pass's
@@ -512,6 +602,10 @@ impl Worker {
                     // does not keep ticking.
                     self.emit_skipped(prov.trigger, SkipReason::Clean);
                     self.clear_retry();
+                    // Skip-to-clean also clears a snapshots-failing state: the
+                    // pending change resolved (committed or reverted elsewhere),
+                    // so the watch is healthy again.
+                    self.recover_to_ok();
                 }
                 PassResult::Unsafe(reason) => {
                     // The repo turned unsafe between the probe and the commit:
@@ -611,11 +705,35 @@ impl Worker {
     /// — including from an unsafe pause — but not while already in it, so a
     /// genuine new failure is surfaced once and per-tick retries do not storm.
     /// Never resets the budget (see [`enter_unsafe`](Self::enter_unsafe)).
+    ///
+    /// It also moves the watch to [`WatchState::Attention`] with
+    /// [`TroubleKind::SnapshotsFailing`], carrying the error as the reason, so
+    /// the failing snapshot is a *queryable state* (see
+    /// [`watch_states`](EngineHandle::watch_states)) — not merely a one-off
+    /// event a health projection could miss. `set_state` is idempotent, so a
+    /// repeat failure inside the episode does not re-emit
+    /// [`Event::WatchStateChanged`].
     fn enter_failure(&mut self, trigger: Trigger, err: &VcsError) {
         if self.retry != Some(RetryKind::Failure) {
             self.emit_failed(trigger, err);
         }
         self.retry = Some(RetryKind::Failure);
+        self.set_state(
+            WatchState::Attention,
+            Some(TroubleKind::SnapshotsFailing),
+            Some(err.to_string()),
+        );
+    }
+
+    /// Returns the watch to [`WatchState::Ok`] after a pass proves it healthy — a
+    /// committed snapshot or a skip-to-clean. Idempotent via `set_state`, so a
+    /// watch already `Ok` (the common case) emits nothing.
+    fn recover_to_ok(&mut self) {
+        self.set_state(
+            WatchState::Ok,
+            None,
+            Some("snapshots are succeeding".into()),
+        );
     }
 
     /// Surfaces a panicked backend call: emits [`Event::SnapshotFailed`], moves
@@ -686,12 +804,33 @@ impl Worker {
     /// `Some` only for a transition caused by trouble (a `Trouble` signal or a
     /// backend panic); every other transition (a resolved-safe `Ok`, an
     /// unsafe-repo `Paused`) passes `None`.
+    ///
+    /// The dedup key is `(state, trouble)`, not the state alone: an
+    /// Attention→Attention change of trouble (snapshots-failing → source-died)
+    /// must emit — the daemon's dead-source rebuild triggers on the SourceDied
+    /// event. A reason-only refresh updates the shared cell (so queries stay
+    /// accurate) without bumping `entered_at` or emitting.
     fn set_state(&mut self, to: WatchState, trouble: Option<TroubleKind>, reason: Option<String>) {
-        if self.state == to {
+        if self.state == to && self.trouble == trouble {
+            let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            if shared.reason != reason {
+                shared.reason = reason;
+            }
             return;
         }
         let from = self.state;
         self.state = to;
+        self.trouble = trouble;
+        // Mirror the transition into the shared cell the handle reads, stamping a
+        // fresh `entered_at`. Held only for this update; recover a poisoned lock
+        // rather than propagate a panic into an unrelated worker.
+        {
+            let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            shared.state = to;
+            shared.trouble = trouble;
+            shared.reason = reason.clone();
+            shared.entered_at = SystemTime::now();
+        }
         self.bus.emit(Event::WatchStateChanged {
             watch: self.name.clone(),
             from,
@@ -835,11 +974,16 @@ impl Engine {
         // manual snapshot. See [`EngineHandle::shutdown`] for why these must be
         // dropped before the workers are drained.
         let mut handle_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> = HashMap::new();
+        // Per-watch status cells, in configured order, shared with the handle so
+        // it can project per-watch truth ([`EngineHandle::watch_states`]).
+        let mut statuses: Vec<(String, Arc<StdMutex<SharedStatus>>)> = Vec::new();
 
         for cw in watches {
             let name = cw.spec.name().to_string();
             let (tx, rx) = mpsc::unbounded_channel();
             handle_routes.insert(name.clone(), tx.clone());
+            let status = Arc::new(StdMutex::new(SharedStatus::new()));
+            statuses.push((name.clone(), Arc::clone(&status)));
             let mode = cw.spec.trigger();
 
             let mute = if matches!(mode, TriggerMode::Events | TriggerMode::Both) {
@@ -869,6 +1013,8 @@ impl Engine {
                 cfg,
                 pending: None,
                 state: WatchState::Ok,
+                trouble: None,
+                status,
                 retry: None,
                 retry_attempts: 0,
                 retry_exhausted: false,
@@ -891,6 +1037,7 @@ impl Engine {
             workers,
             dispatchers,
             routes: handle_routes,
+            statuses,
             drain_timeout: cfg.shutdown_drain_timeout,
         })
     }
@@ -920,10 +1067,42 @@ pub struct EngineHandle {
     /// [`shutdown`](Self::shutdown) must drop this map before draining the
     /// workers or their channels never close.
     routes: HashMap<String, mpsc::UnboundedSender<WatchInput>>,
+    /// Per-watch shared status cells, in configured order, read by
+    /// [`watch_states`](Self::watch_states). Each is the other end of the `Arc`
+    /// its worker mirrors state into.
+    statuses: Vec<(String, Arc<StdMutex<SharedStatus>>)>,
     drain_timeout: Duration,
 }
 
 impl EngineHandle {
+    /// A point-in-time snapshot of every watch's lifecycle truth, in configured
+    /// order: its current [`WatchState`], the [`TroubleKind`] and reason of the
+    /// transition that put it there, and when it entered that state.
+    ///
+    /// This is the projection a host renders into health or status output
+    /// instead of reconstructing state from the [`Event`] stream (which is
+    /// lossy — a slow subscriber can miss a [`Event::WatchStateChanged`]). The
+    /// returned values are consistent with the engine's own truth at the moment
+    /// of the call.
+    ///
+    /// Each [`WatchStatus::entered_at`] is engine-local and not persisted, so a
+    /// restart resets it — see [`WatchStatus`].
+    pub fn watch_states(&self) -> Vec<WatchStatus> {
+        self.statuses
+            .iter()
+            .map(|(name, cell)| {
+                let s = cell.lock().unwrap_or_else(PoisonError::into_inner);
+                WatchStatus {
+                    name: name.clone(),
+                    state: s.state,
+                    trouble: s.trouble,
+                    reason: s.reason.clone(),
+                    entered_at: s.entered_at,
+                }
+            })
+            .collect()
+    }
+
     /// Injects a manual snapshot trigger ([`Trigger::Manual`]) for the named
     /// watch, exactly as if a filesystem or interval signal had arrived — the
     /// worker coalesces it with any pending change (manual wins on priority) and
@@ -987,8 +1166,11 @@ impl EngineHandle {
             workers,
             dispatchers,
             routes,
+            statuses,
             drain_timeout,
         } = self;
+        // The status cells are pure readers' state; drop them with the handle.
+        drop(statuses);
 
         // 0. Drop the handle's own route senders. The dispatchers hold their
         //    clones (dropped in step 1), but this map holds one more sender per
@@ -1535,6 +1717,8 @@ mod tests {
             cfg,
             pending: None,
             state: WatchState::Ok,
+            trouble: None,
+            status: Arc::new(StdMutex::new(SharedStatus::new())),
             retry: None,
             retry_attempts: 0,
             retry_exhausted: false,
@@ -2144,12 +2328,37 @@ mod tests {
             Event::SnapshotFailed { trigger, .. } => assert_eq!(trigger, Trigger::Event),
             other => panic!("expected SnapshotFailed, got {other:?}"),
         }
+        // ...and it moves the watch into the snapshots-failing state.
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SnapshotsFailing),
+                    ..
+                }
+            ),
+            "a hard failure surfaces as a snapshots-failing state, got {ev:?}"
+        );
 
         // With no new trigger, the retry timer re-attempts and the change lands.
         let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
         assert!(
             matches!(ev, Event::SnapshotCompleted { .. }),
             "the preserved change must converge via the retry timer, got {ev:?}"
+        );
+        // The recovery clears the snapshots-failing state back to Ok.
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Ok,
+                    ..
+                }
+            ),
+            "a successful snapshot clears the failing state, got {ev:?}"
         );
 
         // Exactly one failure was emitted across the whole sequence.
@@ -2167,6 +2376,9 @@ mod tests {
         // must not be dropped: it converges on the retry timer with no trigger.
         let backend = FakeBackend::new();
         backend.script_safe([
+            // Consumed by the startup probe (item 2): a safe repo starts Ok.
+            Ok(SafeState::Safe),
+            // The real pass's probe fails, then the retry's probe succeeds.
             Err(VcsError::CommandFailed {
                 op: "status".into(),
                 status: Some(1),
@@ -2183,6 +2395,19 @@ mod tests {
         assert!(
             matches!(ev, Event::SnapshotFailed { .. }),
             "a failed safe-state probe is surfaced, got {ev:?}"
+        );
+        // The failure moves the watch to Attention (snapshots-failing).
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SnapshotsFailing),
+                    ..
+                }
+            ),
+            "a failing probe surfaces as a snapshots-failing state, got {ev:?}"
         );
 
         let ev = advance_until_event(&mut events, Duration::from_secs(30)).await;
@@ -2412,6 +2637,11 @@ mod tests {
             "no re-poll after the retry is cleared"
         );
 
+        // Drain the buffered lifecycle transitions the episode emitted (Attention
+        // on the failure, Ok on the skip-to-clean recovery) so the next assertion
+        // reads the snapshot outcome, not a stale state event.
+        while events.try_recv().is_ok() {}
+
         // A later trigger snapshots immediately (not delayed by an interval).
         tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
         let ev = recv_no_advance(&mut events).await;
@@ -2470,9 +2700,15 @@ mod tests {
         assert_eq!(backend.safe_calls(), safes, "no re-poll after a panic");
 
         // ... and a later trigger snapshots immediately (retry was cleared, so
-        // run() was blocked on the input, not on the retry timer).
+        // run() was blocked on the input, not on the retry timer). The panic
+        // legitimately re-labels the standing Attention (snapshots-failing ->
+        // degraded), so a WatchStateChanged may precede the snapshot event —
+        // skip state transitions and assert the snapshot itself.
         tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
-        let ev = recv_no_advance(&mut events).await;
+        let mut ev = recv_no_advance(&mut events).await;
+        while matches!(ev, Some(Event::WatchStateChanged { .. })) {
+            ev = recv_no_advance(&mut events).await;
+        }
         assert!(
             matches!(ev, Some(Event::SnapshotCompleted { .. })),
             "a trigger after a panic-cleared retry must snapshot at once, got {ev:?}"
@@ -2548,23 +2784,24 @@ mod tests {
             }
         ));
 
-        // The repo returns to safe; the snapshot then fails.
+        // The repo returns to safe; the pause resolves (Paused->Ok) and the
+        // snapshot then fails. Scan to the failure, tolerating the intermediate
+        // Ok transition (order between the resume and the new failure is not what
+        // this test pins down).
         backend.set_safe(SafeState::Safe);
-        let resumed = advance_until_event(&mut events, Duration::from_secs(30)).await;
-        assert!(
-            matches!(
-                resumed,
+        let mut saw_resume = false;
+        loop {
+            match advance_until_event(&mut events, Duration::from_secs(30)).await {
                 Event::WatchStateChanged {
-                    to: WatchState::Ok,
-                    ..
-                }
-            ),
-            "expected the Paused->Ok transition, got {resumed:?}"
-        );
-        let failed = advance_until_event(&mut events, Duration::from_secs(30)).await;
+                    to: WatchState::Ok, ..
+                } => saw_resume = true,
+                Event::SnapshotFailed { .. } => break,
+                other => panic!("unexpected event before the new failure: {other:?}"),
+            }
+        }
         assert!(
-            matches!(failed, Event::SnapshotFailed { .. }),
-            "the new failure after resuming must be surfaced, got {failed:?}"
+            saw_resume,
+            "the unsafe pause must resolve to Ok before failing"
         );
 
         // It converges (Clean) and no second failure is emitted.
@@ -2676,6 +2913,51 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn source_died_is_emitted_even_when_already_in_attention() {
+        // Regression: the change-only dedup must key on (state, trouble), not
+        // the state alone. A watch already parked in Attention by failing
+        // snapshots whose source THEN dies must still emit the SourceDied
+        // transition — the daemon's dead-source rebuild triggers on it.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Fail]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        // Drive a failing snapshot: the watch enters Attention/SnapshotsFailing.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        loop {
+            let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+            if let Event::WatchStateChanged { to, trouble, .. } = ev {
+                assert_eq!(to, WatchState::Attention);
+                assert_eq!(trouble, Some(TroubleKind::SnapshotsFailing));
+                break;
+            }
+        }
+
+        // The source dies while the watch is already in Attention.
+        tx.send(WatchInput::Trouble {
+            kind: TroubleKind::SourceDied,
+            detail: "watch task ended abnormally".into(),
+        })
+        .unwrap();
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match ev {
+            Event::WatchStateChanged {
+                from, to, trouble, ..
+            } => {
+                assert_eq!(from, WatchState::Attention);
+                assert_eq!(to, WatchState::Attention);
+                assert_eq!(
+                    trouble,
+                    Some(TroubleKind::SourceDied),
+                    "an Attention-to-Attention trouble change must emit"
+                );
+            }
+            other => panic!("expected the SourceDied transition, got {other:?}"),
+        }
+    }
+
     // --- EngineHandle::trigger and shutdown ----------------------------------
 
     /// Builds and starts an interval-only engine over one fake-backed watch.
@@ -2762,6 +3044,88 @@ mod tests {
         timeout(Duration::from_secs(5), handle.shutdown())
             .await
             .expect("shutdown must drain promptly, not wait out the drain timeout");
+    }
+
+    // --- watch_states projection ---------------------------------------------
+
+    /// Waits until `pred` holds for the named watch's projected status, or
+    /// panics after a generous budget. Polls `watch_states` rather than the bus,
+    /// which is exactly what a host does.
+    async fn wait_status(handle: &EngineHandle, watch: &str, pred: impl Fn(&WatchStatus) -> bool) {
+        for _ in 0..500 {
+            if let Some(s) = handle.watch_states().into_iter().find(|s| s.name == watch)
+                && pred(&s)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("watch status never satisfied the predicate");
+    }
+
+    #[tokio::test]
+    async fn watch_states_projects_a_failing_snapshot_then_its_recovery() {
+        // The queryable projection reflects the engine's own truth: a healthy
+        // start, a snapshots-failing state on a hard failure, and Ok again once a
+        // snapshot lands.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Fail, Scripted::Commit(1)]);
+        // A short repoll so the failure retry converges within the test budget.
+        let spec = WatchSpec::builder("w", "/tmp")
+            .trigger(TriggerMode::Interval)
+            .interval(Duration::from_secs(3600))
+            .build()
+            .unwrap();
+        let handle = Engine::builder()
+            .watch_with_backend(spec, Arc::clone(&backend) as SharedBackend)
+            .unsafe_repoll_interval(Duration::from_millis(20))
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+
+        // Healthy at start.
+        let start = handle.watch_states();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].name, "w");
+        assert_eq!(start[0].state, WatchState::Ok);
+        assert_eq!(start[0].trouble, None);
+
+        handle.trigger("w");
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Attention
+                && s.trouble == Some(TroubleKind::SnapshotsFailing)
+                && s.reason.is_some()
+        })
+        .await;
+
+        // The retry converges and the projection returns to Ok.
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Ok && s.trouble.is_none()
+        })
+        .await;
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn initial_probe_projects_a_blocked_repo_before_any_trigger() {
+        // A restart against a genuinely blocked (unsafe) repo must not amnesia to
+        // Ok: the startup probe enters the blocked state up front, so the
+        // projection shows it before any trigger arrives.
+        let backend = FakeBackend::new();
+        backend.set_safe(SafeState::Unsafe(UnsafeReason::MergeInProgress));
+        let handle = start_interval_engine(Arc::clone(&backend)).await;
+
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Paused
+                && s.trouble.is_none()
+                && s.reason.as_deref() == Some("a merge is in progress")
+        })
+        .await;
+
+        handle.shutdown().await;
     }
 
     // --- builder validation --------------------------------------------------

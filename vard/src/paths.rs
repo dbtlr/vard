@@ -55,6 +55,13 @@ pub fn lock_file() -> Result<PathBuf, HomeNotFound> {
     Ok(state_dir()?.join("vard.lock"))
 }
 
+/// `<state_dir>/health` — the small structured document the daemon rewrites on
+/// every watch state change and `vard notify` reads. Deliberately in the state
+/// directory (not config): it is derived runtime state, not user input.
+pub fn health_file() -> Result<PathBuf, HomeNotFound> {
+    Ok(state_dir()?.join("health"))
+}
+
 /// `<state_dir>/requests` — the request-file queue the CLI drops into and the
 /// daemon drains.
 pub fn request_dir() -> Result<PathBuf, HomeNotFound> {

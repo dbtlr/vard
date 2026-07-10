@@ -31,7 +31,7 @@ pub use config::{
 pub use engine::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     DEFAULT_UNSAFE_REPOLL_INTERVAL, DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder,
-    EngineError, EngineHandle, SharedBackend, open_git_backend,
+    EngineError, EngineHandle, SharedBackend, WatchStatus, open_git_backend,
 };
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, SkipReason, Trigger,
