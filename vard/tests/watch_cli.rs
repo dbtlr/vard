@@ -4,80 +4,12 @@
 //! throwaway global git config so commits and inits are deterministic in CI.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 
-use tempfile::TempDir;
+mod common;
+use common::{Env, stderr, stdout};
 
-/// A fully isolated environment for one test: its own XDG dirs, HOME, and git
-/// global config.
-struct Env {
-    _root: TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-    home: PathBuf,
-    git_config: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let root = TempDir::new().unwrap();
-        let base = root.path();
-        let env = Env {
-            config_home: base.join("config"),
-            state_home: base.join("state"),
-            home: base.join("home"),
-            git_config: base.join("gitconfig"),
-            _root: root,
-        };
-        std::fs::create_dir_all(&env.home).unwrap();
-        // Deterministic git identity for any repo `watch add --init` creates.
-        run_git(
-            &env.git_config,
-            &[
-                "config",
-                "--file",
-                env.git_config.to_str().unwrap(),
-                "user.email",
-                "vard-test@example.com",
-            ],
-        );
-        run_git(
-            &env.git_config,
-            &[
-                "config",
-                "--file",
-                env.git_config.to_str().unwrap(),
-                "user.name",
-                "Vard Test",
-            ],
-        );
-        env
-    }
-
-    /// Runs `vard <args>` in this environment with stdin closed (non-interactive).
-    fn vard(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_vard"))
-            .args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", &self.state_home)
-            .env("HOME", &self.home)
-            .env("GIT_CONFIG_GLOBAL", &self.git_config)
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE")
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vard")
-    }
-
-    fn config_path(&self) -> PathBuf {
-        self.config_home.join("vard").join("config.toml")
-    }
-
-    fn config_text(&self) -> String {
-        std::fs::read_to_string(self.config_path()).unwrap_or_default()
-    }
-}
-
+/// Runs `git <args>` against the throwaway global git config, asserting success.
 fn run_git(git_config: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -89,7 +21,7 @@ fn run_git(git_config: &Path, args: &[&str]) {
 
 /// A directory that is already a git repository on branch `main`.
 fn repo(env: &Env, name: &str) -> PathBuf {
-    let path = env._root.path().join(name);
+    let path = env.root.path().join(name);
     std::fs::create_dir_all(&path).unwrap();
     let out = Command::new("git")
         .arg("-C")
@@ -105,14 +37,6 @@ fn repo(env: &Env, name: &str) -> PathBuf {
     );
     // canonicalize so assertions compare against what vard stores.
     std::fs::canonicalize(&path).unwrap()
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
 #[test]
@@ -135,7 +59,7 @@ fn add_existing_repo_registers_and_lists() {
 #[test]
 fn add_non_repo_without_init_fails_noninteractively() {
     let env = Env::new();
-    let dir = env._root.path().join("plain");
+    let dir = env.root.path().join("plain");
     std::fs::create_dir_all(&dir).unwrap();
 
     let out = env.vard(&["watch", "add", dir.to_str().unwrap()]);
@@ -148,7 +72,7 @@ fn add_non_repo_without_init_fails_noninteractively() {
 #[test]
 fn add_non_repo_with_init_creates_repository() {
     let env = Env::new();
-    let dir = env._root.path().join("fresh");
+    let dir = env.root.path().join("fresh");
     std::fs::create_dir_all(&dir).unwrap();
 
     let out = env.vard(&[
@@ -341,7 +265,7 @@ fn mutating_a_symlinked_config_preserves_the_symlink() {
     env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
 
     let cfg = env.config_path();
-    let real = env._root.path().join("real-config.toml");
+    let real = env.root.path().join("real-config.toml");
     std::fs::rename(&cfg, &real).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&real, &cfg).unwrap();
@@ -588,7 +512,7 @@ fn add_registers_a_linked_worktree_writing_the_shared_exclude() {
             "seed",
         ],
     );
-    let wt = env._root.path().join("wt");
+    let wt = env.root.path().join("wt");
     run_git(
         &env.git_config,
         &[

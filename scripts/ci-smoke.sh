@@ -26,6 +26,8 @@ test -x "$VARD" || fail "$VARD not found — build first: cargo build -p vard --
 "$VARD" -h | grep -q 'For full help, run' || fail "vard -h is missing the v2 short-help footer"
 "$VARD" --help | grep -q '^EXAMPLES$' || fail "vard --help is missing the EXAMPLES section"
 "$VARD" --help | grep -q 'watch' || fail "vard --help does not mention the watch command"
+"$VARD" --help | grep -q 'status' || fail "vard --help does not mention the status command"
+"$VARD" --help | grep -q 'config' || fail "vard --help does not mention the config command"
 "$VARD" run --help | grep -q 'SIGHUP' || fail "vard run --help is missing the lifecycle prose"
 "$VARD" help run >/dev/null || fail "vard help run did not render"
 
@@ -66,6 +68,11 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" restore --help | grep -q 'protective snapshot' || fail "vard restore --help missing its prose"
 "$VARD" diff --help | grep -q 'text-only' || fail "vard diff --help missing the text-only note"
 
+# The status/config commands (VRD-17) render help through the same v2 path.
+"$VARD" status -h | grep -q 'For full help, run' || fail "vard status -h missing the v2 short-help footer"
+"$VARD" config -h | grep -q 'For full help, run' || fail "vard config -h missing the v2 short-help footer"
+"$VARD" config set --help | grep -q 'inferred' || fail "vard config set --help missing its prose"
+
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
 # Requires git on PATH (the release-artifact job has it).
@@ -88,6 +95,31 @@ grep -q 'vard managed excludes' "$WDIR/.git/info/exclude" || fail "vard watch ad
 "$VARD" watch pause smoke >/dev/null || fail "vard watch pause failed"
 grep -q 'paused = true' "$XDG_CONFIG_HOME/vard/config.toml" || fail "vard watch pause did not persist paused = true"
 "$VARD" watch resume smoke >/dev/null || fail "vard watch resume failed"
+
+# vard status (VRD-17): no daemon runs in the smoke env, so status reports the
+# stopped daemon and exits 1. With nothing monitoring it, the configured watch
+# projects to `unknown` (not `ok` — that would falsely imply it is being watched).
+if status_out="$("$VARD" --format records status)"; then
+  fail "vard status with no daemon must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard status with no daemon must exit 1"
+fi
+printf '%s\n' "$status_out" | grep -q 'daemon: not running' \
+  || fail "vard status did not report the stopped daemon"
+printf '%s\n' "$status_out" | grep -q 'smoke: unknown' \
+  || fail "vard status did not project the unmonitored smoke watch as unknown"
+
+# vard config (VRD-17): round-trip a scalar key and locate the config file.
+"$VARD" config path | grep -q 'config.toml' || fail "vard config path did not print the location"
+"$VARD" config set defaults.interval 30m >/dev/null || fail "vard config set failed"
+grep -q 'interval = "30m"' "$XDG_CONFIG_HOME/vard/config.toml" \
+  || fail "vard config set did not persist defaults.interval"
+test "$("$VARD" --format records config get defaults.interval)" = "30m" \
+  || fail "vard config get did not read the value back"
+"$VARD" config unset defaults.interval >/dev/null || fail "vard config unset failed"
+if "$VARD" config get defaults.interval >/dev/null; then
+  fail "vard config get of an unset key must exit non-zero"
+fi
 
 # Snapshot/log round-trip (VRD-16), no daemon: an in-process snapshot must land
 # a real commit, leave the operation journal compacted (no dangling begin), and

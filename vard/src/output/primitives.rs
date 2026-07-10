@@ -129,6 +129,27 @@ pub(crate) fn sanitize_controls(s: &str) -> String {
         .collect()
 }
 
+/// Collapses a possibly multi-line string into one line: each non-empty line is
+/// trimmed and joined with `"; "`, then any internal whitespace run collapses to
+/// a single space. So a multi-line git error renders as one prompt/status line.
+pub(crate) fn flatten_ws(s: &str) -> String {
+    let joined = s
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Flattens whitespace to a single line ([`flatten_ws`]) and strips control
+/// characters ([`sanitize_controls`]), so a crafted watch name or a multi-line
+/// health summary cannot break or inject into a terminal line. Shared by `notify`
+/// and `status` so a multi-line summary renders identically in both.
+pub(crate) fn clean_line(s: &str) -> String {
+    sanitize_controls(&flatten_ws(s))
+}
+
 fn wrap_value(value: &str, width: usize) -> Vec<String> {
     if value.is_empty() {
         return vec![String::new()];

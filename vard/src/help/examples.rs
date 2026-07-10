@@ -127,6 +127,59 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "emit problems as a JSON array for a status bar".to_string(),
             ),
         ]
+    } else if cmd_path == format!("{BIN_NAME} status") {
+        vec![
+            (
+                format!("{BIN_NAME} status"),
+                "show the daemon and every watch's state".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} status notes"),
+                "show just the notes watch".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} config") {
+        vec![
+            (
+                format!("{BIN_NAME} config get defaults.interval"),
+                "print the default snapshot interval".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} config set daemon.log_level debug"),
+                "raise the daemon's log verbosity".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} config get") {
+        vec![(
+            format!("{BIN_NAME} config get daemon.log_level"),
+            "print a key's value (exit 1 if unset)".to_string(),
+        )]
+    } else if cmd_path == format!("{BIN_NAME} config set") {
+        vec![
+            (
+                format!("{BIN_NAME} config set defaults.interval 30m"),
+                "snapshot every 30 minutes by default".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} config set defaults.sync true"),
+                "sync watches to their remotes by default".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} config unset") {
+        vec![(
+            format!("{BIN_NAME} config unset defaults.interval"),
+            "restore the built-in default interval".to_string(),
+        )]
+    } else if cmd_path == format!("{BIN_NAME} config edit") {
+        vec![(
+            format!("{BIN_NAME} config edit"),
+            "open the config in $EDITOR and validate on save".to_string(),
+        )]
+    } else if cmd_path == format!("{BIN_NAME} config path") {
+        vec![(
+            format!("{BIN_NAME} config path"),
+            "print the config file's location".to_string(),
+        )]
     } else if cmd_path == format!("{BIN_NAME} restore") {
         vec![
             (
@@ -221,6 +274,24 @@ mod tests {
     #[test]
     fn notify_path_has_examples() {
         assert!(!examples_for("vard notify").is_empty());
+    }
+
+    #[test]
+    fn status_and_config_paths_have_examples() {
+        for path in [
+            "vard status",
+            "vard config",
+            "vard config get",
+            "vard config set",
+            "vard config unset",
+            "vard config edit",
+            "vard config path",
+        ] {
+            assert!(
+                !examples_for(path).is_empty(),
+                "missing examples for {path}"
+            );
+        }
     }
 
     #[test]

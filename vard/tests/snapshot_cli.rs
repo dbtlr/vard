@@ -10,79 +10,12 @@
 //! process.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
-use tempfile::TempDir;
+mod common;
+use common::{Env, stderr, stdout};
 
-/// A fully isolated environment for one test: its own XDG dirs, HOME, and git
-/// global config.
-struct Env {
-    _root: TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-    home: PathBuf,
-    git_config: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let root = TempDir::new().unwrap();
-        let base = root.path();
-        let env = Env {
-            config_home: base.join("config"),
-            state_home: base.join("state"),
-            home: base.join("home"),
-            git_config: base.join("gitconfig"),
-            _root: root,
-        };
-        std::fs::create_dir_all(&env.home).unwrap();
-        git_config(&env.git_config, "user.email", "vard-test@example.com");
-        git_config(&env.git_config, "user.name", "Vard Test");
-        git_config(&env.git_config, "init.defaultBranch", "main");
-        env
-    }
-
-    /// Runs `vard <args>` in this environment with stdin closed.
-    fn vard(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_vard"))
-            .args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", &self.state_home)
-            .env("HOME", &self.home)
-            .env("GIT_CONFIG_GLOBAL", &self.git_config)
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE")
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vard")
-    }
-
-    /// The per-watch operation journal directory.
-    fn journal_dir(&self) -> PathBuf {
-        self.state_home.join("vard").join("journal")
-    }
-}
-
-fn git_config(git_config: &Path, key: &str, value: &str) {
-    run_git(
-        git_config,
-        &["config", "--file", git_config.to_str().unwrap(), key, value],
-    );
-}
-
-fn run_git(git_config: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", git_config)
-        .output()
-        .expect("spawn git");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
+/// Runs `git -C <repo> <args>` against the throwaway global git config.
 fn git_in(env: &Env, repo: &Path, args: &[&str]) -> Output {
     let mut full = vec!["-C", repo.to_str().unwrap()];
     full.extend_from_slice(args);
@@ -95,7 +28,7 @@ fn git_in(env: &Env, repo: &Path, args: &[&str]) -> Output {
 
 /// Adds a watch named `name` at a fresh `--init` repository and returns its path.
 fn add_watch(env: &Env, name: &str) -> PathBuf {
-    let path = env._root.path().join(name);
+    let path = env.root.path().join(name);
     std::fs::create_dir_all(&path).unwrap();
     let out = env.vard(&[
         "watch",
@@ -107,14 +40,6 @@ fn add_watch(env: &Env, name: &str) -> PathBuf {
     ]);
     assert!(out.status.success(), "watch add failed: {}", stderr(&out));
     std::fs::canonicalize(&path).unwrap()
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
 fn commit_count(env: &Env, repo: &Path) -> usize {
