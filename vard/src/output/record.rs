@@ -22,6 +22,10 @@ pub(crate) enum Cell {
     Str(String),
     /// A boolean value — `yes`/`no` in records, `true`/`false` in JSON.
     Bool(bool),
+    /// An integer value — rendered as-is in records, a bare JSON number in the
+    /// machine forms (so a consumer can compare `elapsed_seconds` numerically
+    /// rather than parsing a string).
+    Int(i64),
     /// No value: `—` in records, `null` in JSON.
     Absent,
 }
@@ -53,6 +57,17 @@ impl RecordField {
         RecordField {
             key,
             cell: Cell::Bool(value),
+            highlight: false,
+        }
+    }
+
+    /// An optional integer field: `Absent` (JSON `null`) when `None`, a bare
+    /// number otherwise — keeping the field's JSON type stable (number-or-null,
+    /// never a string) whether or not a value was available.
+    pub(crate) fn opt_int(key: &'static str, value: Option<i64>) -> Self {
+        RecordField {
+            key,
+            cell: value.map(Cell::Int).unwrap_or(Cell::Absent),
             highlight: false,
         }
     }
@@ -159,6 +174,7 @@ pub(crate) fn write_json_object(out: &mut dyn Write, record: &Record) -> io::Res
         match &field.cell {
             Cell::Str(s) => write_json_string(out, s)?,
             Cell::Bool(b) => out.write_all(if *b { b"true" } else { b"false" })?,
+            Cell::Int(n) => write!(out, "{n}")?,
             Cell::Absent => out.write_all(b"null")?,
         }
     }
@@ -171,6 +187,7 @@ fn cell_display(cell: &Cell) -> String {
         Cell::Str(s) => s.clone(),
         Cell::Bool(true) => "yes".to_string(),
         Cell::Bool(false) => "no".to_string(),
+        Cell::Int(n) => n.to_string(),
         Cell::Absent => "—".to_string(),
     }
 }
@@ -280,6 +297,27 @@ mod tests {
             String::from_utf8(out).unwrap(),
             r#"{"set_true":true,"set_false":false,"unset":null}"#
         );
+    }
+
+    #[test]
+    fn int_cell_is_a_bare_json_number_and_plain_records_text() {
+        let mut out = Vec::new();
+        let rec = Record {
+            header: None,
+            fields: vec![
+                RecordField::opt_int("elapsed_seconds", Some(7200)),
+                RecordField::opt_int("since", None),
+            ],
+        };
+        write_json_object(&mut out, &rec).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"elapsed_seconds":7200,"since":null}"#
+        );
+        // Records form renders the number as plain text (no quotes).
+        let mut recs = Vec::new();
+        render_records(&mut recs, &Palette::off(), &[rec], "problems", 80).unwrap();
+        assert!(String::from_utf8(recs).unwrap().contains("7200"));
     }
 
     #[test]

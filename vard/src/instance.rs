@@ -89,6 +89,67 @@ pub(crate) enum CliLock {
     BusyPeerCli,
 }
 
+/// The result of probing whether a daemon currently owns the instance lock —
+/// the microsecond, side-effect-free check `vard notify` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonProbe {
+    /// A holder with `role = daemon` owns the lock: a daemon is running.
+    Running,
+    /// Nobody holds the lock, or a holder with a non-daemon (CLI or unreadable)
+    /// role does — either way no daemon is supervising this state directory.
+    NotRunning,
+}
+
+/// Non-blocking, read-only probe of whether a daemon owns the instance lock at
+/// `path`. Unlike [`acquire_for_cli`](InstanceLock::acquire_for_cli) this never
+/// writes to or creates the lock file and never retries: it opens the file
+/// read-only, attempts one non-blocking exclusive `flock`, and reports the
+/// outcome in microseconds —
+///
+/// - the file is missing ⇒ no daemon ever ran ⇒ [`DaemonProbe::NotRunning`];
+/// - the lock is free (we take it, then immediately release it on return) ⇒
+///   [`DaemonProbe::NotRunning`];
+/// - the lock is held and the recorded role is `daemon` ⇒
+///   [`DaemonProbe::Running`];
+/// - the lock is held by a non-daemon role, or the role is unreadable ⇒
+///   [`DaemonProbe::NotRunning`] (a CLI holding the lock truthfully means no
+///   daemon).
+///
+/// Any other I/O error (a permission problem opening the file, say) is returned
+/// so the caller can surface an honest operational error rather than guess.
+pub(crate) fn probe_daemon(path: &Path) -> Result<DaemonProbe, LockError> {
+    // Read-only, no create: a probe must never bring the lock file into being.
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DaemonProbe::NotRunning);
+        }
+        Err(source) => {
+            return Err(LockError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        // We took the lock, so nobody held it: no daemon. Dropping `file` on
+        // return releases the flock; we never wrote to the file.
+        Ok(()) => Ok(DaemonProbe::NotRunning),
+        Err(Errno::WOULDBLOCK) => {
+            let (_holder, role) = read_holder(path);
+            match role {
+                Some(LockRole::Daemon) => Ok(DaemonProbe::Running),
+                _ => Ok(DaemonProbe::NotRunning),
+            }
+        }
+        Err(errno) => Err(LockError::Io {
+            path: path.to_path_buf(),
+            source: errno.into(),
+        }),
+    }
+}
+
 /// A held single-instance lock. The exclusive `flock` lives as long as this
 /// guard: dropping it closes the underlying descriptor, which releases the
 /// lock. Hold it for the daemon's whole lifetime.
@@ -433,6 +494,44 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("lock never became reacquirable after release: {last:?}");
+    }
+
+    #[test]
+    fn probe_reports_not_running_when_the_lock_file_is_absent() {
+        let (_dir, path) = temp_lock_path();
+        // No file created and no directory even; a missing lock means no daemon.
+        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
+        // And the probe must not have created the file.
+        assert!(!path.exists(), "probe must not create the lock file");
+    }
+
+    #[test]
+    fn probe_reports_running_only_for_a_daemon_holder() {
+        let (_dir, path) = temp_lock_path();
+        let held = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::Running);
+        drop(held);
+    }
+
+    #[test]
+    fn probe_reports_not_running_for_a_cli_holder() {
+        // A CLI holding the lock truthfully means no daemon is supervising.
+        let (_dir, path) = temp_lock_path();
+        let held = InstanceLock::acquire_at(&path, LockRole::Cli).unwrap();
+        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
+        drop(held);
+    }
+
+    #[test]
+    fn probe_reports_not_running_when_the_lock_is_free() {
+        // A leftover lock file from a crashed daemon (no live holder) probes as
+        // not-running, and the probe leaves the file releasable for the next
+        // acquirer.
+        let (_dir, path) = temp_lock_path();
+        {
+            let _held = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        } // released, file remains on disk
+        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
     }
 
     #[test]
