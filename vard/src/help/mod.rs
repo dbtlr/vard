@@ -238,6 +238,8 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
         Command::Diff(_) => "diff",
         Command::Restore(_) => "restore",
         Command::Notify => "notify",
+        Command::Status(_) => "status",
+        Command::Config { .. } => "config",
     });
     let (cmd, path) =
         match sub_name.and_then(|n| root.get_subcommands().find(|c| c.get_name() == n)) {

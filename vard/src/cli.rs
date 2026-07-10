@@ -283,6 +283,65 @@ captured — which a prompt substitution always does — so pass `--color always
 (or use a non-UTF-8 locale) for an ASCII fallback glyph instead of the Unicode \
 warning sign.")]
     Notify,
+
+    /// Show the daemon's liveness and every watch's current state, read-only.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Show whether the vard daemon is running and what state each watch is in.
+
+Read-only and safe to run any time: it probes the single-instance lock to learn \
+whether a daemon is running, reads the small health file the daemon keeps, and \
+reads the config's watch list — it never takes a lock, runs git, or mutates \
+anything. With a `<name|path>` it narrows to one watch; with no selector it \
+reports every configured watch.
+
+The first line reports the daemon: running, not running, starting or stopping, \
+or — when a running daemon's health file has gone stale — wedged. Each watch \
+then shows one state: `ok`, `paused` (a pause you chose, which `notify` stays \
+silent about), or a health-vocabulary problem — `blocked`, `snapshots-failing`, \
+`attention`, `conflicted`, or `sync-error` — with how long it has been in it. \
+Unlike `notify`, `status` lists healthy and paused watches too, so it is the \
+on-demand review to `notify`'s always-on prompt hook.
+
+Exit codes make it scriptable: 0 when the daemon is running and every reported \
+watch is healthy, 1 when something needs attention (the daemon is not running, \
+starting, or wedged, or a reported watch has a problem), 2 on an operational \
+error. With a selector the per-watch part reflects only that watch, but \
+daemon-level trouble always folds in. Output follows the global `--format`: \
+human lines by default, or a stable JSON/JSONL array (the daemon carries a null \
+watch name, each configured watch its own object) when piped.")]
+    Status(StatusArgs),
+
+    /// Read and edit vard's configuration: get, set, unset, edit, path.
+    #[command(disable_help_flag = true)]
+    #[command(disable_help_subcommand = true)]
+    #[command(long_about = "\
+Read and edit vard's TOML configuration file.
+
+These commands address scalar keys in the `[daemon]`, `[defaults]`, `[ai]`, and \
+`[update]` sections by their dotted names (`daemon.log_level`, \
+`defaults.interval`, `ai.model`). Edits preserve your comments and formatting \
+and are written atomically, so the running daemon — which watches the file — \
+reloads a clean, whole config every time.
+
+  get    print a key's value (exit 1 when the key is not set)
+  set    set a key to a value, rejecting an edit that would break the config
+  unset  remove a key
+  edit   open the config in $EDITOR and validate the result
+  path   print the config file's path
+
+The set of watched directories is NOT edited here — a `watch.*` key is refused \
+with a pointer to the `vard watch` verbs (`add`, `remove`, `pause`, `resume`), \
+which understand watch identity. The top-level `version` is managed by vard and \
+is not settable either. Every write is validated before it lands: an edit that \
+would turn a valid config invalid is refused, so the CLI can never wedge the \
+daemon's reloads (a config already invalid on disk may still be repaired).")]
+    Config {
+        /// The chosen config subcommand. Absent (a bare `vard config`) prints
+        /// this command's short help.
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
 }
 
 /// Arguments to `vard snapshot`.
@@ -349,6 +408,109 @@ pub struct RestoreArgs {
     /// tree or taking a protective snapshot.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments to `vard status`.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// The watch to report, by name or by path. Omit to report every watch.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: Option<String>,
+}
+
+/// The `vard config` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print a config key's value.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Print the value of a config key.
+
+The key is a dotted name in the `[daemon]`, `[defaults]`, `[ai]`, or `[update]` \
+section (`daemon.log_level`, `defaults.interval`). Only what the file actually \
+sets is printed — an inherited default is not materialized here — so a key the \
+config does not set prints nothing and exits 1, the way `git config` reports an \
+unset key. In records/human output the bare value is printed for easy scripting; \
+`--format json` wraps it as a `{key, value}` object.")]
+    Get(ConfigGetArgs),
+
+    /// Set a config key to a value.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Set a config key to a value.
+
+The key is a dotted name in the `[daemon]`, `[defaults]`, `[ai]`, or `[update]` \
+section. The value's type is inferred (`true`/`false` a boolean, a bare integer \
+a number, otherwise a string) and then validated: the edit is applied to a \
+comment-preserving copy of the file and the result must still parse as a valid \
+config. An edit that would turn a valid config invalid is refused (exit 2) — for \
+example a non-integer `daemon.log_retention_days`. A `watch.*` key is refused \
+with a pointer to `vard watch`; `version` is not settable.")]
+    Set(ConfigSetArgs),
+
+    /// Remove a config key.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Remove a config key.
+
+The key is a dotted name in the `[daemon]`, `[defaults]`, `[ai]`, or `[update]` \
+section. Removing a key restores its inherited default. Removing a key that is \
+not set is reported and exits 2. As with `set`, the result is validated before \
+it lands and a `watch.*` key is refused with a pointer to `vard watch`.")]
+    Unset(ConfigKeyArgs),
+
+    /// Open the config file in $EDITOR and validate the result.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Open the config file in your editor and validate what you save.
+
+The file is copied to a temporary file, `$EDITOR` (falling back to `$VISUAL`) is \
+launched on it, and the result is validated before it replaces the config — \
+written atomically under the config lock so the running daemon never sees a \
+half-written file. If the edit would turn a valid config invalid, it is refused: \
+the parse error and the temporary file's path are printed (so your work is not \
+lost) and the command exits 2. The daemon reloads the change on its own; no \
+signal is needed.")]
+    Edit,
+
+    /// Print the path to the config file.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Print the path to vard's config file.
+
+Resolves the same `$XDG_CONFIG_HOME/vard/config.toml` location the daemon and \
+the other commands use, whether or not the file exists yet, so it can seed a \
+script or an editor invocation.")]
+    Path,
+}
+
+/// Arguments to `vard config get`.
+#[derive(Debug, Args)]
+pub struct ConfigGetArgs {
+    /// The dotted config key to read, e.g. `daemon.log_level`.
+    #[arg(value_name = "KEY")]
+    pub key: String,
+}
+
+/// Arguments to `vard config set`.
+#[derive(Debug, Args)]
+pub struct ConfigSetArgs {
+    /// The dotted config key to set, e.g. `defaults.interval`.
+    #[arg(value_name = "KEY")]
+    pub key: String,
+
+    /// The value to set. Typed by inference: `true`/`false`, a bare integer, or
+    /// otherwise a string.
+    #[arg(value_name = "VALUE")]
+    pub value: String,
+}
+
+/// Arguments to `vard config unset`.
+#[derive(Debug, Args)]
+pub struct ConfigKeyArgs {
+    /// The dotted config key to remove, e.g. `ai.model`.
+    #[arg(value_name = "KEY")]
+    pub key: String,
 }
 
 /// The `vard watch` subcommands.

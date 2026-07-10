@@ -3,6 +3,7 @@ mod cli;
 mod cmd;
 mod command;
 mod config;
+mod config_cmd;
 mod config_edit;
 mod daemon;
 mod health;
@@ -13,6 +14,7 @@ mod notify;
 mod output;
 mod paths;
 mod request;
+mod status;
 mod watch;
 
 use std::process::ExitCode;
@@ -53,6 +55,13 @@ fn main() -> ExitCode {
         Some(Command::Diff(args)) => cmd::diff::run(args, cli.color, cli.format),
         Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
         Some(Command::Notify) => notify::run(cli.color, cli.format),
+        Some(Command::Status(args)) => status::run(args, cli.color, cli.format),
+        // A bare `vard config` (no subcommand) prints config's short help, like
+        // a bare `vard watch`.
+        Some(Command::Config { command: None }) => {
+            ExitCode::from(help::print_command_short(&["config"], cli.color) as u8)
+        }
+        Some(Command::Config { command: Some(sub) }) => config_cmd::run(sub, cli.color, cli.format),
         None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }
