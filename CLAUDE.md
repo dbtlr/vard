@@ -45,6 +45,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo build -p vard --release --locked && scripts/ci-smoke.sh
 ```
 
+CI's lint job additionally enforces `cargo audit` and `cargo deny check`; run
+them too when touching dependencies (`Cargo.toml`/`Cargo.lock`).
+
 `scripts/ci-smoke.sh` is the single source of truth for post-build smoke
 assertions, shared by CI (`.github/workflows/ci.yml`) and local runs; it asserts
 on the release binary's real behavior, so it must pass against a fresh

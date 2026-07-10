@@ -24,7 +24,7 @@ Wire it into a prompt by running it before each prompt and showing its output. B
 
 ## Output
 
-A list surface (records/json/jsonl). When every watch is healthy it **prints nothing and exits 0**. When something needs attention it prints one line per problem and exits `1`:
+Human line form by default, **regardless of destination** — unlike the list surfaces, `notify` never auto-switches to JSON when piped, because its primary consumer is a shell hook echoing the line verbatim. A machine consumer (a status-bar program) passes `--format json`/`jsonl` explicitly. When every watch is healthy it **prints nothing and exits 0**. When something needs attention it prints one line per problem and exits `1`:
 
 ```text
 ⚠ vard: daemon not running — start it with `vard run`

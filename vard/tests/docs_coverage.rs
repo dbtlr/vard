@@ -90,11 +90,13 @@ fn index_links_every_page() {
     let index = std::fs::read_to_string(&index_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", index_path.display()));
     for command in top_level_commands() {
-        let link = format!("commands/{command}.md");
+        // Match the markdown link target form `](commands/<name>.md)`, not a
+        // bare substring — a prose mention or comment must not satisfy the gate.
+        let link = format!("](commands/{command}.md)");
         assert!(
             index.contains(&link),
-            "docs/commands.md (the index) does not link {link}; add a row \
-             for `vard {command}`"
+            "docs/commands.md (the index) has no markdown link to \
+             commands/{command}.md; add a row for `vard {command}`"
         );
     }
 }
