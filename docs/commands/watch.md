@@ -62,11 +62,17 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 
 Unregister a watch. This removes the watch from the config file only — it never touches the repository, its working tree, or its history. The directory and every snapshot vard took remain exactly as they were.
 
-Removing also *drains* the watch: it settles any operation still in flight and cleans a stale git lock left by a crashed vard operation (proven to be vard's own), so a removed directory never wedges on a lock only vard could vouch for. A running daemon drains the watch as it reloads the change; with no daemon running, `remove` drains synchronously. The repository is never modified.
+Removing also *drains* the watch: it settles any operation still in flight and cleans a stale git lock left by a crashed vard operation (proven to be vard's own), so a removed directory never wedges on a lock only vard could vouch for. The drain is best-effort:
+
+- **A running daemon** drains the watch as it reloads the change, so `remove` skips the synchronous drain — the daemon is the one writer of the journal.
+- **No daemon running**: `remove` drains synchronously, taking vard's instance lock for the moment it runs recovery.
+- **A busy peer command** (another `vard` operation holding the lock) is waited out only briefly (about 3 seconds) and then skipped — `remove` never blocks on it. Anything skipped is covered by the daemon's next reload or the next daemon start's journal sweep, which now recovers a since-removed watch's journal from the repository path recorded inside it.
+
+The repository is never modified. The one residual that automatic recovery cannot cover is a journal written by a much older vard version (before journals recorded their repository path) whose watch is already gone — that leaves a manual cleanup, which vard logs when it retains such a file.
 
 | Flag | Effect |
 |---|---|
-| `--purge` | After draining, also delete vard's own metadata for the watch (its operation journal). Never touches the repository. By default this metadata is kept so re-adding the same path resumes cleanly. |
+| `--purge` | After draining, also delete vard's own metadata for the watch (its operation journal). The journal is deleted only when it is safe to: when this command drained it, or when it records no open operation. If a daemon or peer command holds the lock **and** the journal still records an in-flight operation, the journal is **retained** (the command says so) so that open operation stays recoverable — the daemon's reload-drain or the next start's sweep settles it. Never touches the repository. By default this metadata is kept so re-adding the same path resumes cleanly. |
 
 ## list
 
