@@ -191,9 +191,9 @@ fn render(
 }
 
 /// The human line for one problem. Every file-derived string is flattened to a
-/// single line (a multi-line failure reason must not break a prompt) and passed
-/// through [`sanitize_controls`] so a crafted watch name or summary cannot
-/// inject terminal escapes.
+/// single line (a multi-line failure reason must not break a prompt) and stripped
+/// of control characters via [`clean_line`] so a crafted watch name or summary
+/// cannot inject terminal escapes.
 fn human_line(problem: &NotifyProblem, palette: &Palette, now: u64, ascii: bool) -> String {
     let raw = glyphs::render(Glyph::Warn, ascii);
     let glyph = format!(
