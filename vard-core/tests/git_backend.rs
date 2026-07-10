@@ -125,6 +125,74 @@ fn detect_returns_none_for_non_repo() {
 }
 
 #[test]
+fn info_exclude_path_lives_in_the_git_dir_for_a_normal_repo() {
+    let (tmp, backend) = new_repo();
+    let exclude = backend.info_exclude_path().unwrap();
+    assert!(
+        exclude.is_absolute(),
+        "expected an absolute path: {exclude:?}"
+    );
+    assert!(
+        exclude.ends_with("info/exclude"),
+        "expected .../info/exclude, got {exclude:?}"
+    );
+    // It sits under this repository's own .git directory.
+    assert!(
+        fs::canonicalize(exclude.parent().unwrap().parent().unwrap())
+            .unwrap()
+            .starts_with(fs::canonicalize(git_dir(tmp.path())).unwrap()),
+        "exclude file should live under the repo's .git dir"
+    );
+}
+
+#[test]
+fn info_exclude_path_resolves_for_a_linked_worktree() {
+    // In a linked worktree `.git` is a file (a gitlink), not a directory, so
+    // joining ".git/info/exclude" by hand would be wrong. `--git-path` resolves
+    // the shared exclude under the common git dir instead.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "a.txt", "1\n");
+    snap(&backend, Trigger::Manual);
+
+    let wt_holder = TempDir::new().unwrap();
+    let wt_path = wt_holder.path().join("wt");
+    git_ok(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wtbranch",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+    let wt_backend = GitBackend::open(&wt_path, "wtbranch", "origin").unwrap();
+
+    let exclude = wt_backend.info_exclude_path().unwrap();
+    assert!(
+        exclude.is_absolute(),
+        "expected an absolute path: {exclude:?}"
+    );
+    assert!(
+        exclude.ends_with("info/exclude"),
+        "expected .../info/exclude, got {exclude:?}"
+    );
+    // The worktree's `.git` is a file, not a directory — proof this is a linked
+    // worktree and that hand-joining would have failed.
+    assert!(
+        wt_path.join(".git").is_file(),
+        "a linked worktree's .git must be a gitlink file"
+    );
+    // The resolved exclude sits under the main repo's shared git dir.
+    assert!(
+        fs::canonicalize(exclude.parent().unwrap().parent().unwrap())
+            .unwrap()
+            .starts_with(fs::canonicalize(git_dir(tmp.path())).unwrap()),
+        "worktree exclude should resolve under the main repo's .git dir, got {exclude:?}"
+    );
+}
+
+#[test]
 fn detect_returns_none_for_path_inside_a_deeper_repo() {
     let (tmp, _backend) = new_repo();
     let nested = tmp.path().join("sub/dir");

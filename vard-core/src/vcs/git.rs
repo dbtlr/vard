@@ -260,6 +260,24 @@ impl GitBackend {
         Ok(PathBuf::from(out.trim()))
     }
 
+    /// The path to this repository's private `info/exclude` file, resolved via
+    /// `git rev-parse --git-path info/exclude`.
+    ///
+    /// Unlike joining `.git/info/exclude` by hand, this is correct when `.git`
+    /// is a *file* rather than a directory: a linked worktree or a submodule
+    /// stores its git dir elsewhere, and git resolves the shared `info/exclude`
+    /// under the common directory. The returned path is absolute (a relative
+    /// answer is resolved against the repository root).
+    pub fn info_exclude_path(&self) -> Result<PathBuf, VcsError> {
+        let out = self.run(&[], ["rev-parse", "--git-path", "info/exclude"])?;
+        let raw = PathBuf::from(out.trim());
+        Ok(if raw.is_absolute() {
+            raw
+        } else {
+            self.path.join(raw)
+        })
+    }
+
     /// Counts how many commits the local branch is ahead of and behind the
     /// tracking ref, via `rev-list --left-right --count`. The caller must
     /// ensure both refs exist.
