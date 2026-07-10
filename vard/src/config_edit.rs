@@ -1118,6 +1118,25 @@ path = "/home/u/notes"
     }
 
     #[test]
+    fn select_repair_picks_string_when_only_it_matches_the_pre_edit_error() {
+        // Repair mode where the candidates diverge: the inferred (integer) form
+        // adds a NEW type error on top of the pre-existing duplicate-watch
+        // error, while the string form is schema-fine and leaves only the
+        // pre-edit error. The selector must keep the string candidate. No
+        // current typed field accepts a numeric-looking string, so the string
+        // candidate models that shape with a distinct schema-valid value.
+        let mut inferred = DUPLICATE_WATCH.parse::<DocumentMut>().unwrap();
+        set_dotted(&mut inferred, "daemon.log_level", "7").unwrap();
+        let mut string_doc = DUPLICATE_WATCH.parse::<DocumentMut>().unwrap();
+        set_dotted_string(&mut string_doc, "daemon.log_level", "debug").unwrap();
+        let chosen = select_set_candidate(Some(DUPLICATE_WATCH), inferred, Some(string_doc));
+        assert!(
+            chosen.to_string().contains("log_level = \"debug\""),
+            "must keep the string candidate whose error equals the pre-edit error: {chosen}"
+        );
+    }
+
+    #[test]
     fn load_document_missing_file_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.toml");
