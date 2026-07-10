@@ -310,3 +310,83 @@ fn set_a_bare_integer_for_an_integer_key_stays_an_integer() {
         stdout(&json)
     );
 }
+
+#[test]
+fn set_a_negative_integer_surfaces_the_range_error_not_a_type_error() {
+    // A negative value for the u32 `log_retention_days`: the inferred integer
+    // matches the field's type and fails on the range, so the accurate u32 error
+    // must surface — never masked behind the string candidate's type error. The
+    // `--` guards the leading-`-` value from being parsed as a flag.
+    let env = Env::new();
+    let original = "version = 1\n\n[daemon]\nlog_retention_days = 14\n";
+    env.write_config(original);
+    let out = env.vard(&["config", "set", "daemon.log_retention_days", "--", "-5"]);
+    assert_eq!(code(&out), 2, "a valid→invalid set must exit 2");
+    assert!(
+        stderr(&out).contains("u32"),
+        "expected the u32 range error, got: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("invalid type: string"),
+        "the string candidate's type error must not mask the range error, got: {}",
+        stderr(&out)
+    );
+    assert_eq!(env.read_config(), original, "the config must be untouched");
+}
+
+#[test]
+fn set_repairs_a_broken_config_with_a_warning() {
+    // Repair mode: the config is already invalid (two watches share a name). An
+    // unrelated, well-typed edit must be allowed through — written, with an
+    // exit-1 warning that the config is still not fully valid — rather than
+    // trapping the user behind the pre-existing breakage.
+    let env = Env::new();
+    env.write_config(
+        "version = 1\n\n\
+         [[watch]]\nname = \"dup\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"dup\"\npath = \"/b\"\n",
+    );
+    let out = env.vard(&["config", "set", "daemon.log_level", "debug"]);
+    assert_eq!(
+        code(&out),
+        1,
+        "a repair write must exit 1: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("still not fully valid"),
+        "expected the still-invalid warning, got: {}",
+        stderr(&out)
+    );
+    assert!(
+        env.read_config().contains("log_level = \"debug\""),
+        "the repair edit must land, got: {}",
+        env.read_config()
+    );
+}
+
+#[test]
+fn set_on_a_broken_config_writes_the_fallback_candidate() {
+    // Repair mode where neither candidate cleanly resolves the field: setting
+    // `defaults.interval 3600` on an already-broken config falls back to the
+    // inferred integer per the selection rule, written with an exit-1 warning.
+    let env = Env::new();
+    env.write_config(
+        "version = 1\n\n\
+         [[watch]]\nname = \"dup\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"dup\"\npath = \"/b\"\n",
+    );
+    let out = env.vard(&["config", "set", "defaults.interval", "3600"]);
+    assert_eq!(
+        code(&out),
+        1,
+        "a repair write must exit 1: {}",
+        stderr(&out)
+    );
+    assert!(
+        env.read_config().contains("interval = 3600"),
+        "the fallback (inferred integer) must be stored, got: {}",
+        env.read_config()
+    );
+}

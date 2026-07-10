@@ -161,33 +161,34 @@ fn cmd_set(out: &OutCtx, key: &str, raw: &str) -> CmdResult {
     classify_key(key, KeyMode::Write)?;
     let config_file = paths::config_file().map_err(|e| CmdError::err(e.to_string()))?;
     let _lock = ConfigLock::acquire(&config_file)?;
-    let (mut doc, pre_edit) = match config_edit::load_document_with_text(&config_file)? {
+    let (base, pre_edit) = match config_edit::load_document_with_text(&config_file)? {
         Some((doc, text)) => (doc, Some(text)),
         None => (config_edit::new_document(), None),
     };
-    config_edit::set_dotted(&mut doc, key, raw).map_err(CmdError::err)?;
 
-    // Validate-and-write. If the inferred (non-string) value is rejected, retry
-    // the identical edit with the value forced to a string — a duration like
-    // `defaults.interval 3600` infers as an integer the schema rejects, but a
-    // string field that accepts "3600" should still be settable. If both fail,
-    // the string-form error is the informative one (it names the field's own
-    // validation, e.g. the duration parse), so it is what surfaces.
-    let warning = match config_edit::commit_document(&doc, &config_file, pre_edit.as_deref()) {
-        Ok(warning) => warning,
-        Err(inferred_err) => {
-            if config_edit::infers_string(raw) {
-                // Inference already produced a string; a retry is identical.
-                return Err(inferred_err);
-            }
-            config_edit::set_dotted_string(&mut doc, key, raw).map_err(CmdError::err)?;
-            // Both forms failed: the string-form error (the field's own
-            // validation, e.g. a duration parse) is the informative one.
-            config_edit::commit_document(&doc, &config_file, pre_edit.as_deref())?
-        }
+    // Build both candidate documents in memory, then decide the value's type
+    // *once* — from validity, not write side effects — and commit exactly once.
+    // The inferred candidate types `raw` per TOML inference (a duration like
+    // `defaults.interval 3600` infers as an integer); the string candidate forces
+    // the same edit to a string, for a field that accepts "3600" but not 3600.
+    // When inference already yields a string the two are identical, so the string
+    // candidate is skipped (`None`). Which one is committed — and whether that is
+    // a clean write, a refusal, or a repair-with-warning — is
+    // [`select_set_candidate`]'s decision, realized by [`commit_document`].
+    let mut inferred = base.clone();
+    config_edit::set_dotted(&mut inferred, key, raw).map_err(CmdError::err)?;
+    let string_candidate = if config_edit::infers_string(raw) {
+        None
+    } else {
+        let mut string_doc = base;
+        config_edit::set_dotted_string(&mut string_doc, key, raw).map_err(CmdError::err)?;
+        Some(string_doc)
     };
+    let doc = config_edit::select_set_candidate(pre_edit.as_deref(), inferred, string_candidate);
 
-    // Report the value as actually stored (post-inference / post-retry), typed.
+    let warning = config_edit::commit_document(&doc, &config_file, pre_edit.as_deref())?;
+
+    // Report the value as actually stored (post-inference / post-selection), typed.
     let stored = config_edit::get_dotted(&doc, key).and_then(Result::ok);
     let (display, cell) = match stored {
         Some(value) => (value.display(), value_field(&value)),

@@ -444,6 +444,90 @@ pub(crate) fn commit_document(
     }
 }
 
+/// Whether a validation failure is a serde "invalid type" complaint (e.g.
+/// `invalid type: integer …, expected a string`) rather than a value-level one
+/// (an out-of-range integer, an unparseable duration).
+///
+/// This keys off serde's *rendered message* — fragile to a serde wording change,
+/// but locked by the selection tests below. A type error means the candidate's
+/// TOML type did not match the field at all; a non-type error means the type
+/// matched and only the value was wrong, which is the more actionable diagnosis
+/// to surface when an edit is refused.
+fn is_invalid_type_error(err: &ConfigError) -> bool {
+    err.to_string().contains("invalid type:")
+}
+
+/// Chooses which candidate document `config set` should commit, deciding the
+/// value's type *once* from in-memory validity rather than from write side
+/// effects. `inferred` is the type-inferred edit; `string_candidate` is the same
+/// edit forced to a string (`None` when inference already yields a string, so
+/// the two would be byte-identical). `pre_edit_text` is the config's text before
+/// the edit (`None` for a missing file — a valid empty baseline).
+///
+/// The returned document is handed straight to [`commit_document`], which turns
+/// it into the actual outcome (clean write / refuse / repair-warn) from the same
+/// validity it is chosen under — so the exit code and message stay consistent
+/// with the choice:
+///
+/// * A candidate that validates wins, inferred over string on a tie → clean write.
+/// * Otherwise, if the pre-edit config was valid, the edit will be refused: pick
+///   the candidate with the more actionable error — the one whose failure is not
+///   a serde "invalid type" complaint — preferring inferred when both or neither
+///   are type errors.
+/// * If the pre-edit config was already invalid (repair mode), the edit will be
+///   written with a still-invalid warning: pick the candidate that introduces no
+///   new damage — its error equals the pre-edit error — preferring inferred on a
+///   tie, and falling back to inferred when neither matches.
+pub(crate) fn select_set_candidate(
+    pre_edit_text: Option<&str>,
+    inferred: DocumentMut,
+    string_candidate: Option<DocumentMut>,
+) -> DocumentMut {
+    // No distinct string form (inference already produced a string): nothing to
+    // choose between.
+    let Some(string_doc) = string_candidate else {
+        return inferred;
+    };
+
+    let (inferred_err, string_err) = match (
+        document_validity(&inferred.to_string()),
+        document_validity(&string_doc.to_string()),
+    ) {
+        // A candidate that validates wins; inferred over string on a tie.
+        (Ok(()), _) => return inferred,
+        (Err(_), Ok(())) => return string_doc,
+        (Err(i), Err(s)) => (i, s),
+    };
+
+    // Neither candidate validates. What commit will do depends on the pre-edit
+    // validity, so pick the candidate that makes that outcome best.
+    match pre_edit_text.and_then(|t| document_validity(t).err()) {
+        // Pre-edit valid ⇒ the edit will be refused. Surface the more actionable
+        // error: prefer the candidate whose failure is not a serde type mismatch
+        // (its type matched the field; only the value was out of range).
+        None => {
+            if is_invalid_type_error(&inferred_err) && !is_invalid_type_error(&string_err) {
+                string_doc
+            } else {
+                inferred
+            }
+        }
+        // Pre-edit already invalid ⇒ the edit will be written with a warning.
+        // Keep the candidate that introduces no new damage (its error equals the
+        // pre-edit error), preferring inferred on a tie and when neither matches.
+        Some(pre) => {
+            let pre = pre.to_string();
+            if inferred_err.to_string() == pre {
+                inferred
+            } else if string_err.to_string() == pre {
+                string_doc
+            } else {
+                inferred
+            }
+        }
+    }
+}
+
 /// Serializes `doc` and installs it at `path` through the shared durable
 /// atomic-write recipe ([`atomic::write`](crate::atomic::write)): temp file,
 /// `fsync`, `rename(2)`, directory `fsync`. The daemon, which watches this
@@ -895,6 +979,142 @@ path = "/home/u/notes"
     fn document_validity_flags_a_missing_version() {
         assert!(document_validity("version = 1\n").is_ok());
         assert!(document_validity("[daemon]\nlog_level = \"info\"\n").is_err());
+    }
+
+    /// Builds the inferred and (when distinct) string candidate documents the way
+    /// `config set` does: apply the same dotted edit to a fresh parse of `base`
+    /// under type inference and, unless inference already yields a string, forced
+    /// to a string.
+    fn set_candidates(base: &str, key: &str, raw: &str) -> (DocumentMut, Option<DocumentMut>) {
+        let mut inferred = base.parse::<DocumentMut>().unwrap();
+        set_dotted(&mut inferred, key, raw).unwrap();
+        let string_candidate = if infers_string(raw) {
+            None
+        } else {
+            let mut string_doc = base.parse::<DocumentMut>().unwrap();
+            set_dotted_string(&mut string_doc, key, raw).unwrap();
+            Some(string_doc)
+        };
+        (inferred, string_candidate)
+    }
+
+    #[test]
+    fn select_prefers_a_candidate_that_validates() {
+        // A valid integer for an integer field keeps the inferred integer type.
+        let base = "version = 1\n";
+        let (inferred, string_candidate) = set_candidates(base, "daemon.log_retention_days", "14");
+        let chosen = select_set_candidate(Some(base), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("log_retention_days = 14"),
+            "got: {chosen}"
+        );
+    }
+
+    #[test]
+    fn select_no_string_candidate_returns_inferred() {
+        // A bare word already infers as a string: there is no distinct candidate.
+        let base = "version = 1\n";
+        let (inferred, string_candidate) = set_candidates(base, "daemon.log_level", "debug");
+        assert!(string_candidate.is_none(), "a word must infer as a string");
+        let chosen = select_set_candidate(Some(base), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("log_level = \"debug\""),
+            "got: {chosen}"
+        );
+    }
+
+    #[test]
+    fn select_picks_string_when_only_it_validates() {
+        // No real typed field accepts an arbitrary numeric string while rejecting
+        // the integer, so this proves the (inferred-invalid, string-valid) branch
+        // of the pure selector with a representative candidate pair directly.
+        let inferred = "version = 1\n[daemon]\nlog_retention_days = -5\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let string_doc = "version = 1\n".parse::<DocumentMut>().unwrap();
+        let chosen = select_set_candidate(Some("version = 1\n"), inferred, Some(string_doc));
+        // The string (valid) candidate wins over the invalid inferred one.
+        assert!(
+            document_validity(&chosen.to_string()).is_ok(),
+            "the validating candidate must win: {chosen}"
+        );
+    }
+
+    #[test]
+    fn select_refuse_prefers_the_non_type_error_candidate() {
+        // `defaults.interval 3600`: inferred (integer) fails with a serde type
+        // error; the string form fails the duration parse (the actionable one).
+        // On a valid config the edit is refused, so the string candidate — whose
+        // error names the real problem — must be the one commit surfaces.
+        let base = "version = 1\n";
+        let (inferred, string_candidate) = set_candidates(base, "defaults.interval", "3600");
+        let chosen = select_set_candidate(Some(base), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("interval = \"3600\""),
+            "must pick the string candidate whose duration-parse error is actionable: {chosen}"
+        );
+        let err = document_validity(&chosen.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("duration") && !err.contains("invalid type:"),
+            "chosen error must be the duration parse, not a type error: {err}"
+        );
+    }
+
+    #[test]
+    fn select_refuse_keeps_inferred_for_a_value_range_error() {
+        // `daemon.log_retention_days -5`: the inferred integer matches the field's
+        // type and fails on the u32 range; the string form is the serde type
+        // mismatch. The inferred candidate carries the accurate error, so it wins.
+        let base = "version = 1\n";
+        let (inferred, string_candidate) = set_candidates(base, "daemon.log_retention_days", "-5");
+        let chosen = select_set_candidate(Some(base), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("log_retention_days = -5"),
+            "must keep the inferred integer whose range error is actionable: {chosen}"
+        );
+        let err = document_validity(&chosen.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("u32") && !err.contains("invalid type: string"),
+            "chosen error must be the u32 range error, not a string type error: {err}"
+        );
+    }
+
+    /// A config invalid for a reason unrelated to the edit (two watches share a
+    /// name), used to exercise the repair-mode branches of the selector.
+    const DUPLICATE_WATCH: &str = "version = 1\n\n\
+        [[watch]]\nname = \"a\"\npath = \"/a\"\n\n\
+        [[watch]]\nname = \"a\"\npath = \"/b\"\n";
+
+    #[test]
+    fn select_repair_keeps_the_candidate_matching_the_pre_edit_error() {
+        // Repair mode: the config is already invalid (duplicate watch). Setting a
+        // well-typed integer leaves that same error in place — the edit adds no
+        // new damage — so the inferred integer is kept and written with a warning.
+        let (inferred, string_candidate) =
+            set_candidates(DUPLICATE_WATCH, "daemon.log_retention_days", "30");
+        let chosen = select_set_candidate(Some(DUPLICATE_WATCH), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("log_retention_days = 30"),
+            "must keep the inferred integer that preserves the pre-edit error: {chosen}"
+        );
+    }
+
+    #[test]
+    fn select_repair_falls_back_to_inferred_when_neither_matches() {
+        // Repair mode where both candidates introduce a *new* error (neither is
+        // the pre-edit duplicate-watch error): the inferred candidate is the
+        // fallback, written with a still-invalid warning.
+        let (inferred, string_candidate) =
+            set_candidates(DUPLICATE_WATCH, "defaults.interval", "3600");
+        let chosen = select_set_candidate(Some(DUPLICATE_WATCH), inferred, string_candidate);
+        assert!(
+            chosen.to_string().contains("interval = 3600"),
+            "must fall back to the inferred candidate: {chosen}"
+        );
     }
 
     #[test]
