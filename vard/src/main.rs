@@ -1,4 +1,5 @@
 mod cli;
+mod cmd;
 mod config;
 mod config_edit;
 mod daemon;
@@ -42,6 +43,10 @@ fn main() -> ExitCode {
         Some(Command::Watch {
             command: Some(watch_cmd),
         }) => watch::run(watch_cmd, cli.color, cli.format),
+        Some(Command::Snapshot(args)) => cmd::snapshot::run(args, cli.color, cli.format),
+        Some(Command::Log(args)) => cmd::log::run(args, cli.color, cli.format),
+        Some(Command::Diff(args)) => cmd::diff::run(args, cli.color, cli.format),
+        Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
         None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }

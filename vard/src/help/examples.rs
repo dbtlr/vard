@@ -83,6 +83,50 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
             format!("{watch} resume notes"),
             "resume a paused watch".to_string(),
         )]
+    } else if cmd_path == format!("{BIN_NAME} snapshot") {
+        vec![
+            (
+                format!("{BIN_NAME} snapshot"),
+                "snapshot every configured watch now".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} snapshot notes -m \"before the demo\""),
+                "snapshot notes with a message on the subject".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} log") {
+        vec![
+            (
+                format!("{BIN_NAME} log notes"),
+                "show the full snapshot history of notes".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} log notes --since 2h"),
+                "show only snapshots from the last two hours".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} diff") {
+        vec![
+            (
+                format!("{BIN_NAME} diff notes"),
+                "show uncommitted changes against the last snapshot".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} diff notes HEAD~5"),
+                "show everything that changed since five snapshots ago".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} restore") {
+        vec![
+            (
+                format!("{BIN_NAME} restore notes --at 3d --dry-run"),
+                "preview restoring to three days ago".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} restore notes --ref a1b2c3d --file todo.md"),
+                "restore one file from a specific snapshot".to_string(),
+            ),
+        ]
     } else {
         vec![]
     }

@@ -202,6 +202,10 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
     let sub_name: Option<&str> = cli.command.as_ref().map(|c| match c {
         Command::Run => "run",
         Command::Watch { .. } => "watch",
+        Command::Snapshot(_) => "snapshot",
+        Command::Log(_) => "log",
+        Command::Diff(_) => "diff",
+        Command::Restore(_) => "restore",
     });
     let (cmd, path) =
         match sub_name.and_then(|n| root.get_subcommands().find(|c| c.get_name() == n)) {

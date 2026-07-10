@@ -141,6 +141,162 @@ selectors accept either.
         #[command(subcommand)]
         command: Option<WatchCommand>,
     },
+
+    /// Take a manual snapshot now: sweep the watched directory and commit its
+    /// current state into version control.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Take a manual snapshot now.
+
+Sweeps a watched directory and commits its current state into version control, \
+the same operation the daemon performs automatically — just on demand. With no \
+selector every configured watch is snapshotted; with a `<name|path>` only that \
+one is. Paused watches are snapshotted too: a manual snapshot is an explicit \
+request, so pausing (which only stops the daemon's automatic snapshots) does \
+not block it.
+
+If the vard daemon is already running it owns the repositories, so the snapshot \
+is handed to it as a request and taken asynchronously; the command reports that \
+the request was queued, not the commit result. With no daemon running the \
+snapshot is taken in-process under the single-instance lock, and the new \
+commit (or `no changes`) is reported per watch.
+
+A repository that is not in a safe state — mid-merge, mid-rebase, on the wrong \
+branch, or with a detached HEAD — is skipped with an explanation and the \
+command exits 1 (attention), never committing into an in-progress operation.
+
+`-m` prepends a message paragraph to the generated snapshot subject.")]
+    Snapshot(SnapshotArgs),
+
+    /// Show a watch's snapshot history, most recent first.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Show a watch's snapshot history, most recent first.
+
+Read-only: reads the watch's version-control log directly and never takes a \
+lock or mutates anything, so it is safe to run against a watch the daemon is \
+actively snapshotting. Output follows the global `--format`: human-readable \
+record blocks on a terminal (each snapshot's id, time, subject, and trigger), \
+and JSON or JSONL when piped.
+
+`--since` keeps only snapshots at or after a point in the past, given as a \
+humane duration counted back from now — `2h`, `3d`, `1h30m`.")]
+    Log(LogArgs),
+
+    /// Show a raw unified diff for a watch: working tree against a snapshot.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Show a raw unified diff for a watch.
+
+Read-only. With no reference the diff is the watched directory's working tree \
+against its last snapshot (`HEAD`) — the uncommitted changes a snapshot would \
+capture. Given a `<ref>` (a snapshot id, branch, tag, or any revision git \
+understands), the diff runs from that reference to the current working tree, \
+showing everything that changed since it.
+
+The output is a raw unified diff and nothing else: on a terminal it is paged, \
+and piped it passes through untouched so it feeds `patch`, `git apply`, or a \
+file directly. Because a unified diff is inherently a text artifact, `diff` is \
+text-only: an explicit `--format json` or `--format jsonl` is rejected. The \
+piped default still yields plain diff text, so `vard diff notes > changes.patch` \
+works as expected.")]
+    Diff(DiffArgs),
+
+    /// Restore a watch's tree (or one file) to a prior snapshot, protecting the
+    /// current state first.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Restore a watch's working tree, or a single file within it, to a prior state.
+
+Before touching the tree, vard ALWAYS takes a protective snapshot of the \
+current state, so a restore can never destroy uncommitted work — the state you \
+are about to overwrite is committed to history first and can be recovered from \
+the log.
+
+Choose the point to restore from with exactly one of:
+
+  --ref <sha>   a snapshot id (or any revision git understands)
+  --at <when>   the snapshot current as of a past time — a duration counted
+                back from now (`2h`, `3d`), or an absolute date `YYYY-MM-DD`
+                or `YYYY-MM-DD HH:MM` (interpreted as UTC). Natural-language
+                forms like `yesterday 3pm` are deliberately NOT supported and
+                are rejected with this list.
+
+`--file <subpath>` restores just that one path (relative to the watch root) \
+instead of the whole tree. `--dry-run` previews the differences a restore \
+would overwrite, via a diff, without changing anything (and without taking the \
+protective snapshot, since nothing is modified).
+
+If the daemon is running it keeps ownership of the repository; the restore \
+still proceeds, and the daemon will snapshot the restored state afterward — \
+that is by design. Restoring a path that does not exist at the chosen \
+reference reports a friendly error naming the path and the reference.")]
+    Restore(RestoreArgs),
+}
+
+/// Arguments to `vard snapshot`.
+#[derive(Debug, Args)]
+pub struct SnapshotArgs {
+    /// The watch to snapshot, by name or by path. Omit to snapshot every
+    /// configured watch.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: Option<String>,
+
+    /// A message paragraph prepended to the generated snapshot subject.
+    #[arg(short = 'm', long = "message", value_name = "MSG")]
+    pub message: Option<String>,
+}
+
+/// Arguments to `vard log`.
+#[derive(Debug, Args)]
+pub struct LogArgs {
+    /// The watch whose history to show, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// Keep only snapshots at or after this far in the past, e.g. 2h or 3d.
+    #[arg(long, value_name = "DURATION")]
+    pub since: Option<String>,
+}
+
+/// Arguments to `vard diff`.
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// The watch to diff, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// The reference to diff from (a snapshot id, branch, or tag). Defaults to
+    /// HEAD, the last snapshot.
+    #[arg(value_name = "REF")]
+    pub reference: Option<String>,
+}
+
+/// Arguments to `vard restore`.
+#[derive(Debug, Args)]
+pub struct RestoreArgs {
+    /// The watch to restore, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// Restore from this revision (a snapshot id, branch, or tag).
+    #[arg(long = "ref", value_name = "SHA", conflicts_with = "at")]
+    pub reference: Option<String>,
+
+    /// Restore the snapshot current as of a past time: a duration back from now
+    /// (2h, 3d), or an absolute UTC date YYYY-MM-DD optionally with HH:MM.
+    #[arg(long, value_name = "WHEN")]
+    pub at: Option<String>,
+
+    /// Restore only this path (relative to the watch root) instead of the whole
+    /// tree.
+    #[arg(long, value_name = "SUBPATH")]
+    pub file: Option<PathBuf>,
+
+    /// Preview the differences a restore would overwrite, without changing the
+    /// tree or taking a protective snapshot.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// The `vard watch` subcommands.
