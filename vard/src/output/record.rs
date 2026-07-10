@@ -66,6 +66,17 @@ impl RecordField {
         }
     }
 
+    /// An optional boolean field: `Absent` (JSON `null`) when `None`, a boolean
+    /// otherwise. Keeps a field's JSON type stable (boolean-or-null, never a
+    /// string) whether or not the config it came from fully resolved.
+    pub(crate) fn opt_bool(key: &'static str, value: Option<bool>) -> Self {
+        RecordField {
+            key,
+            cell: value.map(Cell::Bool).unwrap_or(Cell::Absent),
+            highlight: false,
+        }
+    }
+
     /// Sets the records-form highlight.
     pub(crate) fn highlighted(mut self, on: bool) -> Self {
         self.highlight = on;
@@ -250,6 +261,24 @@ mod tests {
         assert_eq!(
             s,
             r#"{"path":"/home/u/notes","branch":"main","remote":null,"sync":true,"paused":false}"#
+        );
+    }
+
+    #[test]
+    fn opt_bool_is_boolean_or_null_never_a_string() {
+        let mut out = Vec::new();
+        let rec = Record {
+            header: None,
+            fields: vec![
+                RecordField::opt_bool("set_true", Some(true)),
+                RecordField::opt_bool("set_false", Some(false)),
+                RecordField::opt_bool("unset", None),
+            ],
+        };
+        write_json_object(&mut out, &rec).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"set_true":true,"set_false":false,"unset":null}"#
         );
     }
 

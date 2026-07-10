@@ -408,6 +408,129 @@ fn list_warns_but_still_lists_a_duplicate_name_config() {
 }
 
 #[test]
+fn list_emits_sync_as_a_boolean_in_both_valid_and_lenient_paths() {
+    // The machine JSON must carry `sync` with the same type — boolean, or null
+    // when genuinely unknown — regardless of whether the config fully resolved,
+    // so a consumer's parse never depends on config validity.
+    let env = Env::new();
+
+    // Valid path: a resolved watch lists `sync` as a JSON boolean.
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    let list = env.vard(&["--format", "json", "watch", "list"]);
+    assert!(list.status.success(), "stderr: {}", stderr(&list));
+    let json = stdout(&list);
+    assert!(
+        json.contains("\"sync\":true") || json.contains("\"sync\":false"),
+        "valid path must emit sync as a boolean: {json}"
+    );
+    assert!(
+        !json.contains("\"sync\":\"yes\"") && !json.contains("\"sync\":\"no\""),
+        "sync must never be a string: {json}"
+    );
+
+    // Lenient path: an invalid (duplicate-name) config still renders, and `sync`
+    // keeps the same JSON types — boolean when set, null when unset.
+    write_config(
+        &env,
+        "version = 1\n\n[[watch]]\nname = \"dup\"\npath = \"/a\"\nsync = false\n\n\
+         [[watch]]\nname = \"dup\"\npath = \"/b\"\n",
+    );
+    let list = env.vard(&["--format", "json", "watch", "list"]);
+    assert_eq!(list.status.code(), Some(1), "stderr: {}", stderr(&list));
+    let json = stdout(&list);
+    assert!(
+        json.contains("\"sync\":false"),
+        "a set sync must render as a boolean: {json}"
+    );
+    assert!(
+        json.contains("\"sync\":null"),
+        "an unset sync must render as null: {json}"
+    );
+    assert!(
+        !json.contains("\"sync\":\"no\""),
+        "sync must never be a string: {json}"
+    );
+}
+
+#[test]
+fn remove_repairs_an_already_invalid_duplicate_path_config() {
+    // A hand-edited config with two watches on the same path is already invalid
+    // (a duplicate path). Removing one of the pair is the natural repair, and it
+    // must succeed (exit 0) — the pre-write revalidation refuses only edits that
+    // take a *valid* config to invalid, never edits that repair a broken one.
+    let env = Env::new();
+    write_config(
+        &env,
+        "version = 1\n\n[[watch]]\nname = \"one\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"two\"\npath = \"/a\"\n",
+    );
+
+    let out = env.vard(&["watch", "remove", "one"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    // The surviving config resolves cleanly: `list` exits 0 with a single watch.
+    let list = env.vard(&["--format", "json", "watch", "list"]);
+    assert!(list.status.success(), "stderr: {}", stderr(&list));
+    let json = stdout(&list);
+    assert_eq!(json.matches("\"name\":").count(), 1, "got: {json}");
+    assert!(json.contains("\"name\":\"two\""), "got: {json}");
+}
+
+#[test]
+fn pause_on_an_already_invalid_config_writes_but_warns() {
+    // Pausing a watch unrelated to a pre-existing duplicate-path breakage must
+    // not be blocked: the edit did not introduce the invalidity, so it is
+    // honored (the pause lands) but flagged — exit 1 (attention) with a warning
+    // that the config is still not fully valid.
+    let env = Env::new();
+    write_config(
+        &env,
+        "version = 1\n\n[[watch]]\nname = \"one\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"two\"\npath = \"/a\"\n\n\
+         [[watch]]\nname = \"other\"\npath = \"/b\"\n",
+    );
+
+    let out = env.vard(&["watch", "pause", "other"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("still not fully valid"),
+        "a warning must name the remaining invalidity: {}",
+        stderr(&out)
+    );
+    // The pause landed despite the pre-existing invalidity.
+    assert!(
+        env.config_text().contains("paused = true"),
+        "the pause must be written: {}",
+        env.config_text()
+    );
+}
+
+#[test]
+fn add_that_breaks_a_valid_config_is_refused() {
+    // Starting from a valid config, an add that would make it invalid (here a
+    // [defaults] interval of 0s that every inheriting watch rejects) is a hard
+    // refusal — exit 2, config untouched. The CLI must never introduce breakage.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    write_config(&env, "version = 1\n\n[defaults]\ninterval = \"0s\"\n");
+    let before = env.config_text();
+
+    let out = env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("interval"),
+        "the error should name the offending field: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        env.config_text(),
+        before,
+        "a breaking add must write nothing"
+    );
+}
+
+#[test]
 fn add_registers_a_linked_worktree_writing_the_shared_exclude() {
     // `.git` in a linked worktree is a file, not a directory. The exclude file
     // must be resolved via git (the shared info/exclude), and the add succeeds.

@@ -150,6 +150,17 @@ enum Registration {
     Relink,
 }
 
+/// The repository decision resolved *before* the config lock is taken, so an
+/// interactive `git init` prompt (a human wait) never spans the blocking flock
+/// and wedges concurrent `vard watch` writers.
+enum RepoPlan {
+    /// The path is already a git repository; its backend is carried forward.
+    Existing(GitBackend),
+    /// The path is not a repository, but an init was authorized (`--init`, or an
+    /// interactive "yes"). The init itself runs later, under the lock.
+    Init,
+}
+
 fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     // Canonicalize the path (which requires it to exist); this is the watch's
     // identity. A non-existent directory is a clear, early error.
@@ -205,6 +216,12 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         args.branch.as_deref(),
     )?;
 
+    // Resolve the repository decision — including any interactive `git init`
+    // prompt — *before* acquiring the lock, so a human wait never blocks other
+    // `vard watch` writers. The init itself is deferred until after the
+    // under-lock conflict re-check.
+    let repo_plan = plan_repo(&canonical, args.init)?;
+
     // Serialize the whole read→plan→mutate→write cycle against concurrent
     // `vard watch` writers, so lost updates and stale relocations cannot race.
     let _lock = ConfigLock::acquire(&paths.config_file)?;
@@ -218,16 +235,15 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     let relinked = matches!(registration, Registration::Relink);
     let mut doc =
         config_edit::load_document(&paths.config_file)?.unwrap_or_else(config_edit::new_document);
+    // The config's validity *before* this edit decides how strictly the result
+    // is judged (see [`commit_document`]).
+    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
 
-    // Ensure the path is a git repository (offering / performing init), then
-    // seed vard's default excludes into the repo's resolved exclude file (which
-    // is correct even for a worktree or submodule, where `.git` is a file).
-    let (initialized, backend) = ensure_repo(&canonical, args.init, args.branch.as_deref())?;
-    let exclude_path = backend
-        .info_exclude_path()
-        .map_err(|e| CmdError::err(format!("resolving git excludes: {e}")))?;
-    excludes::ensure(&exclude_path)
-        .map_err(|e| CmdError::err(format!("writing git excludes: {e}")))?;
+    // Realize the repository plan under the lock: perform any authorized init,
+    // then seed vard's default excludes into the repo's resolved exclude file
+    // (which is correct even for a worktree or submodule, where `.git` is a
+    // file).
+    let initialized = init_and_seed_excludes(&canonical, repo_plan, args.branch.as_deref())?;
 
     let entry = WatchEntry {
         name: name.clone(),
@@ -251,9 +267,8 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         }
     }
     // Validate the exact bytes to be written before committing them, so the CLI
-    // can never install a config that would wedge the daemon's reloads.
-    validate_document(&doc, &paths.config_file)?;
-    config_edit::write_atomic(&paths.config_file, &doc)?;
+    // can never take a valid config to invalid and wedge the daemon's reloads.
+    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
@@ -269,16 +284,14 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     emit_action(out, &human, &record)
 }
 
-/// Ensures `path` is a git repository rooted there, initializing one when it is
-/// not and doing so is authorized. Returns whether an init happened and the
-/// backend for the (now guaranteed) repository.
-fn ensure_repo(
-    path: &Path,
-    init_flag: bool,
-    branch: Option<&str>,
-) -> Result<(bool, GitBackend), CmdError> {
+/// Resolves the repository decision for `path` *without holding the config
+/// lock*: an existing repo is carried forward, a missing one is authorized for
+/// init only via `--init` or an interactive "yes", and a declined or
+/// non-interactive miss is refused. Any human prompt happens here, before the
+/// lock, so an unanswered prompt cannot wedge concurrent writers.
+fn plan_repo(path: &Path, init_flag: bool) -> Result<RepoPlan, CmdError> {
     match GitBackend::detect(path) {
-        Ok(Some(backend)) => Ok((false, backend)),
+        Ok(Some(backend)) => Ok(RepoPlan::Existing(backend)),
         Ok(None) => {
             let approved = if init_flag {
                 true
@@ -300,12 +313,35 @@ fn ensure_repo(
                     path.display()
                 )));
             }
-            let backend = GitBackend::init(path, branch)
-                .map_err(|e| CmdError::err(format!("git init {}: {e}", path.display())))?;
-            Ok((true, backend))
+            Ok(RepoPlan::Init)
         }
         Err(e) => Err(CmdError::err(format!("checking {}: {e}", path.display()))),
     }
+}
+
+/// Realizes a [`RepoPlan`] under the config lock: performs a planned `git init`
+/// (idempotent, so a repo appearing between plan and now is harmless), then
+/// seeds vard's default excludes into the repo's resolved exclude file. Returns
+/// whether an init happened.
+fn init_and_seed_excludes(
+    path: &Path,
+    plan: RepoPlan,
+    branch: Option<&str>,
+) -> Result<bool, CmdError> {
+    let (initialized, backend) = match plan {
+        RepoPlan::Existing(backend) => (false, backend),
+        RepoPlan::Init => {
+            let backend = GitBackend::init(path, branch)
+                .map_err(|e| CmdError::err(format!("git init {}: {e}", path.display())))?;
+            (true, backend)
+        }
+    };
+    let exclude_path = backend
+        .info_exclude_path()
+        .map_err(|e| CmdError::err(format!("resolving git excludes: {e}")))?;
+    excludes::ensure(&exclude_path)
+        .map_err(|e| CmdError::err(format!("writing git excludes: {e}")))?;
+    Ok(initialized)
 }
 
 /// Asks the user, on a terminal, whether to initialize a repository. The prompt
@@ -425,13 +461,13 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while removing".to_string()))?;
+    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
     if !config_edit::remove_watch(&mut doc, &name) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be removed"
         )));
     }
-    validate_document(&doc, &paths.config_file)?;
-    config_edit::write_atomic(&paths.config_file, &doc)?;
+    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     // --purge drops vard's own per-watch metadata; the repository is never
     // touched, purge or not.
@@ -525,7 +561,9 @@ fn raw_watch_record(w: &WatchConfig) -> Record {
             RecordField::opt("remote", w.remote.clone()),
             RecordField::opt("trigger", w.trigger.clone()),
             RecordField::opt("interval", w.interval.map(record::format_duration)),
-            RecordField::opt("sync", w.sync.map(|s| if s { "yes" } else { "no" })),
+            // Boolean-or-null, matching the resolved path's `sync` type — a
+            // machine consumer's parse must not depend on config validity.
+            RecordField::opt_bool("sync", w.sync),
             RecordField::bool("paused", w.paused).highlighted(w.paused),
         ],
     }
@@ -542,13 +580,13 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
+    let pre_edit_invalid = document_validity(&doc.to_string()).is_err();
     if !config_edit::set_paused(&mut doc, &name, paused) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be updated"
         )));
     }
-    validate_document(&doc, &paths.config_file)?;
-    config_edit::write_atomic(&paths.config_file, &doc)?;
+    commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
 
     let human = if was == paused {
         format!(
@@ -592,23 +630,49 @@ fn require_config(paths: &WatchPaths, op: &str) -> Result<Config, CmdError> {
     })
 }
 
-/// Validates the exact bytes a mutation is about to write: re-parses the
-/// serialized document through the read layer and resolves every watch. This
-/// mirrors the daemon's validate-new-before-swap discipline, so the CLI can
-/// never install a config that would wedge a reload — and it subsumes per-field
-/// gaps (defaults inheritance, duplicate names/paths) that the pre-mutation
-/// checks do not see. Paused watches are validated too (via `resolve_all`).
-fn validate_document(doc: &DocumentMut, config_file: &Path) -> CmdResult {
-    let text = doc.to_string();
-    let refuse = |e: ConfigError| {
-        CmdError::err(format!(
-            "refusing to write {}: the result would be invalid: {e}",
-            config_file.display()
-        ))
-    };
-    let config = Config::from_toml_str(&text).map_err(refuse)?;
-    config.resolve_all().map_err(refuse)?;
+/// Re-parses a serialized document through the read layer and resolves every
+/// watch, returning the first validation error. This mirrors the daemon's
+/// validate-before-swap discipline and subsumes per-field gaps (defaults
+/// inheritance, duplicate names/paths) that the pre-mutation checks do not see.
+/// Paused watches are validated too (via `resolve_all`).
+fn document_validity(text: &str) -> Result<(), ConfigError> {
+    Config::from_toml_str(text)?.resolve_all()?;
     Ok(())
+}
+
+/// Validates the exact bytes a mutation is about to write, then writes them —
+/// applying the "never break a working config" invariant relative to the
+/// config's validity *before* the edit (`pre_edit_invalid`):
+///
+/// * post-edit valid → write and succeed (a clean edit, or a repair that made an
+///   invalid config valid again — either way, silently).
+/// * pre-edit valid, post-edit invalid → refuse (exit 2): the CLI must never
+///   turn a working config into a broken one that would wedge the daemon.
+/// * pre-edit invalid, post-edit invalid → write anyway, warn, and exit 1
+///   (attention): the config was already broken, so blocking an unrelated
+///   pause/remove would only trap the user — the natural repair path (e.g.
+///   `remove`-ing one of a pair of duplicate paths) must be allowed to proceed.
+fn commit_document(doc: &DocumentMut, config_file: &Path, pre_edit_invalid: bool) -> CmdResult {
+    let text = doc.to_string();
+    match document_validity(&text) {
+        Ok(()) => {
+            config_edit::write_atomic(config_file, doc)?;
+            Ok(())
+        }
+        Err(e) if pre_edit_invalid => {
+            // The edit did not introduce the breakage, so honor it — but flag
+            // that the config is still not fully valid.
+            config_edit::write_atomic(config_file, doc)?;
+            Err(CmdError::attention(format!(
+                "wrote {}, but the config is still not fully valid: {e}",
+                config_file.display()
+            )))
+        }
+        Err(e) => Err(CmdError::err(format!(
+            "refusing to write {}: the edit would make a valid config invalid: {e}",
+            config_file.display()
+        ))),
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
