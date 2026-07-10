@@ -25,6 +25,7 @@ test -x "$VARD" || fail "$VARD not found — build first: cargo build -p vard --
 # broken interceptor) fails loudly.
 "$VARD" -h | grep -q 'For full help, run' || fail "vard -h is missing the v2 short-help footer"
 "$VARD" --help | grep -q '^EXAMPLES$' || fail "vard --help is missing the EXAMPLES section"
+"$VARD" --help | grep -q 'watch' || fail "vard --help does not mention the watch command"
 "$VARD" run --help | grep -q 'SIGHUP' || fail "vard run --help is missing the lifecycle prose"
 "$VARD" help run >/dev/null || fail "vard help run did not render"
 
@@ -50,6 +51,9 @@ for f in \
   "$TARGET_DIR"/man/vard-watch-add.1; do
   test -s "$f" || fail "$f is missing or empty — stale artifact?"
 done
+# The root vard.1 must name its subcommands, not merely be non-empty.
+grep -q 'run' "$TARGET_DIR"/man/vard.1 || fail "vard.1 does not name the 'run' subcommand — stale artifact?"
+grep -q 'watch' "$TARGET_DIR"/man/vard.1 || fail "vard.1 does not name the 'watch' subcommand — stale artifact?"
 grep -q 'run' "$TARGET_DIR"/man/vard-run.1 || fail "vard-run.1 does not name the 'run' subcommand — stale artifact?"
 grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name the 'add' subcommand — stale artifact?"
 
