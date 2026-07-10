@@ -1,56 +1,30 @@
-//! vard's default git excludes, written into a watched repo's
-//! `.git/info/exclude`.
+//! vard's default git excludes, written into a watched repo's private exclude
+//! file (`info/exclude`).
 //!
 //! When `vard watch add` registers a repository, it seeds that repo's
-//! *private* exclude file — `.git/info/exclude`, never the user's tracked
+//! *private* exclude file — `info/exclude`, never the user's tracked
 //! `.gitignore` — with a curated set of patterns: build output and caches that
 //! would bloat snapshots, OS cruft, and well-known secret shapes that must never
-//! be committed. The patterns live inside a marked block so the write is
-//! idempotent: a re-add rewrites only vard's block and leaves every line a user
-//! added above or below it untouched.
+//! be committed. The pattern *catalog* is shared with the correctness crate
+//! ([`vard_core::excludes`]) so the future daemon-side quarantine consumes the
+//! same list; this module owns only how they render into a file.
+//!
+//! The patterns live inside a marked block so the write is idempotent: a re-add
+//! rewrites only vard's block and leaves every line a user added above or below
+//! it untouched, and it preserves the file's existing line endings (a CRLF
+//! exclude file stays CRLF).
 
 use std::fs;
 use std::io;
 use std::path::Path;
+
+use vard_core::excludes::{BUILD_CACHE_PATTERNS, OS_CRUFT_PATTERNS, SECRET_PATTERNS};
 
 /// Opening marker of vard's managed block. A line equal to this (trimmed) marks
 /// where the block begins.
 const BLOCK_BEGIN: &str = "# >>> vard managed excludes >>>";
 /// Closing marker of vard's managed block.
 const BLOCK_END: &str = "# <<< vard managed excludes <<<";
-
-/// The patterns vard writes, in gitignore dialect. Comment lines document the
-/// groups; blank-line-free so the rendered block stays compact. Secrets come
-/// first so they are visually prominent.
-const DEFAULT_EXCLUDES: &[&str] = &[
-    "# Secrets — never snapshot credentials, keys, or environment files.",
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "id_rsa",
-    "id_rsa*",
-    "id_dsa*",
-    "id_ecdsa*",
-    "id_ed25519*",
-    ".netrc",
-    ".aws/credentials",
-    "gcloud-credentials.json",
-    "# Dependency, build, and cache directories.",
-    "node_modules/",
-    "target/",
-    "dist/",
-    "build/",
-    ".cache/",
-    "__pycache__/",
-    ".venv/",
-    "venv/",
-    "# OS and editor cruft.",
-    ".DS_Store",
-    "Thumbs.db",
-];
 
 /// What [`ensure`] did to the exclude file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +35,10 @@ pub(crate) enum ExcludeOutcome {
     Unchanged,
 }
 
-/// Renders vard's managed exclude block (markers included), always ending in a
-/// newline.
+/// Renders vard's managed exclude block (markers included) with `\n` line
+/// endings, always ending in a newline. [`splice_block`] rewrites the endings
+/// to match the target file. The patterns come from the shared
+/// [`vard_core::excludes`] catalog; the comment headers are presentation.
 fn render_block() -> String {
     let mut s = String::new();
     s.push_str(BLOCK_BEGIN);
@@ -70,28 +46,46 @@ fn render_block() -> String {
     s.push_str(
         "# Managed by `vard watch add`; edit above or below this block to keep your rules.\n",
     );
-    for line in DEFAULT_EXCLUDES {
-        s.push_str(line);
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "# Secrets — never snapshot credentials, keys, or environment files.",
+            SECRET_PATTERNS,
+        ),
+        (
+            "# Dependency, build, and cache directories.",
+            BUILD_CACHE_PATTERNS,
+        ),
+        ("# OS and editor cruft.", OS_CRUFT_PATTERNS),
+    ];
+    for (heading, patterns) in groups {
+        s.push_str(heading);
         s.push('\n');
+        for pattern in *patterns {
+            s.push_str(pattern);
+            s.push('\n');
+        }
     }
     s.push_str(BLOCK_END);
     s.push('\n');
     s
 }
 
-/// Ensures `<repo_path>/.git/info/exclude` carries vard's managed block,
-/// idempotently.
+/// Ensures the repository's `info/exclude` file (resolved by the caller via the
+/// git backend, so it is correct for worktrees and submodules) carries vard's
+/// managed block, idempotently.
 ///
 /// If the file has no managed block, the block is appended (after the user's
 /// existing content, separated by a blank line). If it already has one, that
 /// block is replaced in place — content outside the markers is preserved
-/// verbatim. A re-add with the same defaults is a no-op ([`ExcludeOutcome::Unchanged`]).
-pub(crate) fn ensure(repo_path: &Path) -> io::Result<ExcludeOutcome> {
-    let info_dir = repo_path.join(".git").join("info");
-    fs::create_dir_all(&info_dir)?;
-    let exclude_path = info_dir.join("exclude");
+/// verbatim, and the file's dominant line ending is preserved. A re-add with
+/// the same defaults is a no-op ([`ExcludeOutcome::Unchanged`]), including on a
+/// CRLF file.
+pub(crate) fn ensure(exclude_path: &Path) -> io::Result<ExcludeOutcome> {
+    if let Some(parent) = exclude_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
-    let existing = match fs::read_to_string(&exclude_path) {
+    let existing = match fs::read_to_string(exclude_path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
@@ -101,17 +95,33 @@ pub(crate) fn ensure(repo_path: &Path) -> io::Result<ExcludeOutcome> {
     if updated == existing {
         return Ok(ExcludeOutcome::Unchanged);
     }
-    fs::write(&exclude_path, updated)?;
+    fs::write(exclude_path, updated)?;
     Ok(ExcludeOutcome::Written)
 }
 
 /// Splices `block` into `existing`, replacing any current managed block or
 /// appending a fresh one. Pure and line-oriented, so it is exhaustively
 /// testable without touching a filesystem.
+///
+/// Line endings are preserved: the block is re-lined to the file's dominant
+/// ending (CRLF if the file predominantly uses it, else LF), and lines outside
+/// the block keep their original endings verbatim. Marker detection trims a
+/// trailing `\r` so a CRLF file's markers still match. This makes a re-add on a
+/// CRLF file byte-identical rather than silently rewriting it to LF.
 fn splice_block(existing: &str, block: &str) -> String {
-    let lines: Vec<&str> = existing.lines().collect();
-    let begin = lines.iter().position(|l| l.trim() == BLOCK_BEGIN);
-    let end = lines.iter().position(|l| l.trim() == BLOCK_END);
+    let ending = if is_crlf_dominant(existing) {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let block = relined(block, ending);
+
+    // `split_inclusive` keeps each line's own terminator, so lines outside the
+    // block round-trip unchanged.
+    let lines: Vec<&str> = existing.split_inclusive('\n').collect();
+    let is_marker = |line: &str, marker: &str| line.trim_end_matches(['\r', '\n']).trim() == marker;
+    let begin = lines.iter().position(|l| is_marker(l, BLOCK_BEGIN));
+    let end = lines.iter().position(|l| is_marker(l, BLOCK_END));
 
     if let (Some(b), Some(e)) = (begin, end)
         && b <= e
@@ -120,12 +130,10 @@ fn splice_block(existing: &str, block: &str) -> String {
         let mut out = String::new();
         for line in &lines[..b] {
             out.push_str(line);
-            out.push('\n');
         }
-        out.push_str(block);
+        out.push_str(&block);
         for line in &lines[e + 1..] {
             out.push_str(line);
-            out.push('\n');
         }
         return out;
     }
@@ -134,12 +142,34 @@ fn splice_block(existing: &str, block: &str) -> String {
     let mut out = existing.to_string();
     if !out.is_empty() {
         if !out.ends_with('\n') {
-            out.push('\n');
+            out.push_str(ending);
         }
-        out.push('\n');
+        out.push_str(ending);
     }
-    out.push_str(block);
+    out.push_str(&block);
     out
+}
+
+/// Whether `text` predominantly uses CRLF line endings. An empty or LF-only
+/// file is not CRLF; ties (equal counts) favor CRLF so a mixed file that a
+/// CRLF editor produced stays CRLF.
+fn is_crlf_dominant(text: &str) -> bool {
+    let total = text.matches('\n').count();
+    if total == 0 {
+        return false;
+    }
+    let crlf = text.matches("\r\n").count();
+    crlf * 2 >= total
+}
+
+/// Rewrites `block`'s `\n` line endings to `ending`. A no-op when `ending` is
+/// already `\n`. `block` never contains a bare `\r`, so this cannot double up.
+fn relined(block: &str, ending: &str) -> String {
+    if ending == "\n" {
+        block.to_string()
+    } else {
+        block.replace('\n', ending)
+    }
 }
 
 #[cfg(test)]
@@ -189,34 +219,58 @@ mod tests {
     #[test]
     fn ensure_writes_then_reports_unchanged_on_second_call() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        fs::create_dir_all(repo.join(".git")).unwrap();
+        let exclude = dir.path().join(".git/info/exclude");
 
-        assert_eq!(ensure(repo).unwrap(), ExcludeOutcome::Written);
-        let content = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(ensure(&exclude).unwrap(), ExcludeOutcome::Written);
+        let content = fs::read_to_string(&exclude).unwrap();
         assert!(content.contains("target/"));
 
         assert_eq!(
-            ensure(repo).unwrap(),
+            ensure(&exclude).unwrap(),
             ExcludeOutcome::Unchanged,
             "a second ensure with identical defaults must not rewrite"
         );
         // No duplication of the block on the second pass.
-        let content2 = fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        let content2 = fs::read_to_string(&exclude).unwrap();
         assert_eq!(content2.matches(BLOCK_BEGIN).count(), 1);
     }
 
     #[test]
     fn ensure_preserves_preexisting_exclude_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let info = repo.join(".git/info");
-        fs::create_dir_all(&info).unwrap();
-        fs::write(info.join("exclude"), "# git's default\n*.tmp\n").unwrap();
+        let exclude = dir.path().join(".git/info/exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        fs::write(&exclude, "# git's default\n*.tmp\n").unwrap();
 
-        ensure(repo).unwrap();
-        let content = fs::read_to_string(info.join("exclude")).unwrap();
+        ensure(&exclude).unwrap();
+        let content = fs::read_to_string(&exclude).unwrap();
         assert!(content.contains("*.tmp"), "user's line must survive");
         assert!(content.contains(BLOCK_BEGIN));
+    }
+
+    #[test]
+    fn ensure_is_byte_idempotent_on_a_crlf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exclude = dir.path().join(".git/info/exclude");
+        fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        // A CRLF file, as a Windows editor would produce.
+        fs::write(&exclude, "# my rules\r\n*.tmp\r\n").unwrap();
+
+        assert_eq!(ensure(&exclude).unwrap(), ExcludeOutcome::Written);
+        let once = fs::read(&exclude).unwrap();
+        // The managed block must have been written with CRLF endings, not LF.
+        let text = String::from_utf8(once.clone()).unwrap();
+        assert!(text.contains("\r\n# >>> vard managed excludes >>>\r\n"));
+        assert!(
+            !text.contains("\n\n"),
+            "no bare-LF blank line on a CRLF file"
+        );
+        // The user's CRLF lines survive verbatim.
+        assert!(text.contains("# my rules\r\n*.tmp\r\n"));
+
+        // A re-add is a true no-op: byte-identical, reported Unchanged.
+        assert_eq!(ensure(&exclude).unwrap(), ExcludeOutcome::Unchanged);
+        let twice = fs::read(&exclude).unwrap();
+        assert_eq!(once, twice, "re-add on a CRLF file must be byte-identical");
     }
 }

@@ -22,18 +22,21 @@
 //! consume `add`/`remove`/`pause`/`resume` as readily as `list`.
 
 mod excludes;
-mod select;
+// `pub(crate)` so the shared `<name|path>` identity/selector logic is reachable
+// from future top-level commands (VRD-16/17) as `crate::watch::select`.
+pub(crate) mod select;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use toml_edit::DocumentMut;
 use vard_core::{GitBackend, TriggerMode, WatchSpec};
 
 use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
-use crate::config::{Config, ConfigError, ResolvedWatch, expand_tilde};
-use crate::config_edit::{self, WatchEntry};
+use crate::config::{Config, ConfigError, ResolvedWatch, WatchConfig};
+use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::journal::Journal;
 use crate::output::format;
 use crate::output::palette::{self, Palette};
@@ -141,8 +144,10 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
 enum Registration {
     /// Append a new `[[watch]]`.
     Append,
-    /// Relink the watch at this index to the new path (re-add / moved dir).
-    Relink(usize),
+    /// Relink an existing watch (matched by name) to the new path — the re-add
+    /// / moved-directory path. The document is relocated by name at mutation
+    /// time, so no index is carried across the two parses.
+    Relink,
 }
 
 fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
@@ -156,6 +161,18 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
             canonical.display()
         )));
     }
+
+    // The config is UTF-8 (TOML), so a non-UTF-8 path cannot be stored without
+    // a lossy corruption that could never be matched again. Reject it honestly.
+    let path_str = canonical
+        .to_str()
+        .ok_or_else(|| {
+            CmdError::err(format!(
+                "{} is not valid UTF-8; vard's config is UTF-8 and cannot store this path",
+                canonical.display()
+            ))
+        })?
+        .to_string();
 
     // Name: explicit, or the directory's own final component.
     let name = match &args.name {
@@ -188,21 +205,33 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         args.branch.as_deref(),
     )?;
 
-    // Ensure the path is a git repository (offering / performing init), then
-    // seed vard's default excludes.
-    let initialized = ensure_repo(&canonical, args.init, args.branch.as_deref())?;
-    excludes::ensure(&canonical)
-        .map_err(|e| CmdError::err(format!("writing git excludes: {e}")))?;
+    // Serialize the whole read→plan→mutate→write cycle against concurrent
+    // `vard watch` writers, so lost updates and stale relocations cannot race.
+    let _lock = ConfigLock::acquire(&paths.config_file)?;
 
-    // Decide append-vs-relink against the current config, then apply it to the
-    // editable document and commit atomically.
+    // Decide append-vs-relink against the current config, and load the editable
+    // document, *before* any git init or exclude side effects — so a rejected
+    // add (a name/path conflict, or a config the editor cannot safely mutate)
+    // leaves no git init or exclude block behind.
     let config = load_config(&paths.config_file)?;
     let registration = plan_registration(config.as_ref(), &name, &canonical)?;
-    let relinked = matches!(registration, Registration::Relink(_));
+    let relinked = matches!(registration, Registration::Relink);
+    let mut doc =
+        config_edit::load_document(&paths.config_file)?.unwrap_or_else(config_edit::new_document);
+
+    // Ensure the path is a git repository (offering / performing init), then
+    // seed vard's default excludes into the repo's resolved exclude file (which
+    // is correct even for a worktree or submodule, where `.git` is a file).
+    let (initialized, backend) = ensure_repo(&canonical, args.init, args.branch.as_deref())?;
+    let exclude_path = backend
+        .info_exclude_path()
+        .map_err(|e| CmdError::err(format!("resolving git excludes: {e}")))?;
+    excludes::ensure(&exclude_path)
+        .map_err(|e| CmdError::err(format!("writing git excludes: {e}")))?;
 
     let entry = WatchEntry {
         name: name.clone(),
-        path: canonical.to_string_lossy().into_owned(),
+        path: path_str,
         branch: args.branch.clone(),
         remote: args.remote.clone(),
         trigger: trigger.map(str::to_string),
@@ -211,12 +240,19 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         no_sync: args.no_sync,
     };
 
-    let mut doc =
-        config_edit::load_document(&paths.config_file)?.unwrap_or_else(config_edit::new_document);
     match registration {
         Registration::Append => config_edit::append_watch(&mut doc, &entry),
-        Registration::Relink(index) => config_edit::update_watch(&mut doc, index, &entry),
+        // Relink relocates by name inside this document; if the watch vanished
+        // between planning and now, fall back to appending rather than panic.
+        Registration::Relink => {
+            if !config_edit::update_watch(&mut doc, &entry) {
+                config_edit::append_watch(&mut doc, &entry);
+            }
+        }
     }
+    // Validate the exact bytes to be written before committing them, so the CLI
+    // can never install a config that would wedge the daemon's reloads.
+    validate_document(&doc, &paths.config_file)?;
     config_edit::write_atomic(&paths.config_file, &doc)?;
 
     let verb = if relinked { "relinked" } else { "added" };
@@ -234,14 +270,22 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
 }
 
 /// Ensures `path` is a git repository rooted there, initializing one when it is
-/// not and doing so is authorized. Returns whether an init happened.
-fn ensure_repo(path: &Path, init_flag: bool, branch: Option<&str>) -> Result<bool, CmdError> {
+/// not and doing so is authorized. Returns whether an init happened and the
+/// backend for the (now guaranteed) repository.
+fn ensure_repo(
+    path: &Path,
+    init_flag: bool,
+    branch: Option<&str>,
+) -> Result<(bool, GitBackend), CmdError> {
     match GitBackend::detect(path) {
-        Ok(Some(_)) => Ok(false),
+        Ok(Some(backend)) => Ok((false, backend)),
         Ok(None) => {
             let approved = if init_flag {
                 true
-            } else if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            } else if io::stdin().is_terminal() && io::stderr().is_terminal() {
+                // Gate interactivity on the stream we actually prompt on
+                // (stderr), so `2>/dev/null` yields a clean error, not a
+                // silent, invisible hang waiting on input.
                 prompt_init(path)?
             } else {
                 return Err(CmdError::err(format!(
@@ -256,9 +300,9 @@ fn ensure_repo(path: &Path, init_flag: bool, branch: Option<&str>) -> Result<boo
                     path.display()
                 )));
             }
-            GitBackend::init(path, branch)
+            let backend = GitBackend::init(path, branch)
                 .map_err(|e| CmdError::err(format!("git init {}: {e}", path.display())))?;
-            Ok(true)
+            Ok((true, backend))
         }
         Err(e) => Err(CmdError::err(format!("checking {}: {e}", path.display()))),
     }
@@ -325,7 +369,8 @@ fn validate_watch(
 }
 
 /// Decides whether an add appends a new watch or relinks an existing one,
-/// rejecting the conflicting cases.
+/// rejecting the conflicting cases. Path identity uses the shared spec-§12 rule
+/// in [`select`], the same one the `<name|path>` selectors apply.
 fn plan_registration(
     config: Option<&Config>,
     name: &str,
@@ -339,16 +384,16 @@ fn plan_registration(
         .watches
         .iter()
         .position(|w| w.name.eq_ignore_ascii_case(name));
-    let by_path = config
-        .watches
-        .iter()
-        .position(|w| config_path_is(&w.path, home.as_deref(), canonical));
+    let by_path = config.watches.iter().position(|w| {
+        // `canonical` is already canonicalized, so it is its own canonical form.
+        select::config_path_identifies(&w.path, home.as_deref(), canonical, Some(canonical))
+    });
 
     match (by_name, by_path) {
         // Same watch (re-add same name + path, or relink same name to a new
         // path): update it in place.
-        (Some(n), Some(p)) if n == p => Ok(Registration::Relink(n)),
-        (Some(n), None) => Ok(Registration::Relink(n)),
+        (Some(n), Some(p)) if n == p => Ok(Registration::Relink),
+        (Some(_), None) => Ok(Registration::Relink),
         // The name exists on one watch and the path on another — relinking would
         // collide. Refuse rather than silently clobber.
         (Some(n), Some(p)) => Err(CmdError::err(format!(
@@ -371,6 +416,7 @@ fn plan_registration(
 // --- remove ----------------------------------------------------------------
 
 fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdResult {
+    let _lock = ConfigLock::acquire(&paths.config_file)?;
     let config = require_config(paths, "remove")?;
     let index =
         select::select_watch(&config, &args.target).map_err(|e| CmdError::err(e.to_string()))?;
@@ -379,7 +425,12 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while removing".to_string()))?;
-    config_edit::remove_watch(&mut doc, index);
+    if !config_edit::remove_watch(&mut doc, &name) {
+        return Err(CmdError::err(format!(
+            "watch {name:?} vanished from the config before it could be removed"
+        )));
+    }
+    validate_document(&doc, &paths.config_file)?;
     config_edit::write_atomic(&paths.config_file, &doc)?;
 
     // --purge drops vard's own per-watch metadata; the repository is never
@@ -418,14 +469,27 @@ fn purge_metadata(paths: &WatchPaths, name: &str) -> CmdResult {
 // --- list ------------------------------------------------------------------
 
 fn cmd_list(paths: &WatchPaths, out: &OutCtx) -> CmdResult {
-    let watches = match load_config(&paths.config_file)? {
-        Some(config) => config
-            .resolve_all()
-            .map_err(|e: ConfigError| CmdError::err(e.to_string()))?,
-        None => Vec::new(),
+    let Some(config) = load_config(&paths.config_file)? else {
+        return emit_list(out, &[]);
     };
-    let records: Vec<Record> = watches.iter().map(watch_record).collect();
-    emit_list(out, &records)
+    // `list` is the one read-only diagnostic: it must render even when the
+    // config fails full validation (a duplicate name, a bad inherited default),
+    // so a broken config is exactly what you can still inspect. On success it
+    // shows effective values; on a validation failure it renders leniently from
+    // the raw watches and exits 1 (attention) with a warning, never 2.
+    match config.resolve_all() {
+        Ok(watches) => {
+            let records: Vec<Record> = watches.iter().map(watch_record).collect();
+            emit_list(out, &records)
+        }
+        Err(e) => {
+            let records: Vec<Record> = config.watches.iter().map(raw_watch_record).collect();
+            emit_list(out, &records)?;
+            Err(CmdError::attention(format!(
+                "listed watches as written, but the config is not fully valid: {e}"
+            )))
+        }
+    }
 }
 
 /// Builds the display record for one resolved watch (effective values plus its
@@ -447,9 +511,30 @@ fn watch_record(rw: &ResolvedWatch) -> Record {
     }
 }
 
+/// Builds a *lenient* display record straight from a raw `[[watch]]` table,
+/// used only when full resolution fails so the diagnostic `list` still renders.
+/// Unset optional fields show absent (`—` / `null`) rather than resolved
+/// defaults — this is the "as written" view, not the effective one.
+fn raw_watch_record(w: &WatchConfig) -> Record {
+    Record {
+        header: None,
+        fields: vec![
+            RecordField::str("name", &w.name),
+            RecordField::str("path", w.path.to_string_lossy()),
+            RecordField::opt("branch", w.branch.clone()),
+            RecordField::opt("remote", w.remote.clone()),
+            RecordField::opt("trigger", w.trigger.clone()),
+            RecordField::opt("interval", w.interval.map(record::format_duration)),
+            RecordField::opt("sync", w.sync.map(|s| if s { "yes" } else { "no" })),
+            RecordField::bool("paused", w.paused).highlighted(w.paused),
+        ],
+    }
+}
+
 // --- pause / resume --------------------------------------------------------
 
 fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) -> CmdResult {
+    let _lock = ConfigLock::acquire(&paths.config_file)?;
     let config = require_config(paths, if paused { "pause" } else { "resume" })?;
     let index = select::select_watch(&config, target).map_err(|e| CmdError::err(e.to_string()))?;
     let name = config.watches[index].name.clone();
@@ -457,7 +542,12 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
 
     let mut doc = config_edit::load_document(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
-    config_edit::set_paused(&mut doc, index, paused);
+    if !config_edit::set_paused(&mut doc, &name, paused) {
+        return Err(CmdError::err(format!(
+            "watch {name:?} vanished from the config before it could be updated"
+        )));
+    }
+    validate_document(&doc, &paths.config_file)?;
     config_edit::write_atomic(&paths.config_file, &doc)?;
 
     let human = if was == paused {
@@ -502,14 +592,23 @@ fn require_config(paths: &WatchPaths, op: &str) -> Result<Config, CmdError> {
     })
 }
 
-/// Whether a watch's configured path (tilde-expanded) identifies the same
-/// directory as `target` (already canonical).
-fn config_path_is(config_path: &Path, home: Option<&Path>, target: &Path) -> bool {
-    let expanded = expand_tilde(config_path, home).unwrap_or_else(|| config_path.to_path_buf());
-    match std::fs::canonicalize(&expanded) {
-        Ok(canon) => canon == target,
-        Err(_) => expanded == target,
-    }
+/// Validates the exact bytes a mutation is about to write: re-parses the
+/// serialized document through the read layer and resolves every watch. This
+/// mirrors the daemon's validate-new-before-swap discipline, so the CLI can
+/// never install a config that would wedge a reload — and it subsumes per-field
+/// gaps (defaults inheritance, duplicate names/paths) that the pre-mutation
+/// checks do not see. Paused watches are validated too (via `resolve_all`).
+fn validate_document(doc: &DocumentMut, config_file: &Path) -> CmdResult {
+    let text = doc.to_string();
+    let refuse = |e: ConfigError| {
+        CmdError::err(format!(
+            "refusing to write {}: the result would be invalid: {e}",
+            config_file.display()
+        ))
+    };
+    let config = Config::from_toml_str(&text).map_err(refuse)?;
+    config.resolve_all().map_err(refuse)?;
+    Ok(())
 }
 
 fn home_dir() -> Option<PathBuf> {

@@ -295,3 +295,176 @@ fn list_with_no_config_is_empty() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert_eq!(stdout(&out).trim(), "[]");
 }
+
+/// Writes `text` to the environment's config path, creating its directory.
+fn write_config(env: &Env, text: &str) {
+    let cfg = env.config_path();
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(&cfg, text).unwrap();
+}
+
+#[test]
+fn inline_watch_array_errors_cleanly_without_wipe_or_panic() {
+    // The read layer tolerates `watch = [{...}]`, but the comment-preserving
+    // editor must refuse it — never coercing (which would drop the watch) nor
+    // panicking on an index from a different parse.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    let inline = format!(
+        "version = 1\nwatch = [{{ name = \"notes\", path = {:?} }}]\n",
+        path.to_str().unwrap()
+    );
+    write_config(&env, &inline);
+
+    // pause: exit 2, actionable message, config byte-identical (no wipe).
+    let out = env.vard(&["watch", "pause", "notes"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[[watch]]"),
+        "message should tell the user to rewrite as [[watch]]: {}",
+        stderr(&out)
+    );
+    assert_eq!(env.config_text(), inline, "pause must not touch the file");
+
+    // add: also refused, and the file is left untouched (no watches destroyed).
+    let out = env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "other"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert_eq!(env.config_text(), inline, "add must not wipe the file");
+}
+
+#[test]
+fn mutating_a_symlinked_config_preserves_the_symlink() {
+    // config.toml is a symlink to a real file elsewhere; a mutation must edit
+    // the real file (via the resolved directory) and leave the link intact.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let cfg = env.config_path();
+    let real = env._root.path().join("real-config.toml");
+    std::fs::rename(&cfg, &real).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &cfg).unwrap();
+
+    let out = env.vard(&["watch", "pause", "notes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // The config path is still a symlink pointing at the real file...
+    assert!(
+        std::fs::symlink_metadata(&cfg)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink must survive the mutation"
+    );
+    assert_eq!(std::fs::read_link(&cfg).unwrap(), real);
+    // ...and the edit landed in the real file.
+    assert!(
+        std::fs::read_to_string(&real)
+            .unwrap()
+            .contains("paused = true")
+    );
+}
+
+#[test]
+fn add_fails_before_writing_when_defaults_make_the_watch_invalid() {
+    // A [defaults] interval of 0s makes every inheriting watch invalid. The add
+    // must be refused by the pre-write revalidation, leaving the config as it
+    // was — never installing a config that would wedge the daemon's reloads.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    write_config(&env, "version = 1\n\n[defaults]\ninterval = \"0s\"\n");
+    let before = env.config_text();
+
+    let out = env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("interval"),
+        "error should name the offending field: {}",
+        stderr(&out)
+    );
+    assert_eq!(env.config_text(), before, "no watch may be written");
+}
+
+#[test]
+fn list_warns_but_still_lists_a_duplicate_name_config() {
+    // A duplicate name fails full resolution, but `list` is the one read-only
+    // diagnostic — it must render the watches as written and exit 1 (attention),
+    // never exit 2 on the very config it exists to inspect.
+    let env = Env::new();
+    write_config(
+        &env,
+        "version = 1\n\n[[watch]]\nname = \"dup\"\npath = \"/a\"\n\n[[watch]]\nname = \"dup\"\npath = \"/b\"\n",
+    );
+
+    let out = env.vard(&["--format", "json", "watch", "list"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let json = stdout(&out);
+    assert_eq!(json.matches("\"name\":\"dup\"").count(), 2, "got: {json}");
+    assert!(
+        stderr(&out).contains("not fully valid"),
+        "a warning must be emitted: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn add_registers_a_linked_worktree_writing_the_shared_exclude() {
+    // `.git` in a linked worktree is a file, not a directory. The exclude file
+    // must be resolved via git (the shared info/exclude), and the add succeeds.
+    let env = Env::new();
+    let main = repo(&env, "main");
+    // A worktree needs a commit to branch from: stage a file, then commit it.
+    std::fs::write(main.join("seed.txt"), "x").unwrap();
+    run_git(
+        &env.git_config,
+        &["-C", main.to_str().unwrap(), "add", "-A"],
+    );
+    run_git(
+        &env.git_config,
+        &[
+            "-C",
+            main.to_str().unwrap(),
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+    let wt = env._root.path().join("wt");
+    run_git(
+        &env.git_config,
+        &[
+            "-C",
+            main.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "wtbranch",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let wt_canon = std::fs::canonicalize(&wt).unwrap();
+
+    let out = env.vard(&["watch", "add", wt_canon.to_str().unwrap(), "--name", "wt"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        wt.join(".git").is_file(),
+        "a linked worktree's .git is a gitlink file, not a dir"
+    );
+    // The managed block landed in the shared exclude under the main repo's .git.
+    let shared = main.join(".git").join("info").join("exclude");
+    assert!(
+        std::fs::read_to_string(&shared)
+            .unwrap()
+            .contains("vard managed excludes"),
+        "excludes should be written to the shared info/exclude"
+    );
+    // And the watch is registered.
+    let list = env.vard(&["--format", "json", "watch", "list"]);
+    assert!(
+        stdout(&list).contains("\"name\":\"wt\""),
+        "got: {}",
+        stdout(&list)
+    );
+}

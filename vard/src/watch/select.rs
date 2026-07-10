@@ -73,17 +73,20 @@ pub(crate) fn select_watch_with_home(
         return Ok(i);
     }
 
-    // 2. Path match by canonical identity, with a textual fallback.
-    let selector_path = Path::new(selector);
-    let selector_canon = std::fs::canonicalize(selector_path).ok();
+    // 2. Path match by canonical identity, with a textual fallback. The
+    //    selector is tilde-expanded first — the same expansion stored paths
+    //    get — so a `~`-prefixed selector resolves against home instead of
+    //    matching a literal `~` no path ever holds.
+    let selector_expanded =
+        expand_tilde(Path::new(selector), home).unwrap_or_else(|| PathBuf::from(selector));
+    let selector_canon = std::fs::canonicalize(&selector_expanded).ok();
 
     let matches: Vec<usize> = config
         .watches
         .iter()
         .enumerate()
         .filter(|(_, w)| {
-            let expanded = expand_tilde(&w.path, home).unwrap_or_else(|| w.path.clone());
-            path_matches(&expanded, selector_path, selector_canon.as_deref())
+            config_path_identifies(&w.path, home, &selector_expanded, selector_canon.as_deref())
         })
         .map(|(i, _)| i)
         .collect();
@@ -103,15 +106,28 @@ pub(crate) fn select_watch_with_home(
     }
 }
 
-/// Whether a watch's (tilde-expanded) configured path identifies the same
-/// directory as the selector: equal canonical paths when both canonicalize,
-/// else a textual equality fallback for paths that no longer exist on disk.
-fn path_matches(watch_path: &Path, selector: &Path, selector_canon: Option<&Path>) -> bool {
-    match (std::fs::canonicalize(watch_path).ok(), selector_canon) {
+/// The single implementation of the spec-§12 path-identity rule, shared by the
+/// `<name|path>` selectors here and by `watch add`'s append-vs-relink decision.
+///
+/// A watch's configured `config_path` is tilde-expanded against `home`, then
+/// compared to `target` by *canonical* identity (symlinks resolved). When
+/// either side cannot be canonicalized — a moved or deleted directory — it
+/// falls back to exact textual equality of the expanded paths. `target_canon`
+/// is `target`'s pre-computed canonical form (or `None` when it does not
+/// canonicalize), so a caller resolving one selector against many watches
+/// canonicalizes it once.
+pub(crate) fn config_path_identifies(
+    config_path: &Path,
+    home: Option<&Path>,
+    target: &Path,
+    target_canon: Option<&Path>,
+) -> bool {
+    let expanded = expand_tilde(config_path, home).unwrap_or_else(|| config_path.to_path_buf());
+    match (std::fs::canonicalize(&expanded).ok(), target_canon) {
         (Some(a), Some(b)) => a == b,
         // One side (or both) cannot be canonicalized — a moved/removed dir.
         // Fall back to exact textual equality of the expanded paths.
-        _ => watch_path == selector,
+        _ => expanded == target,
     }
 }
 
@@ -174,8 +190,21 @@ mod tests {
     fn tilde_selector_expands_against_home() {
         let home = Path::new("/nonexistent/home");
         let config = config_with(&[("dots", "~/dotfiles")]);
-        // Both expand to /nonexistent/home/dotfiles; neither exists, so the
-        // textual fallback matches.
+        // A literal `~/dotfiles` selector must expand against home just as the
+        // stored path does; both become /nonexistent/home/dotfiles, and since
+        // neither exists the textual fallback matches. A pre-fix build compared
+        // the raw `~/dotfiles` selector against the expanded path and missed.
+        assert_eq!(
+            select_watch_with_home(&config, "~/dotfiles", Some(home)),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn absolute_selector_still_matches_a_tilde_stored_path() {
+        // The already-expanded absolute form must keep resolving, too.
+        let home = Path::new("/nonexistent/home");
+        let config = config_with(&[("dots", "~/dotfiles")]);
         assert_eq!(
             select_watch_with_home(&config, "/nonexistent/home/dotfiles", Some(home)),
             Ok(0)

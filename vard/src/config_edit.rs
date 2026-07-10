@@ -24,10 +24,11 @@
 //! [`paths`](crate::paths).
 
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{FlockOperation, flock};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::config::SUPPORTED_VERSION;
@@ -60,11 +61,19 @@ pub(crate) struct WatchEntry {
     pub no_sync: bool,
 }
 
-/// Reads and parses `path` into an editable document, preserving all formatting.
+/// Reads and parses `path` into an editable document, preserving all
+/// formatting, and verifies the `watch` key (if present) is in a shape the
+/// comment-preserving editor can safely mutate.
 ///
 /// Returns `Ok(None)` when the file does not exist (the caller starts from
-/// [`new_document`]); `Ok(Some(doc))` when it parses; and an error when the file
-/// exists but cannot be read or is not valid TOML.
+/// [`new_document`]); `Ok(Some(doc))` when it parses; an error when the file
+/// exists but cannot be read or is not valid TOML; and
+/// [`EditError::WatchNotArrayOfTables`] when `watch` is present but not an
+/// array-of-`[[watch]]`-tables — an inline `watch = [{...}]` (or `watch = []`)
+/// the read layer tolerates but the editor cannot restructure without risking
+/// the user's formatting. Refusing is safer than coercing (which would drop
+/// every inline watch) or blindly indexing (which would panic on a stale
+/// index).
 pub(crate) fn load_document(path: &Path) -> Result<Option<DocumentMut>, EditError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -80,6 +89,13 @@ pub(crate) fn load_document(path: &Path) -> Result<Option<DocumentMut>, EditErro
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
+    if let Some(item) = doc.get(WATCH_KEY)
+        && !item.is_array_of_tables()
+    {
+        return Err(EditError::WatchNotArrayOfTables {
+            path: path.to_path_buf(),
+        });
+    }
     Ok(Some(doc))
 }
 
@@ -91,19 +107,31 @@ pub(crate) fn new_document() -> DocumentMut {
     doc
 }
 
-/// The `[[watch]]` array-of-tables, created empty if absent. Coerces a
-/// conflicting non-array `watch` key into an array-of-tables — the read layer
-/// would already have rejected such a file, so this only fires on a document the
-/// caller built itself.
+/// The `[[watch]]` array-of-tables, created empty if absent.
+///
+/// Never coerces: [`load_document`] has already rejected a non-array `watch`
+/// key, and [`new_document`] has no `watch` key at all, so `or_insert_with`
+/// either finds an existing array-of-tables or creates a fresh empty one. The
+/// `expect` documents that precondition; it cannot fire for a document produced
+/// by this module's constructors.
 fn watch_tables_mut(doc: &mut DocumentMut) -> &mut ArrayOfTables {
     let item = doc
         .entry(WATCH_KEY)
         .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
-    if !item.is_array_of_tables() {
-        *item = Item::ArrayOfTables(ArrayOfTables::new());
-    }
     item.as_array_of_tables_mut()
-        .expect("watch key coerced to an array-of-tables above")
+        .expect("load_document guarantees `watch` is an array-of-tables or absent")
+}
+
+/// The index of the `[[watch]]` named `name` (compared case-insensitively, as
+/// the read layer compares names), relocated *inside the given document* so an
+/// index computed from a different parse can never be used against it.
+fn watch_index(tables: &ArrayOfTables, name: &str) -> Option<usize> {
+    tables.iter().position(|table| {
+        table
+            .get("name")
+            .and_then(Item::as_str)
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Appends a new `[[watch]]` table built from `entry`. Only the fields the user
@@ -116,15 +144,24 @@ pub(crate) fn append_watch(doc: &mut DocumentMut, entry: &WatchEntry) {
     watch_tables_mut(doc).push(table);
 }
 
-/// Relinks the watch at `index` to a new path and updates any explicitly-set
-/// optional fields, leaving unmentioned fields (and the whole rest of the file)
-/// untouched. This is the moved-directory / re-add path.
-pub(crate) fn update_watch(doc: &mut DocumentMut, index: usize, entry: &WatchEntry) {
-    let table = watch_tables_mut(doc)
+/// Relinks the watch named `entry.name` to a new path and updates any
+/// explicitly-set optional fields, leaving unmentioned fields (and the whole
+/// rest of the file) untouched. This is the moved-directory / re-add path.
+///
+/// Returns `false` when no watch by that name is present in the document (it
+/// vanished between planning and mutating) so the caller can fall back to an
+/// append rather than panic on a stale index.
+pub(crate) fn update_watch(doc: &mut DocumentMut, entry: &WatchEntry) -> bool {
+    let tables = watch_tables_mut(doc);
+    let Some(index) = watch_index(tables, &entry.name) else {
+        return false;
+    };
+    let table = tables
         .get_mut(index)
-        .expect("caller resolved a valid watch index");
+        .expect("index just located in this document");
     table["path"] = value(entry.path.clone());
     apply_optional_fields(table, entry);
+    true
 }
 
 /// Writes the explicitly-set optional fields of `entry` into `table`. A field
@@ -150,54 +187,91 @@ fn apply_optional_fields(table: &mut Table, entry: &WatchEntry) {
     }
 }
 
-/// Removes the `[[watch]]` at `index`.
-pub(crate) fn remove_watch(doc: &mut DocumentMut, index: usize) {
-    watch_tables_mut(doc).remove(index);
+/// Removes the `[[watch]]` named `name`, relocating it inside the document.
+/// Returns `false` when no watch by that name is present (already gone).
+pub(crate) fn remove_watch(doc: &mut DocumentMut, name: &str) -> bool {
+    let tables = watch_tables_mut(doc);
+    let Some(index) = watch_index(tables, name) else {
+        return false;
+    };
+    tables.remove(index);
+    true
 }
 
-/// Sets or clears the `paused` flag on the watch at `index`. Pausing writes
-/// `paused = true`; resuming removes the key entirely so a resumed watch is
-/// byte-for-byte a never-paused one — the file stays minimal.
-pub(crate) fn set_paused(doc: &mut DocumentMut, index: usize, paused: bool) {
-    let table = watch_tables_mut(doc)
+/// Sets or clears the `paused` flag on the watch named `name`, relocating it
+/// inside the document. Pausing writes `paused = true`; resuming removes the key
+/// entirely so a resumed watch is byte-for-byte a never-paused one — the file
+/// stays minimal. Returns `false` when no watch by that name is present.
+pub(crate) fn set_paused(doc: &mut DocumentMut, name: &str, paused: bool) -> bool {
+    let tables = watch_tables_mut(doc);
+    let Some(index) = watch_index(tables, name) else {
+        return false;
+    };
+    let table = tables
         .get_mut(index)
-        .expect("caller resolved a valid watch index");
+        .expect("index just located in this document");
     if paused {
         table["paused"] = value(true);
     } else {
         table.remove("paused");
     }
+    true
 }
 
-/// Serializes `doc` and installs it at `path` atomically: write to a temporary
-/// file in the same directory, then `rename(2)` it into place. The daemon, which
-/// watches this file, therefore never observes a partial write.
+/// Serializes `doc` and installs it at `path` atomically and durably: write to
+/// a temporary file in the same directory, `fsync` it, `rename(2)` it into
+/// place, then `fsync` the parent directory. The daemon, which watches this
+/// file, therefore never observes a partial write, and a crash immediately
+/// after cannot leave a truncated or lost config — the source of truth for
+/// every watch.
+///
+/// When `path` is a symlink, it is resolved first (via [`fs::canonicalize`]) so
+/// the temp+rename happens in the *real* target's directory: the rename
+/// replaces the target the symlink points at, leaving the symlink itself
+/// intact. A not-yet-existing config resolves to itself.
 pub(crate) fn write_atomic(path: &Path, doc: &DocumentMut) -> Result<(), EditError> {
+    // Resolve through a symlink so we edit the real file (preserving the link);
+    // a missing file has no link to preserve and resolves to itself.
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let io_err = |source| EditError::Io {
-        path: path.to_path_buf(),
+        path: target.clone(),
         source,
     };
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).map_err(io_err)?;
 
     // Temp name in the same directory so the rename is same-filesystem (hence
     // atomic). The leading dot and pid keep concurrent writers from colliding.
-    let file_name = path
+    let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.toml".to_string());
     let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
 
     let text = doc.to_string();
-    if let Err(source) = fs::write(&tmp, text.as_bytes()) {
+    if let Err(source) = write_and_sync(&tmp, text.as_bytes()) {
         let _ = fs::remove_file(&tmp);
         return Err(io_err(source));
     }
-    if let Err(source) = fs::rename(&tmp, path) {
+    if let Err(source) = fs::rename(&tmp, &target) {
         let _ = fs::remove_file(&tmp);
         return Err(io_err(source));
+    }
+    // fsync the directory so the rename itself is durable. Best-effort: some
+    // filesystems reject an fsync on a directory, which does not make the write
+    // any less committed than the file fsync already made it.
+    if let Ok(dir_file) = File::open(dir) {
+        let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+/// Writes `bytes` to `path` and `fsync`s the file before returning, so its
+/// contents are on stable storage before the caller renames it into place.
+fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Everything that can go wrong reading or writing the config for a mutation.
@@ -218,6 +292,14 @@ pub(crate) enum EditError {
         /// The parser's message.
         message: String,
     },
+    /// The config's `watch` key is present but not an array-of-`[[watch]]`
+    /// tables (an inline `watch = [{...}]` or `watch = []`). The
+    /// comment-preserving editor cannot safely restructure it, so the mutation
+    /// is refused rather than risking the user's formatting or losing watches.
+    WatchNotArrayOfTables {
+        /// The config path.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for EditError {
@@ -229,6 +311,12 @@ impl fmt::Display for EditError {
             EditError::Parse { path, message } => {
                 write!(f, "config {} is not valid TOML: {message}", path.display())
             }
+            EditError::WatchNotArrayOfTables { path } => write!(
+                f,
+                "config {} stores watches as an inline array; rewrite them as [[watch]] \
+                 tables before using `vard watch` to edit it",
+                path.display()
+            ),
         }
     }
 }
@@ -237,8 +325,52 @@ impl std::error::Error for EditError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             EditError::Io { source, .. } => Some(source),
-            EditError::Parse { .. } => None,
+            EditError::Parse { .. } | EditError::WatchNotArrayOfTables { .. } => None,
         }
+    }
+}
+
+/// An exclusive advisory lock over `config.lock`, held for a whole
+/// read→plan→mutate→rename cycle so concurrent `vard watch` invocations
+/// serialize instead of racing.
+///
+/// It adapts the `flock` machinery the daemon uses for its single-instance lock
+/// ([`crate::instance`]) — the kernel releases the lock when the descriptor
+/// closes, so a crashed CLI never leaves a stale lock — but takes a *blocking*
+/// exclusive lock rather than a non-blocking one: a second writer waits its turn
+/// rather than failing. Combined with by-name relocation and pre-write
+/// revalidation, this closes the lost-update and stale-index races between
+/// concurrent mutators. The lock file is left on disk deliberately (removing it
+/// would race a concurrent acquirer that already opened it).
+pub(crate) struct ConfigLock {
+    /// Held open purely to keep the `flock`; the drop that closes it releases
+    /// the lock.
+    _file: File,
+}
+
+impl ConfigLock {
+    /// Acquires the writer lock for the config at `config_path`, blocking until
+    /// any concurrent `vard watch` writer releases it. The lock file is
+    /// `config.lock` beside the config (its directory is stable across
+    /// invocations, so all writers contend on the same file).
+    pub(crate) fn acquire(config_path: &Path) -> Result<ConfigLock, EditError> {
+        let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let lock_path = dir.join("config.lock");
+        let io_err = |source| EditError::Io {
+            path: lock_path.clone(),
+            source,
+        };
+        fs::create_dir_all(dir).map_err(io_err)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(io_err)?;
+        // Blocking exclusive lock: a concurrent writer waits rather than failing.
+        flock(&file, FlockOperation::LockExclusive).map_err(|errno| io_err(errno.into()))?;
+        Ok(ConfigLock { _file: file })
     }
 }
 
@@ -311,9 +443,9 @@ path = "/home/u/notes"
     fn set_paused_then_resume_round_trips_to_original() {
         let original = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\n";
         let mut doc = original.parse::<DocumentMut>().unwrap();
-        set_paused(&mut doc, 0, true);
+        assert!(set_paused(&mut doc, "w", true));
         assert!(doc.to_string().contains("paused = true"));
-        set_paused(&mut doc, 0, false);
+        assert!(set_paused(&mut doc, "w", false));
         assert_eq!(
             doc.to_string(),
             original,
@@ -322,13 +454,45 @@ path = "/home/u/notes"
     }
 
     #[test]
+    fn set_paused_relocates_by_name_not_index() {
+        // The name is matched case-insensitively and located within the
+        // document, so a case difference or reordering never mis-targets.
+        let original = "version = 1\n\n[[watch]]\nname = \"a\"\npath = \"/a\"\n\n[[watch]]\nname = \"B\"\npath = \"/b\"\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+        assert!(set_paused(&mut doc, "b", true));
+        let text = doc.to_string();
+        // Only the second watch (matched case-insensitively) gained the flag.
+        let b_block = text.split("name = \"B\"").nth(1).unwrap();
+        assert!(b_block.contains("paused = true"), "got: {text}");
+        // The first watch's block (everything before the B table) is untouched.
+        let a_block = text.split("name = \"B\"").next().unwrap();
+        assert!(!a_block.contains("paused"), "got: {text}");
+    }
+
+    #[test]
+    fn set_paused_returns_false_for_a_vanished_watch() {
+        let mut doc = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!set_paused(&mut doc, "ghost", true));
+    }
+
+    #[test]
     fn remove_watch_drops_only_that_table() {
         let original = "version = 1\n\n[[watch]]\nname = \"a\"\npath = \"/a\"\n\n[[watch]]\nname = \"b\"\npath = \"/b\"\n";
         let mut doc = original.parse::<DocumentMut>().unwrap();
-        remove_watch(&mut doc, 0);
+        assert!(remove_watch(&mut doc, "a"));
         let text = doc.to_string();
         assert!(!text.contains("name = \"a\""), "got: {text}");
         assert!(text.contains("name = \"b\""), "got: {text}");
+    }
+
+    #[test]
+    fn remove_watch_returns_false_for_a_vanished_watch() {
+        let mut doc = "version = 1\n\n[[watch]]\nname = \"a\"\npath = \"/a\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!remove_watch(&mut doc, "ghost"));
     }
 
     #[test]
@@ -342,12 +506,49 @@ path = "/home/u/notes"
             branch: Some("b".to_string()),
             ..Default::default()
         };
-        update_watch(&mut doc, 0, &entry);
+        assert!(update_watch(&mut doc, &entry));
         let text = doc.to_string();
         assert!(text.contains("path = \"/new\""), "got: {text}");
         assert!(text.contains("branch = \"b\""), "got: {text}");
         // An unmentioned existing field is preserved.
         assert!(text.contains("remote = \"keep\""), "got: {text}");
+    }
+
+    #[test]
+    fn update_watch_returns_false_when_name_absent() {
+        let mut doc = new_document();
+        let entry = sample_entry("ghost", "/new");
+        assert!(!update_watch(&mut doc, &entry), "no such watch to relink");
+    }
+
+    #[test]
+    fn load_document_rejects_inline_watch_array() {
+        // The read layer tolerates `watch = [{...}]`, but the editor must refuse
+        // it rather than coerce (dropping every watch) or index into a
+        // structure it did not parse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\nwatch = [{ name = \"w\", path = \"/p\" }]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            load_document(&path),
+            Err(EditError::WatchNotArrayOfTables { .. })
+        ));
+    }
+
+    #[test]
+    fn config_lock_serializes_and_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("vard").join("config.toml");
+        {
+            let _held = ConfigLock::acquire(&config).unwrap();
+            assert!(config.parent().unwrap().join("config.lock").exists());
+        } // released here
+        // A fresh acquire after release succeeds.
+        let _again = ConfigLock::acquire(&config).unwrap();
     }
 
     #[test]
