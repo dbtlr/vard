@@ -35,9 +35,10 @@ use vard_core::{GitBackend, TriggerMode, WatchSpec};
 
 use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
 use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, finish};
-use crate::config::{Config, ResolvedWatch, WatchConfig};
+use crate::config::{Config, ResolvedWatch, WatchConfig, expand_tilde};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
-use crate::journal::Journal;
+use crate::instance::{CliLock, InstanceLock};
+use crate::journal::{Journal, RecoveryOpts};
 use crate::output::record::{self, Record, RecordField};
 use crate::paths::{self, HomeNotFound};
 
@@ -46,8 +47,12 @@ use crate::paths::{self, HomeNotFound};
 struct WatchPaths {
     /// `config.toml`, mutated in place.
     config_file: PathBuf,
-    /// Per-watch operation journals, dropped by `remove --purge`.
+    /// Per-watch operation journals, drained on `remove` and dropped by
+    /// `remove --purge`.
     journal_dir: PathBuf,
+    /// The single-instance lock, taken while a no-daemon `remove` drains a
+    /// watch's journal (the journal's single-writer invariant).
+    lock_file: PathBuf,
 }
 
 impl WatchPaths {
@@ -55,6 +60,7 @@ impl WatchPaths {
         Ok(WatchPaths {
             config_file: paths::config_file()?,
             journal_dir: paths::journal_dir()?,
+            lock_file: paths::lock_file()?,
         })
     }
 }
@@ -400,13 +406,24 @@ fn plan_registration(
 
 // --- remove ----------------------------------------------------------------
 
+/// How long a no-daemon `remove` waits out a *peer CLI* lock holder before
+/// giving up on the synchronous drain. Short: the drain is a best-effort
+/// safety net (a running daemon's reload, or the next daemon start, covers what
+/// this misses), so it must never make `remove` feel slow.
+const REMOVE_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
 fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdResult {
     let _lock = ConfigLock::acquire(&paths.config_file)?;
     let config = require_config(paths, "remove")?;
     let index =
         select::select_watch(&config, &args.target).map_err(|e| CmdError::err(e.to_string()))?;
     let name = config.watches[index].name.clone();
-    let path_display = config.watches[index].path.display().to_string();
+    let raw_path = config.watches[index].path.clone();
+    let path_display = raw_path.display().to_string();
+    // The repo's identity path, for keying and draining its journal. Expanded
+    // the same way resolution expands it, with a textual fallback when HOME is
+    // unset — the journal helpers canonicalize from here.
+    let repo_path = expand_tilde(&raw_path, home_dir().as_deref()).unwrap_or(raw_path);
 
     let (mut doc, pre_edit) = config_edit::load_document_with_text(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while removing".to_string()))?;
@@ -417,11 +434,14 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
     }
     let warning = config_edit::commit_document(&doc, &paths.config_file, Some(&pre_edit))?;
 
-    // --purge drops vard's own per-watch metadata; the repository is never
-    // touched, purge or not. This must run whenever the removal was written —
-    // after it, the watch no longer exists for a retry to select.
+    // Drain the watch: settle any in-flight operation and clean a stale git
+    // lock we left, so a removed watch never wedges on a lock only its journal
+    // could prove ours. A running daemon's reload drains it instead (we skip);
+    // with no daemon we run recovery here, under the instance lock. `--purge`
+    // then deletes the journal outright. The repository is never touched.
+    drain_removed_watch(paths, &repo_path);
     if args.purge {
-        purge_metadata(paths, &name)?;
+        purge_metadata(paths, &repo_path)?;
     }
 
     let human = if args.purge {
@@ -441,14 +461,54 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
     warning.map_or(Ok(()), Err)
 }
 
-/// Drops vard's per-watch metadata (its operation journal) for `name`. Absent
-/// metadata is not an error — purge is idempotent.
-fn purge_metadata(paths: &WatchPaths, name: &str) -> CmdResult {
-    let journal = Journal::in_dir(&paths.journal_dir, name);
+/// Drains a just-removed watch's journal when no daemon is running: takes the
+/// instance lock (the journal's single-writer invariant) and runs stale-lock
+/// recovery against the repo, so a lock left by a crashed in-process operation
+/// is proven ours and cleaned rather than wedging a repo the config no longer
+/// mentions.
+///
+/// Best-effort by design, and it deliberately does nothing when it is not the
+/// journal's writer:
+///
+/// * A **daemon** holds the lock ⇒ the reload triggered by the config write
+///   drains the watch as the engine drops it; double-draining here would race
+///   the daemon's own journal writes, so we skip.
+/// * A **peer CLI** holds the lock past the short budget ⇒ another in-process
+///   operation is mid-flight; we could not have crashed, and forcing our way in
+///   would violate the single-writer invariant. Skip; the next daemon start's
+///   sweep covers any residue.
+///
+/// A recovery hiccup is never fatal — recovery folds every outcome into a
+/// report, and this is a cleanup step, not the removal itself.
+fn drain_removed_watch(paths: &WatchPaths, repo_path: &Path) {
+    match InstanceLock::acquire_for_cli(&paths.lock_file, REMOVE_DRAIN_BUDGET) {
+        Ok(CliLock::Acquired(lock)) => {
+            let journal = Journal::for_repo_in_dir(&paths.journal_dir, repo_path);
+            let _report = journal.recover(repo_path, RecoveryOpts::new());
+            drop(lock);
+        }
+        // A daemon drains via its reload; a peer CLI means we are not the
+        // writer. Either way, leave the journal untouched.
+        Ok(CliLock::DaemonHeld) | Ok(CliLock::BusyPeerCli) => {}
+        // Could not even attempt the lock (an I/O error resolving it): the drain
+        // is best-effort, so a removal must not fail on it.
+        Err(_) => {}
+    }
+}
+
+/// Drops vard's per-watch metadata (its operation journal, keyed by repo path)
+/// for a removed watch. Absent metadata is not an error — purge is idempotent.
+/// Runs after [`drain_removed_watch`], so any lock the journal could prove ours
+/// is cleaned before the evidence is deleted.
+fn purge_metadata(paths: &WatchPaths, repo_path: &Path) -> CmdResult {
+    let journal = Journal::for_repo_in_dir(&paths.journal_dir, repo_path);
     match std::fs::remove_file(journal.path()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(CmdError::err(format!("purging metadata for {name:?}: {e}"))),
+        Err(e) => Err(CmdError::err(format!(
+            "purging metadata for {}: {e}",
+            repo_path.display()
+        ))),
     }
 }
 
@@ -590,4 +650,121 @@ fn opt_duration(raw: Option<&str>) -> Result<Option<Duration>, CmdError> {
 /// Emits the watch list in the resolved format, under the `watches` noun.
 fn emit_list(out: &OutCtx, records: &[Record]) -> CmdResult {
     emit_records(out, records, "watches")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instance::LockRole;
+    use std::time::UNIX_EPOCH;
+
+    /// A dead PID: spawn `true` and reap it, so the PID is known to have exited.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap true");
+        pid
+    }
+
+    /// Ages `path`'s mtime well past the stale-lock gates via `touch -t`
+    /// (POSIX-portable), returning the resulting mtime in unix seconds so a
+    /// coherent journal `ts` can be written for it.
+    fn age_far_past(path: &Path) -> u64 {
+        let ok = std::process::Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(path)
+            .status()
+            .expect("spawn touch")
+            .success();
+        assert!(ok, "touch must age the file");
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn paths_in(dir: &Path) -> WatchPaths {
+        WatchPaths {
+            config_file: dir.join("config.toml"),
+            journal_dir: dir.join("journal"),
+            lock_file: dir.join("vard.lock"),
+        }
+    }
+
+    /// A repo dir with a `.git/index.lock`, aged into the past, plus a dangling
+    /// path-keyed journal recording a dead owner whose `ts` matches the lock —
+    /// exactly the residue of a crash mid-operation.
+    fn crashed_repo(paths: &WatchPaths, root: &Path) -> (PathBuf, PathBuf) {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let journal = Journal::for_repo_in_dir(&paths.journal_dir, &repo);
+        std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        std::fs::write(
+            journal.path(),
+            format!("begin snapshot pid={} ts={ts}\n", dead_pid()),
+        )
+        .unwrap();
+        (repo, lock)
+    }
+
+    #[test]
+    fn no_daemon_remove_drains_a_proven_stale_lock() {
+        // With no daemon holding the lock, a `remove` drains the watch: recovery
+        // proves the crash-leftover lock ours and cleans it, and compacts the
+        // journal — the no-daemon half of drain-on-remove.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let (repo, lock) = crashed_repo(&paths, dir.path());
+
+        drain_removed_watch(&paths, &repo);
+
+        assert!(!lock.exists(), "a proven-stale lock must be drained");
+        let journal = Journal::for_repo_in_dir(&paths.journal_dir, &repo);
+        assert_eq!(
+            std::fs::metadata(journal.path()).unwrap().len(),
+            0,
+            "the journal is compacted after the drain"
+        );
+    }
+
+    #[test]
+    fn remove_drain_defers_to_a_running_daemon() {
+        // A daemon holds the instance lock, so the CLI must NOT double-drain —
+        // the daemon's reload covers it. The lock is left for the daemon.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        std::fs::create_dir_all(&paths.journal_dir).unwrap();
+        let _daemon = InstanceLock::acquire_at(&paths.lock_file, LockRole::Daemon).unwrap();
+        let (repo, lock) = crashed_repo(&paths, dir.path());
+
+        drain_removed_watch(&paths, &repo);
+
+        assert!(
+            lock.exists(),
+            "with a daemon holding the lock the CLI must defer, not drain"
+        );
+    }
+
+    #[test]
+    fn purge_deletes_the_path_keyed_journal_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let repo = dir.path().join("repo");
+        let journal = Journal::for_repo_in_dir(&paths.journal_dir, &repo);
+        std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        std::fs::write(journal.path(), b"").unwrap();
+
+        assert!(purge_metadata(&paths, &repo).is_ok());
+        assert!(!journal.path().exists(), "purge deletes the journal file");
+        // A second purge on an already-absent journal is a clean no-op.
+        assert!(purge_metadata(&paths, &repo).is_ok());
+    }
 }

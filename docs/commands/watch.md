@@ -62,9 +62,11 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 
 Unregister a watch. This removes the watch from the config file only — it never touches the repository, its working tree, or its history. The directory and every snapshot vard took remain exactly as they were.
 
+Removing also *drains* the watch: it settles any operation still in flight and cleans a stale git lock left by a crashed vard operation (proven to be vard's own), so a removed directory never wedges on a lock only vard could vouch for. A running daemon drains the watch as it reloads the change; with no daemon running, `remove` drains synchronously. The repository is never modified.
+
 | Flag | Effect |
 |---|---|
-| `--purge` | Also drop vard's own metadata for the watch (its operation journal and per-watch state). Never touches the repository. By default this metadata is kept so re-adding the same name resumes cleanly. |
+| `--purge` | After draining, also delete vard's own metadata for the watch (its operation journal). Never touches the repository. By default this metadata is kept so re-adding the same path resumes cleanly. |
 
 ## list
 
