@@ -14,12 +14,13 @@
 //! The set of watched directories is deliberately *not* editable here: a
 //! `watch.*` key is refused with a pointer to the `vard watch` verbs, which
 //! understand watch identity (canonical paths, relinking). The top-level
-//! `version` is managed by vard and is not settable either. `edit` is the one
-//! freeform escape hatch — it validates the whole document rather than one key —
-//! so it can touch anything, at the cost of the identity guarantees the verbs
-//! give.
+//! `version` is managed by vard and is not settable (though it is readable).
+//! `edit` is the one freeform escape hatch — it validates the whole document
+//! rather than one key — so it can touch anything, at the cost of the identity
+//! guarantees the verbs give.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -27,20 +28,30 @@ use toml_edit::DocumentMut;
 
 use crate::cli::{ColorWhen, ConfigCommand, OutputFormat};
 use crate::command::{CmdError, CmdResult, OutCtx, emit_action, finish};
-use crate::config::Config;
-use crate::config_edit::{self, ConfigLock};
+use crate::config_edit::{self, ConfigLock, ScalarValue};
 use crate::output::record::{Record, RecordField};
 use crate::paths;
 
 /// The tables whose scalar keys `get`/`set`/`unset` may address.
 const SETTABLE_TABLES: &[&str] = &["daemon", "defaults", "ai", "update"];
 
+/// Whether a key is being read (`get`) or written (`set`/`unset`). A few keys
+/// answer differently: `version` is readable but not settable, and the pointer
+/// for a `watch.*` key points at inspection (`vard watch list`) or mutation
+/// (`vard watch add|…`) accordingly.
+#[derive(Clone, Copy)]
+enum KeyMode {
+    Read,
+    Write,
+}
+
 /// Production entry point for `vard config <subcommand>`.
 pub(crate) fn run(cmd: ConfigCommand, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     let out = OutCtx::resolve(color, format);
     match cmd {
         // `get` distinguishes found (0) from not-set (1, silent) from an
-        // operational error (2, with a message), the way `git config` does.
+        // operational error (2, with a message), the way `git config` does — the
+        // git-config contract this command deliberately mirrors.
         ConfigCommand::Get(args) => match cmd_get(&out, &args.key) {
             Ok(true) => ExitCode::SUCCESS,
             Ok(false) => ExitCode::from(1),
@@ -53,25 +64,47 @@ pub(crate) fn run(cmd: ConfigCommand, color: ColorWhen, format: Option<OutputFor
     }
 }
 
-/// Rejects keys outside the settable surface: a `watch.*` key points at the
-/// `vard watch` verbs, `version` is not settable, any other top-level table is
-/// not addressable, and a bare table name (no dotted field) is not a scalar.
-fn classify_key(key: &str) -> Result<(), CmdError> {
+/// The human-readable settable-table list (`[daemon], [defaults], [ai], or
+/// [update]`), built from [`SETTABLE_TABLES`] so the error text and the const
+/// can never drift.
+fn settable_tables_phrase() -> String {
+    let bracketed: Vec<String> = SETTABLE_TABLES.iter().map(|t| format!("[{t}]")).collect();
+    match bracketed.split_last() {
+        Some((last, head)) if !head.is_empty() => format!("{}, or {last}", head.join(", ")),
+        _ => bracketed.join(", "),
+    }
+}
+
+/// Classifies a dotted key against the settable surface. A `watch.*` key points
+/// at the `vard watch` verbs (inspection for a read, mutation for a write);
+/// `version` is readable but not settable; any other top-level table is not
+/// addressable; and a bare table name (no dotted field) is not a scalar.
+fn classify_key(key: &str, mode: KeyMode) -> Result<(), CmdError> {
     let head = key.split('.').next().unwrap_or_default();
     if head == "watch" {
-        return Err(CmdError::err(
-            "watch settings are not edited with `vard config`; use `vard watch add|remove|pause|resume`",
-        ));
+        return Err(CmdError::err(match mode {
+            KeyMode::Read => {
+                "watch settings are inspected with `vard watch list`, not `vard config get`"
+            }
+            KeyMode::Write => {
+                "watch settings are not edited with `vard config`; use `vard watch add|remove|pause|resume`"
+            }
+        }));
     }
     if head == "version" {
-        return Err(CmdError::err(
-            "`version` is managed by vard and is not settable",
-        ));
+        return match mode {
+            // The managed version is readable like any other top-level scalar…
+            KeyMode::Read => Ok(()),
+            // …but never settable by hand.
+            KeyMode::Write => Err(CmdError::err(
+                "`version` is managed by vard and is not settable",
+            )),
+        };
     }
     if !SETTABLE_TABLES.contains(&head) {
         return Err(CmdError::err(format!(
-            "config key {key:?} is not settable; address a scalar in [daemon], [defaults], \
-             [ai], or [update]"
+            "config key {key:?} is not settable; address a scalar in {}",
+            settable_tables_phrase()
         )));
     }
     if !key.contains('.') {
@@ -82,12 +115,22 @@ fn classify_key(key: &str) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// Builds the `value` record field carrying the typed scalar, so the machine
+/// forms emit a JSON boolean/number/string rather than a stringified everything.
+fn value_field(value: &ScalarValue) -> RecordField {
+    match value {
+        ScalarValue::Bool(b) => RecordField::bool("value", *b),
+        ScalarValue::Int(i) => RecordField::opt_int("value", Some(*i)),
+        ScalarValue::Str(s) => RecordField::str("value", s),
+    }
+}
+
 // --- get -------------------------------------------------------------------
 
 /// Prints the value a key is set to. Returns `Ok(true)` when found (and printed),
 /// `Ok(false)` when the key is not set (empty stdout, exit 1), or an error.
 fn cmd_get(out: &OutCtx, key: &str) -> Result<bool, CmdError> {
-    classify_key(key)?;
+    classify_key(key, KeyMode::Read)?;
     let config_file = paths::config_file().map_err(|e| CmdError::err(e.to_string()))?;
     let Some(doc) = config_edit::load_document(&config_file)? else {
         // No config file at all ⇒ nothing is set.
@@ -96,15 +139,13 @@ fn cmd_get(out: &OutCtx, key: &str) -> Result<bool, CmdError> {
     match config_edit::get_dotted(&doc, key) {
         Some(Ok(value)) => {
             // Records/human: the bare value (scripting ergonomics). JSON: the
-            // {key, value} object. `emit_action` renders each form for us.
+            // {key, value} object with a *typed* value cell. `emit_action`
+            // renders each form for us.
             let record = Record {
                 header: None,
-                fields: vec![
-                    RecordField::str("key", key),
-                    RecordField::str("value", value.clone()),
-                ],
+                fields: vec![RecordField::str("key", key), value_field(&value)],
             };
-            emit_action(out, &value, &record)?;
+            emit_action(out, &value.display(), &record)?;
             Ok(true)
         }
         Some(Err(_not_scalar)) => Err(CmdError::err(format!(
@@ -117,19 +158,45 @@ fn cmd_get(out: &OutCtx, key: &str) -> Result<bool, CmdError> {
 // --- set -------------------------------------------------------------------
 
 fn cmd_set(out: &OutCtx, key: &str, raw: &str) -> CmdResult {
-    classify_key(key)?;
+    classify_key(key, KeyMode::Write)?;
     let config_file = paths::config_file().map_err(|e| CmdError::err(e.to_string()))?;
     let _lock = ConfigLock::acquire(&config_file)?;
-    let mut doc =
-        config_edit::load_document(&config_file)?.unwrap_or_else(config_edit::new_document);
-    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
+    let (mut doc, pre_edit) = match config_edit::load_document_with_text(&config_file)? {
+        Some((doc, text)) => (doc, Some(text)),
+        None => (config_edit::new_document(), None),
+    };
     config_edit::set_dotted(&mut doc, key, raw).map_err(CmdError::err)?;
-    let warning = config_edit::commit_document(&doc, &config_file, pre_edit_invalid)?;
 
-    let human = format!("set {key} = {raw}");
+    // Validate-and-write. If the inferred (non-string) value is rejected, retry
+    // the identical edit with the value forced to a string — a duration like
+    // `defaults.interval 3600` infers as an integer the schema rejects, but a
+    // string field that accepts "3600" should still be settable. If both fail,
+    // the string-form error is the informative one (it names the field's own
+    // validation, e.g. the duration parse), so it is what surfaces.
+    let warning = match config_edit::commit_document(&doc, &config_file, pre_edit.as_deref()) {
+        Ok(warning) => warning,
+        Err(inferred_err) => {
+            if config_edit::infers_string(raw) {
+                // Inference already produced a string; a retry is identical.
+                return Err(inferred_err);
+            }
+            config_edit::set_dotted_string(&mut doc, key, raw).map_err(CmdError::err)?;
+            // Both forms failed: the string-form error (the field's own
+            // validation, e.g. a duration parse) is the informative one.
+            config_edit::commit_document(&doc, &config_file, pre_edit.as_deref())?
+        }
+    };
+
+    // Report the value as actually stored (post-inference / post-retry), typed.
+    let stored = config_edit::get_dotted(&doc, key).and_then(Result::ok);
+    let (display, cell) = match stored {
+        Some(value) => (value.display(), value_field(&value)),
+        None => (raw.to_string(), RecordField::str("value", raw)),
+    };
+    let human = format!("set {key} = {display}");
     let record = Record {
         header: None,
-        fields: vec![RecordField::str("key", key), RecordField::str("value", raw)],
+        fields: vec![RecordField::str("key", key), cell],
     };
     emit_action(out, &human, &record)?;
     warning.map_or(Ok(()), Err)
@@ -138,20 +205,19 @@ fn cmd_set(out: &OutCtx, key: &str, raw: &str) -> CmdResult {
 // --- unset -----------------------------------------------------------------
 
 fn cmd_unset(out: &OutCtx, key: &str) -> CmdResult {
-    classify_key(key)?;
+    classify_key(key, KeyMode::Write)?;
     let config_file = paths::config_file().map_err(|e| CmdError::err(e.to_string()))?;
     let _lock = ConfigLock::acquire(&config_file)?;
-    let Some(mut doc) = config_edit::load_document(&config_file)? else {
+    let Some((mut doc, pre_edit)) = config_edit::load_document_with_text(&config_file)? else {
         return Err(CmdError::err(format!(
             "no config file at {}; nothing to unset",
             config_file.display()
         )));
     };
-    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
     if !config_edit::unset_dotted(&mut doc, key) {
         return Err(CmdError::err(format!("config key {key:?} is not set")));
     }
-    let warning = config_edit::commit_document(&doc, &config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &config_file, Some(&pre_edit))?;
 
     let human = format!("unset {key}");
     let record = Record {
@@ -168,7 +234,7 @@ fn cmd_unset(out: &OutCtx, key: &str) -> CmdResult {
 // --- path ------------------------------------------------------------------
 
 fn cmd_path(out: &OutCtx) -> CmdResult {
-    let path = Config::default_path().map_err(|e| CmdError::err(e.to_string()))?;
+    let path = paths::config_file().map_err(|e| CmdError::err(e.to_string()))?;
     let human = path.display().to_string();
     let record = Record {
         header: None,
@@ -185,23 +251,25 @@ fn cmd_edit(out: &OutCtx) -> CmdResult {
     edit_with(out, &config_file, |tmp| launch_editor(&editor, tmp))
 }
 
-/// The injectable core of `edit`: seed a temp file from the current config,
-/// hand it to `launch`, then validate and atomically install the result under
-/// the config lock. On a rejection (invalid TOML, or an edit that would turn a
-/// valid config invalid) the temp file is left in place and its path is reported
-/// so the work is not lost.
+/// The injectable core of `edit`: seed a temp file from the current config, hand
+/// it to `launch`, then — under the config lock — verify the config did not
+/// change while editing, validate, and atomically install the result.
+///
+/// Temp-file hygiene: the scratch file is created `0600`. A launch failure (the
+/// user never edited) removes it; a temp read failure removes it best-effort. But
+/// once the user *has* edited, every later failure (lock, concurrent change,
+/// invalid TOML, or a valid→invalid result) preserves the temp and names its
+/// path, so the work is never lost.
 fn edit_with(
     out: &OutCtx,
     config_file: &Path,
     launch: impl FnOnce(&Path) -> Result<(), CmdError>,
 ) -> CmdResult {
-    // Seed the temp with the current config, or a fresh version-seeded document
-    // when there is none yet.
-    let seed = match fs::read_to_string(config_file) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            config_edit::new_document().to_string()
-        }
+    // The baseline the edit starts from: the exact on-disk text, or `None` when
+    // no config file exists yet.
+    let seed_baseline = match fs::read_to_string(config_file) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             return Err(CmdError::err(format!(
                 "reading {}: {e}",
@@ -209,26 +277,61 @@ fn edit_with(
             )));
         }
     };
+    // The bytes actually handed to the editor: the baseline, or a fresh
+    // version-seeded document when there is none. This is also the pre-edit text
+    // whose validity decides how strictly the result is judged (a missing file
+    // seeds a *valid* document, so a first-time edit that saves an invalid config
+    // is refused, not silently written).
+    let seeded = seed_baseline
+        .clone()
+        .unwrap_or_else(|| config_edit::new_document().to_string());
 
     let dir = config_file.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).map_err(|e| CmdError::err(format!("{}: {e}", dir.display())))?;
     let tmp = dir.join(format!(".config-edit-{}.toml", std::process::id()));
-    fs::write(&tmp, seed.as_bytes())
+    write_private(&tmp, seeded.as_bytes())
         .map_err(|e| CmdError::err(format!("writing {}: {e}", tmp.display())))?;
 
-    launch(&tmp)?;
+    // A launch failure means the user made no edits — the temp is pure scratch,
+    // so remove it.
+    if let Err(e) = launch(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
 
-    let edited = fs::read_to_string(&tmp)
-        .map_err(|e| CmdError::err(format!("reading {}: {e}", tmp.display())))?;
-
-    // Serialize the read→validate→install against concurrent writers.
-    let _lock = ConfigLock::acquire(config_file)?;
-    // Whether the config on disk was already invalid decides how strictly the
-    // result is judged (a repair of a broken config is allowed to stay broken).
-    let pre_edit_invalid = match fs::read_to_string(config_file) {
-        Ok(text) => config_edit::document_validity(&text).is_err(),
-        Err(_) => true,
+    // A temp read failure loses nothing the user could recover *from the temp*
+    // (we cannot read it), so remove it best-effort.
+    let edited = match fs::read_to_string(&tmp) {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(CmdError::err(format!("reading {}: {e}", tmp.display())));
+        }
     };
+
+    // From here the user HAS edited: preserve the temp on every failure.
+    let _lock = ConfigLock::acquire(config_file).map_err(|e| preserved(&tmp, e.to_string()))?;
+
+    // Optimistic concurrency: the config must be byte-for-byte what we seeded
+    // from, or a concurrent writer landed a change our whole-document overwrite
+    // would silently clobber. Refuse and preserve the edit.
+    let current = match fs::read_to_string(config_file) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(preserved(
+                &tmp,
+                format!("reading {}: {e}", config_file.display()),
+            ));
+        }
+    };
+    if current != seed_baseline {
+        return Err(preserved(
+            &tmp,
+            "the config changed on disk while you were editing, so your edit was not applied"
+                .to_string(),
+        ));
+    }
 
     let doc: DocumentMut = match edited.parse() {
         Ok(doc) => doc,
@@ -239,7 +342,7 @@ fn edit_with(
             ));
         }
     };
-    match config_edit::commit_document(&doc, config_file, pre_edit_invalid) {
+    match config_edit::commit_document(&doc, config_file, Some(&seeded)) {
         Ok(warning) => {
             // The write landed; the temp scratch is no longer needed.
             let _ = fs::remove_file(&tmp);
@@ -260,6 +363,20 @@ fn edit_with(
     }
 }
 
+/// Writes `contents` to `path`, creating it `0600` on unix so an in-flight edit
+/// (which may hold secrets a user is about to add) is not world-readable.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents)
+}
+
 /// Builds the rejection error that preserves the edit at `tmp`.
 fn preserved(tmp: &Path, message: String) -> CmdError {
     CmdError::err(format!(
@@ -268,34 +385,34 @@ fn preserved(tmp: &Path, message: String) -> CmdError {
     ))
 }
 
-/// Resolves the editor command: `$EDITOR`, then `$VISUAL`, each ignored when
-/// empty. An error names both when neither is set.
+/// Resolves the editor command: `$VISUAL`, then `$EDITOR` (the git/historical
+/// precedence), each ignored when empty. An error names both when neither is set.
 fn resolve_editor() -> Result<String, CmdError> {
-    for var in ["EDITOR", "VISUAL"] {
+    for var in ["VISUAL", "EDITOR"] {
         if let Some(value) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
             return Ok(value);
         }
     }
     Err(CmdError::err(
-        "no editor configured; set $EDITOR (or $VISUAL) to edit the config",
+        "no editor configured; set $VISUAL (or $EDITOR) to edit the config",
     ))
 }
 
-/// Launches `editor` on `file`, waiting for it to exit. The command may carry
-/// arguments (e.g. `code --wait`), split on whitespace, with `file` appended.
+/// Launches the configured editor on `file` via the shell — like `git` does —
+/// so an editor string carrying flags (`code --wait`) or a space-containing path
+/// both work without hand-rolled tokenizing. The file is passed as `"$1"`, not
+/// interpolated into the script, so its path is never re-parsed by the shell.
 fn launch_editor(editor: &str, file: &Path) -> Result<(), CmdError> {
-    let mut parts = editor.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| CmdError::err("the configured editor command is empty"))?;
-    let status = Command::new(program)
-        .args(parts)
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("vard-editor")
         .arg(file)
         .status()
-        .map_err(|e| CmdError::err(format!("launching editor {program:?}: {e}")))?;
+        .map_err(|e| CmdError::err(format!("launching editor {editor:?}: {e}")))?;
     if !status.success() {
         return Err(CmdError::err(format!(
-            "editor {program:?} exited without success; the config was not changed"
+            "editor {editor:?} exited without success; the config was not changed"
         )));
     }
     Ok(())
@@ -311,9 +428,17 @@ mod tests {
         OutCtx::resolve(ColorWhen::Never, Some(OutputFormat::Json))
     }
 
+    fn leftovers(dir: &Path) -> Vec<std::fs::DirEntry> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".config-edit-"))
+            .collect()
+    }
+
     #[test]
     fn classify_rejects_watch_keys_with_a_pointer() {
-        let err = classify_key("watch.0.name").unwrap_err();
+        let err = classify_key("watch.0.name", KeyMode::Write).unwrap_err();
         assert!(
             err.message().contains("vard watch"),
             "got: {}",
@@ -322,23 +447,36 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_version() {
+    fn classify_read_of_a_watch_key_points_at_watch_list() {
+        // A read points at inspection (`vard watch list`), not the mutation verbs.
+        let err = classify_key("watch.0.name", KeyMode::Read).unwrap_err();
         assert!(
-            classify_key("version")
-                .unwrap_err()
-                .message()
-                .contains("not settable")
+            err.message().contains("vard watch list"),
+            "got: {}",
+            err.message()
         );
     }
 
     #[test]
+    fn classify_rejects_setting_version_but_allows_reading_it() {
+        assert!(
+            classify_key("version", KeyMode::Write)
+                .unwrap_err()
+                .message()
+                .contains("not settable")
+        );
+        // `config get version` must be permitted through classification.
+        assert!(classify_key("version", KeyMode::Read).is_ok());
+    }
+
+    #[test]
     fn classify_rejects_unknown_table() {
-        assert!(classify_key("bogus.key").is_err());
+        assert!(classify_key("bogus.key", KeyMode::Write).is_err());
     }
 
     #[test]
     fn classify_rejects_a_bare_table_name() {
-        let err = classify_key("daemon").unwrap_err();
+        let err = classify_key("daemon", KeyMode::Write).unwrap_err();
         assert!(err.message().contains("scalar"), "got: {}", err.message());
     }
 
@@ -350,8 +488,19 @@ mod tests {
             "ai.model",
             "update.channel",
         ] {
-            assert!(classify_key(key).is_ok(), "should accept {key}");
+            assert!(
+                classify_key(key, KeyMode::Write).is_ok(),
+                "should accept {key}"
+            );
         }
+    }
+
+    #[test]
+    fn settable_tables_phrase_is_built_from_the_const() {
+        assert_eq!(
+            settable_tables_phrase(),
+            "[daemon], [defaults], [ai], or [update]"
+        );
     }
 
     #[test]
@@ -368,15 +517,7 @@ mod tests {
         let written = fs::read_to_string(&config).unwrap();
         assert!(written.contains("log_level = \"debug\""), "got: {written}");
         // The temp scratch is cleaned up on success.
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".config-edit-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temp scratch left behind: {leftovers:?}"
-        );
+        assert!(leftovers(dir.path()).is_empty(), "temp scratch left behind");
     }
 
     #[test]
@@ -399,12 +540,7 @@ mod tests {
         // The config on disk is untouched.
         assert_eq!(fs::read_to_string(&config).unwrap(), original);
         // The temp scratch survives so the edit is recoverable.
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".config-edit-"))
-            .collect();
-        assert_eq!(leftovers.len(), 1, "the edit must be preserved");
+        assert_eq!(leftovers(dir.path()).len(), 1, "the edit must be preserved");
     }
 
     #[test]
@@ -430,5 +566,115 @@ mod tests {
             original,
             "a valid→invalid edit must not land"
         );
+    }
+
+    #[test]
+    fn edit_of_a_missing_config_saving_invalid_is_refused() {
+        // F7: a first-time edit (no config file) seeds a *valid* version-only
+        // document, so saving a schema-invalid result is a valid→invalid edit and
+        // must be refused — not written with a warning.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let err = edit_with(&out(), &config, |tmp| {
+            // Valid TOML but no version ⇒ schema-invalid.
+            fs::write(tmp, "[daemon]\nlog_level = \"debug\"\n").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            err.message().contains("preserved at"),
+            "got: {}",
+            err.message()
+        );
+        assert!(!config.exists(), "no config must have been written");
+        assert_eq!(leftovers(dir.path()).len(), 1, "the edit must be preserved");
+    }
+
+    #[test]
+    fn edit_of_a_missing_config_saving_valid_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let res = edit_with(&out(), &config, |tmp| {
+            fs::write(tmp, "version = 1\n\n[daemon]\nlog_level = \"debug\"\n").unwrap();
+            Ok(())
+        });
+        assert!(res.is_ok(), "a valid first-time edit must install");
+        assert!(
+            fs::read_to_string(&config)
+                .unwrap()
+                .contains("log_level = \"debug\""),
+        );
+    }
+
+    #[test]
+    fn edit_refuses_when_the_config_changed_during_editing() {
+        // F1: a concurrent writer lands a change between seed and commit. The
+        // whole-document overwrite must not silently clobber it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let original = "version = 1\n\n[daemon]\nlog_level = \"info\"\n";
+        fs::write(&config, original).unwrap();
+
+        let err = edit_with(&out(), &config, |tmp| {
+            // The user's edit…
+            fs::write(tmp, "version = 1\n\n[daemon]\nlog_level = \"debug\"\n").unwrap();
+            // …but a concurrent writer changed the config underneath.
+            fs::write(&config, "version = 1\n\n[daemon]\nlog_level = \"trace\"\n").unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            err.message().contains("changed on disk"),
+            "got: {}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("preserved at"),
+            "must preserve the edit: {}",
+            err.message()
+        );
+        // The concurrent write stands; the edit did not clobber it.
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "version = 1\n\n[daemon]\nlog_level = \"trace\"\n"
+        );
+        assert_eq!(leftovers(dir.path()).len(), 1, "the edit must be preserved");
+    }
+
+    #[test]
+    fn edit_launch_failure_removes_the_temp() {
+        // F8: the user never edited (the editor failed to launch), so the scratch
+        // temp is removed rather than left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "version = 1\n").unwrap();
+
+        let err = edit_with(&out(), &config, |_tmp| {
+            Err(CmdError::err("editor exploded"))
+        })
+        .unwrap_err();
+        assert_eq!(err.message(), "editor exploded");
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "a launch failure must remove the scratch temp"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_temp_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "version = 1\n").unwrap();
+
+        // Inspect the temp's mode while the editor "runs".
+        let mode = std::cell::Cell::new(0u32);
+        let _ = edit_with(&out(), &config, |tmp| {
+            mode.set(fs::metadata(tmp).unwrap().permissions().mode() & 0o777);
+            fs::write(tmp, "version = 1\n").unwrap();
+            Ok(())
+        });
+        assert_eq!(mode.get(), 0o600, "temp must be created 0600");
     }
 }

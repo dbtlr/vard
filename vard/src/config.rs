@@ -32,8 +32,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use vard_core::{TriggerMode, WatchSpec};
 
-use crate::paths;
-
 /// The only config schema version this binary understands.
 pub(crate) const SUPPORTED_VERSION: i64 = 1;
 
@@ -182,13 +180,6 @@ pub(crate) struct WatchConfig {
 }
 
 impl Config {
-    /// The default config path, `$XDG_CONFIG_HOME/vard/config.toml`. The daemon
-    /// resolves paths via `DaemonPaths`; this is the CLI locator behind
-    /// `vard config path`.
-    pub fn default_path() -> Result<PathBuf, ConfigError> {
-        paths::config_file().map_err(|e| ConfigError::Path(e.to_string()))
-    }
-
     /// Reads and parses the config file at `path`. Does not watch for changes
     /// or hot-reload — that is VRD-14.
     pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
@@ -435,8 +426,6 @@ pub(crate) enum ConfigError {
     },
     /// The config file could not be parsed as the expected TOML schema.
     Parse(String),
-    /// The config path could not be resolved (see [`paths`]).
-    Path(String),
     /// The config has no `version` key.
     MissingVersion,
     /// The `version` key names a schema this binary does not support.
@@ -484,7 +473,6 @@ impl fmt::Display for ConfigError {
                 write!(f, "reading config {}: {source}", path.display())
             }
             ConfigError::Parse(msg) => write!(f, "parsing config: {msg}"),
-            ConfigError::Path(msg) => write!(f, "resolving config path: {msg}"),
             ConfigError::MissingVersion => f.write_str(
                 "config is missing the `version` key; add `version = 1` at the top of the file",
             ),

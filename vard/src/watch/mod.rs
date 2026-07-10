@@ -179,11 +179,13 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     let config = load_config(&paths.config_file)?;
     let registration = plan_registration(config.as_ref(), &name, &canonical)?;
     let relinked = matches!(registration, Registration::Relink);
-    let mut doc =
-        config_edit::load_document(&paths.config_file)?.unwrap_or_else(config_edit::new_document);
-    // The config's validity *before* this edit decides how strictly the result
-    // is judged (see [`commit_document`]).
-    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
+    // Load the editable document plus the exact on-disk text: the config's
+    // validity *before* this edit decides how strictly the result is judged (see
+    // [`commit_document`]); a missing file is a valid empty baseline.
+    let (mut doc, pre_edit) = match config_edit::load_document_with_text(&paths.config_file)? {
+        Some((doc, text)) => (doc, Some(text)),
+        None => (config_edit::new_document(), None),
+    };
 
     // Realize the repository plan under the lock: perform any authorized init,
     // then seed vard's default excludes into the repo's resolved exclude file
@@ -214,7 +216,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     }
     // Validate the exact bytes to be written before committing them, so the CLI
     // can never take a valid config to invalid and wedge the daemon's reloads.
-    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit.as_deref())?;
 
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
@@ -406,15 +408,14 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
     let name = config.watches[index].name.clone();
     let path_display = config.watches[index].path.display().to_string();
 
-    let mut doc = config_edit::load_document(&paths.config_file)?
+    let (mut doc, pre_edit) = config_edit::load_document_with_text(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while removing".to_string()))?;
-    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
     if !config_edit::remove_watch(&mut doc, &name) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be removed"
         )));
     }
-    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, Some(&pre_edit))?;
 
     // --purge drops vard's own per-watch metadata; the repository is never
     // touched, purge or not. This must run whenever the removal was written —
@@ -527,15 +528,14 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
     let name = config.watches[index].name.clone();
     let was = config.watches[index].paused;
 
-    let mut doc = config_edit::load_document(&paths.config_file)?
+    let (mut doc, pre_edit) = config_edit::load_document_with_text(&paths.config_file)?
         .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
-    let pre_edit_invalid = config_edit::document_validity(&doc.to_string()).is_err();
     if !config_edit::set_paused(&mut doc, &name, paused) {
         return Err(CmdError::err(format!(
             "watch {name:?} vanished from the config before it could be updated"
         )));
     }
-    let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit_invalid)?;
+    let warning = config_edit::commit_document(&doc, &paths.config_file, Some(&pre_edit))?;
 
     let human = if was == paused {
         format!(

@@ -29,7 +29,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value, value};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value, value};
 
 use crate::command::CmdError;
 use crate::config::{Config, ConfigError, SUPPORTED_VERSION};
@@ -76,6 +76,15 @@ pub(crate) struct WatchEntry {
 /// every inline watch) or blindly indexing (which would panic on a stale
 /// index).
 pub(crate) fn load_document(path: &Path) -> Result<Option<DocumentMut>, EditError> {
+    Ok(load_document_with_text(path)?.map(|(doc, _text)| doc))
+}
+
+/// Like [`load_document`], but also returns the exact on-disk text the document
+/// was parsed from, so a caller can judge the config's pre-edit validity (for
+/// [`commit_document`]) without re-serializing the mutated document.
+pub(crate) fn load_document_with_text(
+    path: &Path,
+) -> Result<Option<(DocumentMut, String)>, EditError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -97,7 +106,7 @@ pub(crate) fn load_document(path: &Path) -> Result<Option<DocumentMut>, EditErro
             path: path.to_path_buf(),
         });
     }
-    Ok(Some(doc))
+    Ok(Some((doc, text)))
 }
 
 /// A fresh document seeded with `version = <SUPPORTED_VERSION>`, for the first
@@ -222,14 +231,17 @@ pub(crate) fn set_paused(doc: &mut DocumentMut, name: &str, paused: bool) -> boo
 // --- generic dotted scalar keys (`vard config get/set/unset`) --------------
 
 /// Reads the scalar value addressed by a dotted `key` (e.g. `daemon.log_level`),
-/// as a display string. `None` when the path does not resolve, and
+/// as a typed [`ScalarValue`]. `None` when the path does not resolve, and
 /// `Some(Err(..))` — a present-but-not-scalar answer — when the key names a
 /// table or array rather than a settable scalar. Only the value the file
 /// actually holds is returned; inherited defaults are not materialized here.
-pub(crate) fn get_dotted(doc: &DocumentMut, key: &str) -> Option<Result<String, KeyNotScalar>> {
+pub(crate) fn get_dotted(
+    doc: &DocumentMut,
+    key: &str,
+) -> Option<Result<ScalarValue, KeyNotScalar>> {
     let item = item_at(doc, key)?;
-    Some(match item.as_value().and_then(scalar_to_string) {
-        Some(text) => Ok(text),
+    Some(match item.as_value().and_then(scalar_value) {
+        Some(v) => Ok(v),
         None => Err(KeyNotScalar),
     })
 }
@@ -237,40 +249,86 @@ pub(crate) fn get_dotted(doc: &DocumentMut, key: &str) -> Option<Result<String, 
 /// The addressed key exists but names a table or array, not a scalar value.
 pub(crate) struct KeyNotScalar;
 
+/// A settable scalar's value, typed so the machine output shapes it faithfully
+/// (a JSON boolean/number/string rather than a stringified everything). Floats
+/// and datetimes — which the config schema never uses but a hand-edited file
+/// might carry — collapse to their display spelling under [`ScalarValue::Str`].
+pub(crate) enum ScalarValue {
+    /// A boolean.
+    Bool(bool),
+    /// An integer.
+    Int(i64),
+    /// A string (also the fallback for floats/datetimes).
+    Str(String),
+}
+
+impl ScalarValue {
+    /// The bare display spelling: `true`/`false`, the number, or the raw string —
+    /// the scripting value `config get`/`config set` print on a TTY.
+    pub(crate) fn display(&self) -> String {
+        match self {
+            ScalarValue::Bool(b) => b.to_string(),
+            ScalarValue::Int(i) => i.to_string(),
+            ScalarValue::Str(s) => s.clone(),
+        }
+    }
+}
+
 /// Sets the scalar `key` to `raw`, creating intermediate tables as needed and
 /// preserving the rest of the document. The value's TOML type is inferred from
 /// `raw` (see [`infer_value`]); correctness of the *typed* result is the
 /// caller's to check via [`commit_document`]. Returns an error only when a path
 /// segment already exists as a non-table (so it cannot be descended into).
 pub(crate) fn set_dotted(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<(), String> {
+    set_dotted_value(doc, key, infer_value(raw))
+}
+
+/// Sets the scalar `key` to `raw` forced to a TOML *string*, bypassing type
+/// inference. The escape hatch for a field that wants a string which would
+/// otherwise infer as a bool or integer (see the retry in `config set`).
+pub(crate) fn set_dotted_string(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<(), String> {
+    set_dotted_value(doc, key, Value::from(raw))
+}
+
+/// Whether [`infer_value`] would type `raw` as a bare TOML string (rather than a
+/// bool or integer). Used to decide whether a post-validation string retry could
+/// possibly differ from the inferred write.
+pub(crate) fn infers_string(raw: &str) -> bool {
+    matches!(infer_value(raw), Value::String(_))
+}
+
+/// The shared walker behind [`set_dotted`]/[`set_dotted_string`]: descends
+/// (creating) intermediate tables and writes `val` at the leaf. Descends
+/// table-like nodes (inline tables included), matching [`get_dotted`], so a key
+/// stored inline (`daemon = { log_level = "info" }`) is editable in place.
+fn set_dotted_value(doc: &mut DocumentMut, key: &str, val: Value) -> Result<(), String> {
     let segments: Vec<&str> = key.split('.').collect();
     let (last, parents) = segments
         .split_last()
         .expect("split on a non-empty key yields at least one segment");
-    let mut table: &mut Table = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
     for seg in parents {
-        let entry = table
-            .entry(seg)
-            .or_insert_with(|| Item::Table(Table::new()));
+        let entry = table.entry(seg).or_insert(Item::Table(Table::new()));
         table = entry
-            .as_table_mut()
+            .as_table_like_mut()
             .ok_or_else(|| format!("config key {seg:?} is not a table"))?;
     }
-    table[last] = value(infer_value(raw));
+    table.insert(last, value(val));
     Ok(())
 }
 
 /// Removes the scalar `key`, leaving any now-empty parent table in place (the
 /// file stays otherwise byte-for-byte unchanged). Returns `false` when the key
-/// was not present.
+/// was not present. Descends table-like nodes (inline tables included), matching
+/// [`get_dotted`].
 pub(crate) fn unset_dotted(doc: &mut DocumentMut, key: &str) -> bool {
     let segments: Vec<&str> = key.split('.').collect();
     let (last, parents) = segments
         .split_last()
         .expect("split on a non-empty key yields at least one segment");
-    let mut table: &mut Table = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
     for seg in parents {
-        match table.get_mut(seg).and_then(Item::as_table_mut) {
+        match table.get_mut(seg).and_then(Item::as_table_like_mut) {
             Some(next) => table = next,
             None => return false,
         }
@@ -288,16 +346,16 @@ fn item_at<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
     Some(item)
 }
 
-/// Renders a scalar [`Value`] to its display string (a bare string keeps its
-/// contents, other scalars their TOML spelling). `None` for arrays and inline
-/// tables, which are not settable scalars.
-fn scalar_to_string(v: &Value) -> Option<String> {
+/// Reads a scalar [`Value`] into a typed [`ScalarValue`] (a float or datetime
+/// collapses to its display spelling). `None` for arrays and inline tables,
+/// which are not settable scalars.
+fn scalar_value(v: &Value) -> Option<ScalarValue> {
     match v {
-        Value::String(s) => Some(s.value().clone()),
-        Value::Integer(i) => Some(i.value().to_string()),
-        Value::Float(f) => Some(f.value().to_string()),
-        Value::Boolean(b) => Some(b.value().to_string()),
-        Value::Datetime(d) => Some(d.value().to_string()),
+        Value::String(s) => Some(ScalarValue::Str(s.value().clone())),
+        Value::Integer(i) => Some(ScalarValue::Int(*i.value())),
+        Value::Boolean(b) => Some(ScalarValue::Bool(*b.value())),
+        Value::Float(f) => Some(ScalarValue::Str(f.value().to_string())),
+        Value::Datetime(d) => Some(ScalarValue::Str(d.value().to_string())),
         Value::Array(_) | Value::InlineTable(_) => None,
     }
 }
@@ -338,7 +396,10 @@ pub(crate) fn document_validity(text: &str) -> Result<(), ConfigError> {
 
 /// Validates the exact bytes a mutation is about to write, then writes them —
 /// applying the "never break a working config" invariant relative to the
-/// config's validity *before* the edit (`pre_edit_invalid`):
+/// config's validity *before* the edit. `pre_edit_text` is the exact on-disk
+/// text the edit started from (`None` when no config file existed, which is a
+/// valid empty baseline); its validity is computed *lazily*, only when the
+/// post-edit result is invalid, so the happy path validates once, not twice:
 ///
 /// * post-edit valid → write and succeed (a clean edit, or a repair that made an
 ///   invalid config valid again — either way, silently).
@@ -355,7 +416,7 @@ pub(crate) fn document_validity(text: &str) -> Result<(), ConfigError> {
 pub(crate) fn commit_document(
     doc: &DocumentMut,
     config_file: &Path,
-    pre_edit_invalid: bool,
+    pre_edit_text: Option<&str>,
 ) -> Result<Option<CmdError>, CmdError> {
     let text = doc.to_string();
     match document_validity(&text) {
@@ -363,17 +424,23 @@ pub(crate) fn commit_document(
             write_atomic(config_file, doc)?;
             Ok(None)
         }
-        Err(e) if pre_edit_invalid => {
-            write_atomic(config_file, doc)?;
-            Ok(Some(CmdError::attention(format!(
-                "wrote {}, but the config is still not fully valid: {e}",
-                config_file.display()
-            ))))
+        Err(e) => {
+            // Only now — on a post-edit failure — is the pre-edit validity worth
+            // computing. A missing file (`None`) is a valid empty baseline.
+            let pre_edit_invalid = pre_edit_text.is_some_and(|t| document_validity(t).is_err());
+            if pre_edit_invalid {
+                write_atomic(config_file, doc)?;
+                Ok(Some(CmdError::attention(format!(
+                    "wrote {}, but the config is still not fully valid: {e}",
+                    config_file.display()
+                ))))
+            } else {
+                Err(CmdError::err(format!(
+                    "refusing to write {}: the edit would make a valid config invalid: {e}",
+                    config_file.display()
+                )))
+            }
         }
-        Err(e) => Err(CmdError::err(format!(
-            "refusing to write {}: the edit would make a valid config invalid: {e}",
-            config_file.display()
-        ))),
     }
 }
 
@@ -724,6 +791,7 @@ path = "/home/u/notes"
             get_dotted(&doc, "daemon.log_level")
                 .unwrap()
                 .ok()
+                .map(|v| v.display())
                 .as_deref(),
             Some("info")
         );
@@ -731,6 +799,7 @@ path = "/home/u/notes"
             get_dotted(&doc, "daemon.log_retention_days")
                 .unwrap()
                 .ok()
+                .map(|v| v.display())
                 .as_deref(),
             Some("14")
         );
@@ -764,6 +833,62 @@ path = "/home/u/notes"
         let text = doc.to_string();
         assert!(text.contains("[ai]"), "empty table left in place: {text}");
         assert!(!text.contains("model"), "got: {text}");
+    }
+
+    #[test]
+    fn dotted_editors_descend_an_inline_table() {
+        // `daemon = { log_level = "info" }` stores the table inline; get/set/unset
+        // must all descend it (the read layer tolerates the inline form).
+        let original = "version = 1\ndaemon = { log_level = \"info\", log_retention_days = 14 }\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+
+        // get descends the inline table.
+        assert_eq!(
+            get_dotted(&doc, "daemon.log_level")
+                .unwrap()
+                .ok()
+                .map(|v| v.display())
+                .as_deref(),
+            Some("info")
+        );
+
+        // set edits a value inside the inline table in place.
+        set_dotted(&mut doc, "daemon.log_level", "debug").unwrap();
+        assert_eq!(
+            get_dotted(&doc, "daemon.log_level")
+                .unwrap()
+                .ok()
+                .map(|v| v.display())
+                .as_deref(),
+            Some("debug")
+        );
+        let text = doc.to_string();
+        assert!(text.contains("log_level = \"debug\""), "got: {text}");
+
+        // unset removes a key from the inline table.
+        assert!(unset_dotted(&mut doc, "daemon.log_retention_days"));
+        assert!(get_dotted(&doc, "daemon.log_retention_days").is_none());
+        // A sibling inside the inline table survives.
+        assert_eq!(
+            get_dotted(&doc, "daemon.log_level")
+                .unwrap()
+                .ok()
+                .map(|v| v.display())
+                .as_deref(),
+            Some("debug")
+        );
+    }
+
+    #[test]
+    fn set_dotted_string_forces_a_string_bypassing_inference() {
+        let mut doc = new_document();
+        // "3600" would infer as an integer; the forced form stores a string.
+        assert!(!infers_string("3600"));
+        set_dotted_string(&mut doc, "defaults.interval", "3600").unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("interval = \"3600\""), "got: {text}");
+        // A bare word already infers as a string.
+        assert!(infers_string("15m"));
     }
 
     #[test]

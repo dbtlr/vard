@@ -68,7 +68,15 @@ impl Env {
     /// Installs an executable `$EDITOR` shell script that overwrites the file it
     /// is given with `new_contents`, and returns its path.
     fn editor_writing(&self, new_contents: &str) -> PathBuf {
-        let script = self.root.path().join("fake-editor.sh");
+        // Name the script by a stable hash of its payload so two distinct
+        // editors (e.g. a $VISUAL and a $EDITOR) never collide on one file.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        new_contents.hash(&mut hasher);
+        let script = self
+            .root
+            .path()
+            .join(format!("fake-editor-{:x}.sh", hasher.finish()));
         // The editor is invoked as `script <file>`; write the payload to $1.
         let body = format!("#!/bin/sh\ncat > \"$1\" <<'VARD_EOF'\n{new_contents}\nVARD_EOF\n");
         std::fs::write(&script, body).unwrap();
@@ -287,5 +295,113 @@ fn edit_without_an_editor_configured_errors() {
         stderr(&out).contains("no editor configured"),
         "got: {}",
         stderr(&out)
+    );
+}
+
+#[test]
+fn edit_prefers_visual_over_editor() {
+    // C5: $VISUAL wins over $EDITOR (the git/historical convention).
+    let env = Env::new();
+    env.write_config("version = 1\n\n[daemon]\nlog_level = \"info\"\n");
+    let visual = env.editor_writing("version = 1\n\n[daemon]\nlog_level = \"trace\"\n");
+    let editor = env.editor_writing("version = 1\n\n[daemon]\nlog_level = \"debug\"\n");
+
+    let out = env
+        .command(&["config", "edit"])
+        .env("VISUAL", &visual)
+        .env("EDITOR", &editor)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn vard");
+    assert_eq!(code(&out), 0, "edit failed: {}", stderr(&out));
+    assert!(
+        env.read_config().contains("log_level = \"trace\""),
+        "VISUAL must win over EDITOR, got: {}",
+        env.read_config()
+    );
+}
+
+#[test]
+fn get_reads_the_managed_version() {
+    // F10: `config get version` prints the value and exits 0 (version is
+    // readable, though not settable).
+    let env = Env::new();
+    env.write_config("version = 1\n");
+    let out = env.vard(&["--format", "records", "config", "get", "version"]);
+    assert_eq!(code(&out), 0, "got: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "1");
+}
+
+#[test]
+fn get_of_a_watch_key_points_at_watch_list() {
+    // F10: a read of a watch.* key points at inspection, not the mutation verbs.
+    let env = Env::new();
+    env.write_config("version = 1\n");
+    let out = env.vard(&["config", "get", "watch.0.name"]);
+    assert_eq!(code(&out), 2);
+    assert!(
+        stderr(&out).contains("vard watch list"),
+        "got: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn get_of_a_boolean_is_a_bare_json_bool() {
+    // F12: a boolean key emits a JSON boolean, not a stringified "true".
+    let env = Env::new();
+    env.write_config("version = 1\n\n[defaults]\nsync = true\n");
+    let out = env.vard(&["--format", "json", "config", "get", "defaults.sync"]);
+    assert_eq!(code(&out), 0, "got: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(r#""value":true"#),
+        "expected a bare JSON bool, got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn set_a_bare_number_for_a_duration_surfaces_the_parse_error() {
+    // F3: `defaults.interval 3600` infers an integer the schema rejects; the
+    // string retry ("3600") fails duration parsing, so that parse error surfaces
+    // rather than the opaque integer type error.
+    let env = Env::new();
+    let original = "version = 1\n";
+    env.write_config(original);
+    let out = env.vard(&["config", "set", "defaults.interval", "3600"]);
+    assert_eq!(code(&out), 2, "both forms invalid must exit 2");
+    assert!(
+        stderr(&out).contains("missing unit") || stderr(&out).contains("invalid duration"),
+        "expected the duration parse error, got: {}",
+        stderr(&out)
+    );
+    assert_eq!(env.read_config(), original, "the config must be untouched");
+}
+
+#[test]
+fn set_a_bare_integer_for_an_integer_key_stays_an_integer() {
+    // F3: a valid integer key keeps the integer type (no string retry).
+    let env = Env::new();
+    env.write_config("version = 1\n");
+    let out = env.vard(&["config", "set", "daemon.log_retention_days", "14"]);
+    assert_eq!(code(&out), 0, "got: {}", stderr(&out));
+    assert!(
+        env.read_config().contains("log_retention_days = 14"),
+        "must stay a bare integer, got: {}",
+        env.read_config()
+    );
+    // The confirmation JSON reports the value typed as an integer.
+    let json = env.vard(&[
+        "--format",
+        "json",
+        "config",
+        "set",
+        "daemon.log_retention_days",
+        "30",
+    ]);
+    assert!(
+        stdout(&json).contains(r#""value":30"#),
+        "set must report the stored typed value, got: {}",
+        stdout(&json)
     );
 }

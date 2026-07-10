@@ -296,20 +296,22 @@ anything. With a `<name|path>` it narrows to one watch; with no selector it \
 reports every configured watch.
 
 The first line reports the daemon: running, not running, starting or stopping, \
-or — when a running daemon's health file has gone stale — wedged. Each watch \
+or — when a running daemon's health file has gone stale — stale. Each watch \
 then shows one state: `ok`, `paused` (a pause you chose, which `notify` stays \
-silent about), or a health-vocabulary problem — `blocked`, `snapshots-failing`, \
-`attention`, `conflicted`, or `sync-error` — with how long it has been in it. \
-Unlike `notify`, `status` lists healthy and paused watches too, so it is the \
-on-demand review to `notify`'s always-on prompt hook.
+silent about), `unknown` (nothing is monitoring it because the daemon is not \
+running or still starting), or a health-vocabulary problem — `blocked`, \
+`snapshots-failing`, `attention`, `conflicted`, or `sync-error` — with how long \
+it has been in it. Unlike `notify`, `status` lists healthy and paused watches \
+too, so it is the on-demand review to `notify`'s always-on prompt hook.
 
 Exit codes make it scriptable: 0 when the daemon is running and every reported \
 watch is healthy, 1 when something needs attention (the daemon is not running, \
-starting, or wedged, or a reported watch has a problem), 2 on an operational \
+starting, or stale, or a reported watch has a problem), 2 on an operational \
 error. With a selector the per-watch part reflects only that watch, but \
 daemon-level trouble always folds in. Output follows the global `--format`: \
-human lines by default, or a stable JSON/JSONL array (the daemon carries a null \
-watch name, each configured watch its own object) when piped.")]
+human lines by default, or a stable JSON/JSONL array (the daemon row carries a \
+null watch name and a `daemon: true` flag, each configured watch its own object) \
+when piped.")]
     Status(StatusArgs),
 
     /// Read and edit vard's configuration: get, set, unset, edit, path.
@@ -327,7 +329,7 @@ reloads a clean, whole config every time.
   get    print a key's value (exit 1 when the key is not set)
   set    set a key to a value, rejecting an edit that would break the config
   unset  remove a key
-  edit   open the config in $EDITOR and validate the result
+  edit   open the config in $VISUAL/$EDITOR and validate the result
   path   print the config file's path
 
 The set of watched directories is NOT edited here — a `watch.*` key is refused \
@@ -430,9 +432,11 @@ The key is a dotted name in the `[daemon]`, `[defaults]`, `[ai]`, or `[update]` 
 section (`daemon.log_level`, `defaults.interval`). Only what the file actually \
 sets is printed — an inherited default is not materialized here — so a key the \
 config does not set prints nothing and exits 1, the way `git config` reports an \
-unset key. In records/human output the bare value is printed for easy scripting; \
-`--format json` wraps it as a `{key, value}` object.")]
-    Get(ConfigGetArgs),
+unset key. The bare value is printed in records format (the TTY default) for easy \
+scripting. Piped output defaults to json — a `{key, value}` object — so in a \
+script that captures the value pass `--format records` to get the bare value \
+back.")]
+    Get(ConfigKeyArgs),
 
     /// Set a config key to a value.
     #[command(disable_help_flag = true)]
@@ -459,18 +463,18 @@ not set is reported and exits 2. As with `set`, the result is validated before \
 it lands and a `watch.*` key is refused with a pointer to `vard watch`.")]
     Unset(ConfigKeyArgs),
 
-    /// Open the config file in $EDITOR and validate the result.
+    /// Open the config file in $VISUAL/$EDITOR and validate the result.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
 Open the config file in your editor and validate what you save.
 
-The file is copied to a temporary file, `$EDITOR` (falling back to `$VISUAL`) is \
+The file is copied to a temporary file, `$VISUAL` (falling back to `$EDITOR`) is \
 launched on it, and the result is validated before it replaces the config — \
 written atomically under the config lock so the running daemon never sees a \
-half-written file. If the edit would turn a valid config invalid, it is refused: \
-the parse error and the temporary file's path are printed (so your work is not \
-lost) and the command exits 2. The daemon reloads the change on its own; no \
-signal is needed.")]
+half-written file. If the config changed on disk while you were editing, or the \
+edit would turn a valid config invalid, it is refused: the reason and the \
+temporary file's path are printed (so your work is not lost) and the command \
+exits 2. The daemon reloads the change on its own; no signal is needed.")]
     Edit,
 
     /// Print the path to the config file.
@@ -480,16 +484,10 @@ Print the path to vard's config file.
 
 Resolves the same `$XDG_CONFIG_HOME/vard/config.toml` location the daemon and \
 the other commands use, whether or not the file exists yet, so it can seed a \
-script or an editor invocation.")]
+script or an editor invocation. The bare path prints in records format (the TTY \
+default); piped output defaults to json (a `{path}` object), so pass `--format \
+records` to capture the bare path in a script.")]
     Path,
-}
-
-/// Arguments to `vard config get`.
-#[derive(Debug, Args)]
-pub struct ConfigGetArgs {
-    /// The dotted config key to read, e.g. `daemon.log_level`.
-    #[arg(value_name = "KEY")]
-    pub key: String,
 }
 
 /// Arguments to `vard config set`.
@@ -505,10 +503,11 @@ pub struct ConfigSetArgs {
     pub value: String,
 }
 
-/// Arguments to `vard config unset`.
+/// Arguments to a single-key `vard config` verb (`get`, `unset`): the one dotted
+/// config key it acts on.
 #[derive(Debug, Args)]
 pub struct ConfigKeyArgs {
-    /// The dotted config key to remove, e.g. `ai.model`.
+    /// The dotted config key, e.g. `daemon.log_level` or `ai.model`.
     #[arg(value_name = "KEY")]
     pub key: String,
 }
