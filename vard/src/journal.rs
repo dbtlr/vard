@@ -38,9 +38,12 @@
 //! # File format
 //!
 //! One journal file per watch under [`paths::journal_dir`], the filename
-//! derived from the watch name (see [`Journal::in_dir`]). The format is
-//! line-oriented, human-readable, and internal — no serialization crate. A
-//! `begin` record is written before an operation starts:
+//! derived from the watch's *canonical repository path* (see
+//! [`Journal::for_repo_in_dir`] and [`journal_file_name`]). Path — not name — is
+//! the watch's durable identity (spec §12), so a watch renamed in the config
+//! keeps its journal, and a lock left by a crash is still recoverable after the
+//! rename. The format is line-oriented, human-readable, and internal — no
+//! serialization crate. A `begin` record is written before an operation starts:
 //!
 //! ```text
 //! begin <op> pid=<pid> ts=<unix-seconds>
@@ -61,9 +64,11 @@
 //! and at most one `begin` record is ever live, which is what lets recovery
 //! treat a dangling `begin` as an unambiguous "our abandoned operation" marker.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -101,24 +106,28 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
-    /// The journal for `watch_name` at the default location, one file under
-    /// `$XDG_STATE_HOME/vard/journal`.
-    // The daemon resolves the journal dir via `DaemonPaths` and uses `in_dir`;
-    // this XDG convenience is kept for future non-daemon callers.
+    /// The journal for the watch rooted at `repo_path` at the default location,
+    /// one file under `$XDG_STATE_HOME/vard/journal`.
+    // The daemon resolves the journal dir via `DaemonPaths` and uses
+    // `for_repo_in_dir`; this XDG convenience is kept for future non-daemon
+    // callers.
     #[allow(dead_code)]
-    pub(crate) fn for_watch(watch_name: &str) -> Result<Journal, JournalError> {
+    pub(crate) fn for_repo(repo_path: &Path) -> Result<Journal, JournalError> {
         let dir = paths::journal_dir().map_err(|e| JournalError::Path(e.to_string()))?;
-        Ok(Self::in_dir(&dir, watch_name))
+        Ok(Self::for_repo_in_dir(&dir, repo_path))
     }
 
-    /// The journal for `watch_name` inside `dir`, so tests inject a tempdir.
+    /// The journal for the watch rooted at `repo_path` inside `dir`, so tests
+    /// inject a tempdir.
     ///
-    /// The filename is the watch name with path-hostile characters replaced by
-    /// `_`, suffixed with a hash of the original name so that two names that
-    /// sanitize alike (e.g. `a/b` and `a_b`) still get distinct files.
-    pub(crate) fn in_dir(dir: &Path, watch_name: &str) -> Journal {
+    /// The filename is keyed by the repo's *canonical path identity* (see
+    /// [`journal_file_name`]): a human-readable final path segment plus a hash of
+    /// the full canonical path. Keying by path — the watch's durable identity —
+    /// rather than by its config name means a rename never orphans the journal,
+    /// and two distinct repositories never collide on one file.
+    pub(crate) fn for_repo_in_dir(dir: &Path, repo_path: &Path) -> Journal {
         Journal {
-            path: dir.join(journal_file_name(watch_name)),
+            path: dir.join(journal_file_name(repo_path)),
         }
     }
 
@@ -513,23 +522,218 @@ fn sanitize_token(token: &str) -> String {
         .collect()
 }
 
-/// Derives a filesystem-safe journal filename from a watch name: path-hostile
-/// characters become `_`, and a hash of the original name is appended so
-/// distinct names never collide on one file.
+/// The stable *identity* path for a watch repository: its canonical form
+/// (symlinks resolved) when it can be canonicalized, else the path as given.
 ///
-/// The hash is FNV-1a, hand-rolled so the filename is stable across Rust
-/// toolchains — `DefaultHasher` makes no such guarantee, and an unstable
-/// filename would orphan a dangling journal on upgrade, leaving a stale lock
-/// that recovery could never clean.
-fn journal_file_name(watch_name: &str) -> String {
-    let sanitized: String = watch_name
+/// The fallback is the moved/deleted-directory case — a repository that no
+/// longer exists cannot be canonicalized — and it mirrors [`select`]'s
+/// textual-identity fallback so a watch selected by path and its journal agree
+/// on identity. Because `vard watch add` stores the already-canonical path, the
+/// two forms coincide for a configured watch whether or not its directory is
+/// present, so the key is stable across the repo's existence; a hand-edited
+/// non-canonical config path is the only case where the two can differ, and
+/// then only while the directory exists.
+///
+/// [`select`]: crate::watch::select
+fn identity_path(repo_path: &Path) -> PathBuf {
+    fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf())
+}
+
+/// Derives a filesystem-safe journal filename from a watch's repository path:
+/// the repo's sanitized final path segment (for a human eyeballing the
+/// directory), a hyphen, then a hash of the full canonical path so two repos
+/// that share a final segment (e.g. `~/a/notes` and `~/b/notes`) never collide
+/// on one file.
+///
+/// The hash is FNV-1a over the full identity path's bytes, hand-rolled so the
+/// filename is stable across Rust toolchains — `DefaultHasher` makes no such
+/// guarantee, and an unstable filename would orphan a dangling journal on
+/// upgrade, leaving a stale lock that recovery could never clean.
+pub(crate) fn journal_file_name(repo_path: &Path) -> String {
+    let identity = identity_path(repo_path);
+    let segment = identity
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("root");
+    format!(
+        "{}-{:016x}.journal",
+        sanitize_segment(segment),
+        fnv1a(identity.as_os_str().as_bytes())
+    )
+}
+
+/// The pre-VRD-34 name-keyed journal filename. Retained solely so the
+/// daemon-start/reload sweep ([`reconcile_journals`]) can migrate an existing
+/// name-keyed file to its owner's path key.
+fn legacy_journal_file_name(watch_name: &str) -> String {
+    format!(
+        "{}-{:016x}.journal",
+        sanitize_segment(watch_name),
+        fnv1a(watch_name.as_bytes())
+    )
+}
+
+/// Replaces path-hostile characters in a filename component with `_`, keeping
+/// only ASCII alphanumerics, `.`, and `-`.
+fn sanitize_segment(segment: &str) -> String {
+    segment
         .chars()
         .map(|c| match c {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '-' => c,
             _ => '_',
         })
-        .collect();
-    format!("{sanitized}-{:016x}.journal", fnv1a(watch_name.as_bytes()))
+        .collect()
+}
+
+/// Orphan-journal retention window. A journal whose path key matches no
+/// configured watch (a watch removed, relinked to a new path, or a legacy
+/// name-keyed file superseded by its path-keyed twin) is *history*, not
+/// recovery evidence — but a crash that left a dangling begin plus a stale lock
+/// on a since-removed repo is still recoverable while the journal survives, and
+/// [`Journal::recover`] proves the lock ours if the repo is relinked. Thirty
+/// days covers that relink-recovery window; past it, an orphan is swept and any
+/// residual lock is a manual cleanup. Non-orphan journals are never swept.
+pub(crate) const ORPHAN_JOURNAL_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Tunables for [`reconcile_journals`], injectable so tests need not age real
+/// files.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SweepOpts {
+    /// "Now", against which an orphan journal's mtime age is measured.
+    pub now: SystemTime,
+    /// An orphan journal older than this (by mtime) is deleted.
+    pub max_orphan_age: Duration,
+}
+
+impl SweepOpts {
+    /// Production defaults: real wall clock and [`ORPHAN_JOURNAL_MAX_AGE`].
+    pub(crate) fn new() -> SweepOpts {
+        SweepOpts {
+            now: SystemTime::now(),
+            max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
+        }
+    }
+}
+
+impl Default for SweepOpts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What [`reconcile_journals`] migrated and swept, for the caller to log and for
+/// tests to assert on.
+#[derive(Debug, Default)]
+pub(crate) struct ReconcileReport {
+    /// Legacy name-keyed files renamed to their owner's path key: `(from, to)`.
+    pub migrated: Vec<(PathBuf, PathBuf)>,
+    /// Orphan journals deleted for exceeding [`ORPHAN_JOURNAL_MAX_AGE`].
+    pub gc_deleted: Vec<PathBuf>,
+    /// Non-fatal trouble (a failed rename or delete, an unreadable dir): every
+    /// entry is a human-readable line. Reconciliation never fails the daemon.
+    pub trouble: Vec<String>,
+}
+
+impl ReconcileReport {
+    /// Whether anything happened worth logging.
+    pub(crate) fn is_noop(&self) -> bool {
+        self.migrated.is_empty() && self.gc_deleted.is_empty() && self.trouble.is_empty()
+    }
+}
+
+/// Reconciles the journal directory against the currently configured watches,
+/// run on daemon start and on every reload. Two jobs in one directory scan:
+///
+/// 1. **Migration.** A legacy name-keyed journal whose embedded name matches a
+///    configured watch is renamed to that watch's path key — but only when no
+///    path-keyed file already exists. If both exist, the path-keyed file wins
+///    and the legacy one is left to the orphan sweep (it matches no path key).
+///
+/// 2. **Orphan GC.** Any `*.journal` file whose name is not a configured
+///    watch's path key, and whose mtime is older than [`SweepOpts::max_orphan_age`],
+///    is deleted. A non-orphan journal (its key matches a configured watch) is
+///    never swept, however old.
+///
+/// `owners` are the configured watches as `(stable name, repo path)` pairs —
+/// paused included, since a paused watch still owns its journal.
+///
+/// Best-effort: every failure is folded into [`ReconcileReport::trouble`];
+/// nothing here returns an error or panics, so a journal-directory hiccup never
+/// blocks a daemon start or reload.
+pub(crate) fn reconcile_journals(
+    dir: &Path,
+    owners: &[(&str, &Path)],
+    opts: SweepOpts,
+) -> ReconcileReport {
+    let mut report = ReconcileReport::default();
+
+    // Configured path keys, and — as a side effect — migrate legacy files.
+    let mut configured: HashSet<String> = HashSet::with_capacity(owners.len());
+    for (name, repo_path) in owners {
+        let path_key = journal_file_name(repo_path);
+        let legacy_key = legacy_journal_file_name(name);
+        // A legacy file only needs migrating when its name differs from the path
+        // key (it always does in practice — name bytes and path bytes differ).
+        if legacy_key != path_key {
+            let legacy = dir.join(&legacy_key);
+            let target = dir.join(&path_key);
+            // Rename only when the legacy file exists and the path-keyed file
+            // does not: if both exist, the path-keyed file is authoritative and
+            // the legacy one becomes an orphan for the sweep below.
+            if legacy.exists() && !target.exists() {
+                match fs::rename(&legacy, &target) {
+                    Ok(()) => report.migrated.push((legacy, target)),
+                    Err(e) => report
+                        .trouble
+                        .push(format!("migrating {}: {e}", legacy.display())),
+                }
+            }
+        }
+        configured.insert(path_key);
+    }
+
+    // Orphan GC.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(e) => {
+            report
+                .trouble
+                .push(format!("reading journal dir {}: {e}", dir.display()));
+            return report;
+        }
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.ends_with(".journal") {
+            continue;
+        }
+        // Non-orphan: matches a configured watch's path key. Never swept.
+        if configured.contains(file_name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let age = opts.now.duration_since(mtime).unwrap_or(Duration::ZERO);
+        if age >= opts.max_orphan_age {
+            match fs::remove_file(&path) {
+                Ok(()) => report.gc_deleted.push(path),
+                Err(e) => report
+                    .trouble
+                    .push(format!("sweeping orphan journal {}: {e}", path.display())),
+            }
+        }
+    }
+
+    report
 }
 
 /// 64-bit FNV-1a over `bytes`; a fixed, documented algorithm rather than a
@@ -633,7 +837,8 @@ mod tests {
     #[test]
     fn begin_then_complete_leaves_a_compacted_file() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let repo = dir.path().join("repo");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         journal.begin("snapshot").unwrap();
         assert!(
             fs::metadata(journal.path()).unwrap().len() > 0,
@@ -651,7 +856,7 @@ mod tests {
     fn no_journal_recovers_clean() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // A foreign lock is present, but with no journal it is not ours.
         let report = journal.recover(&repo, RecoveryOpts::new());
         assert!(matches!(report, RecoveryReport::Clean), "got: {report}");
@@ -662,7 +867,7 @@ mod tests {
     fn dangling_dead_pid_old_lock_removes_and_reports() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // ts coherent with the lock's mtime: the lock is inside the op window.
         let ts = mtime_secs(&lock_path(&repo));
         write_dangling(&journal, "snapshot", dead_pid(), ts);
@@ -687,7 +892,7 @@ mod tests {
     fn dangling_alive_pid_leaves_lock() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // Our own PID is alive.
         let ts = mtime_secs(&lock_path(&repo));
         write_dangling(&journal, "snapshot", std::process::id(), ts);
@@ -709,7 +914,7 @@ mod tests {
     fn dangling_dead_pid_fresh_lock_leaves_lock() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // ts coherent with the mtime so the window check passes; only the age
         // gate blocks removal here.
         let ts = mtime_secs(&lock_path(&repo));
@@ -733,7 +938,7 @@ mod tests {
     fn no_dangling_begin_leaves_foreign_lock() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // Empty (compacted) journal — no dangling begin.
         fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
         fs::write(journal.path(), b"").unwrap();
@@ -747,7 +952,7 @@ mod tests {
     fn corrupt_journal_is_conservative() {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
         fs::write(journal.path(), b"this is not a valid record\n").unwrap();
 
@@ -767,7 +972,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap(); // no index.lock
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         write_dangling(&journal, "snapshot", dead_pid(), 1000);
 
         let report = journal.recover(&repo, RecoveryOpts::new());
@@ -790,7 +995,7 @@ mod tests {
         // place even though our owner is dead and the lock is old.
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // begin recorded well after the lock's mtime: lock predates the op.
         let ts = mtime_secs(&lock_path(&repo)) + STALE_LOCK_TS_SLACK.as_secs() + 100;
         write_dangling(&journal, "snapshot", dead_pid(), ts);
@@ -823,7 +1028,7 @@ mod tests {
         // live rebase started hours later. It must be left in place.
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let journal = Journal::in_dir(dir.path(), "notes");
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
         // begin recorded long before the lock's mtime: lock postdates the op.
         let ts = mtime_secs(&lock_path(&repo)) - MAX_OP_WINDOW.as_secs() - 100;
         write_dangling(&journal, "snapshot", dead_pid(), ts);
@@ -845,8 +1050,63 @@ mod tests {
     }
 
     #[test]
-    fn distinct_names_that_sanitize_alike_get_distinct_files() {
-        assert_ne!(journal_file_name("a/b"), journal_file_name("a_b"));
+    fn distinct_paths_get_distinct_journal_files() {
+        // Two repos sharing a final segment must not collide: the full-path hash
+        // separates them even though the human-readable prefix matches.
+        let a = journal_file_name(Path::new("/home/u/a/notes"));
+        let b = journal_file_name(Path::new("/home/u/b/notes"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("notes-"), "human-readable prefix, got: {a}");
+        assert!(b.starts_with("notes-"), "human-readable prefix, got: {b}");
+    }
+
+    #[test]
+    fn journal_key_uses_canonical_identity_but_falls_back_to_text() {
+        // A directory that exists canonicalizes; a symlink to it keys the same.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            journal_file_name(&real),
+            journal_file_name(&link),
+            "a symlink and its target must key the same journal"
+        );
+
+        // A non-existent path cannot canonicalize, so it keys off its own text —
+        // and two distinct missing paths still differ.
+        let gone_a = dir.path().join("gone-a");
+        let gone_b = dir.path().join("gone-b");
+        assert_ne!(journal_file_name(&gone_a), journal_file_name(&gone_b));
+    }
+
+    #[test]
+    fn path_hostile_final_segments_sanitize_without_colliding() {
+        // Two sibling repos whose final segments sanitize alike ("a b" and
+        // "a-b" both keep distinct bytes; a space becomes `_`) must still get
+        // distinct files — the full-path hash guarantees it.
+        let spacey = journal_file_name(Path::new("/data/a b"));
+        assert!(
+            spacey.starts_with("a_b-"),
+            "whitespace sanitized to _, got: {spacey}"
+        );
+        assert_ne!(spacey, journal_file_name(Path::new("/data/a-b")));
+    }
+
+    #[test]
+    fn legacy_key_matches_the_pre_migration_scheme() {
+        // The legacy key is the name run through the same sanitizer and hashed
+        // over the *name* bytes — distinct from the path key for the same watch.
+        assert_eq!(
+            legacy_journal_file_name("a/b"),
+            format!("a_b-{:016x}.journal", fnv1a(b"a/b"))
+        );
+        assert_ne!(
+            legacy_journal_file_name("notes"),
+            journal_file_name(Path::new("/home/u/notes"))
+        );
     }
 
     #[test]
@@ -889,5 +1149,166 @@ mod tests {
         ));
         // An unrepresentable timestamp is conservative: never ours.
         assert!(!lock_in_op_window(begin, u64::MAX));
+    }
+
+    // --- journal reconciliation (migration + orphan GC) ----------------------
+
+    /// Writes an empty journal file `name` under `dir`, returning its mtime so a
+    /// test can age it against an injected `now`.
+    fn touch_journal(dir: &Path, name: &str) -> SystemTime {
+        let path = dir.join(name);
+        fs::write(&path, b"").unwrap();
+        fs::metadata(&path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn migration_renames_a_legacy_file_to_its_path_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("notes");
+        fs::create_dir_all(&repo).unwrap();
+        // A pre-VRD-34 file named by the watch name.
+        let legacy = legacy_journal_file_name("notes");
+        fs::write(dir.path().join(&legacy), b"begin snapshot pid=1 ts=1\n").unwrap();
+
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
+        assert_eq!(report.migrated.len(), 1, "one file migrated: {report:?}");
+        assert!(
+            report.trouble.is_empty(),
+            "migration must not error: {report:?}"
+        );
+        // The legacy name is gone; the path-keyed file now holds the record.
+        assert!(!dir.path().join(&legacy).exists());
+        let path_key = journal_file_name(&repo);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&path_key)).unwrap(),
+            "begin snapshot pid=1 ts=1\n",
+            "the dangling record survives the rename"
+        );
+    }
+
+    #[test]
+    fn migration_keeps_the_path_keyed_file_when_both_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("notes");
+        fs::create_dir_all(&repo).unwrap();
+        let legacy = legacy_journal_file_name("notes");
+        let path_key = journal_file_name(&repo);
+        fs::write(dir.path().join(&legacy), b"legacy\n").unwrap();
+        fs::write(dir.path().join(&path_key), b"authoritative\n").unwrap();
+
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
+        assert!(report.migrated.is_empty(), "no rename when both exist");
+        // Path-keyed file wins, untouched; the legacy file is left as an orphan
+        // (young, so not swept this pass).
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&path_key)).unwrap(),
+            "authoritative\n"
+        );
+        assert!(
+            dir.path().join(&legacy).exists(),
+            "legacy left for the sweep"
+        );
+    }
+
+    #[test]
+    fn orphan_legacy_file_is_swept_once_old() {
+        let dir = tempfile::tempdir().unwrap();
+        // A legacy file whose name matches no configured watch.
+        let orphan = legacy_journal_file_name("long-gone");
+        let mtime = touch_journal(dir.path(), &orphan);
+
+        // No owners: everything is an orphan. Age it past the window.
+        let opts = SweepOpts {
+            now: mtime + ORPHAN_JOURNAL_MAX_AGE + Duration::from_secs(1),
+            max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
+        };
+        let report = reconcile_journals(dir.path(), &[], opts);
+        assert_eq!(report.gc_deleted.len(), 1, "old orphan swept: {report:?}");
+        assert!(!dir.path().join(&orphan).exists());
+    }
+
+    #[test]
+    fn young_orphan_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = journal_file_name(Path::new("/data/removed"));
+        let mtime = touch_journal(dir.path(), &orphan);
+        // now == mtime: age zero, below the window.
+        let opts = SweepOpts {
+            now: mtime,
+            max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
+        };
+        let report = reconcile_journals(dir.path(), &[], opts);
+        assert!(
+            report.gc_deleted.is_empty(),
+            "young orphan kept: {report:?}"
+        );
+        assert!(dir.path().join(&orphan).exists());
+    }
+
+    #[test]
+    fn non_orphan_journal_is_never_swept_however_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("active");
+        fs::create_dir_all(&repo).unwrap();
+        let key = journal_file_name(&repo);
+        let mtime = touch_journal(dir.path(), &key);
+        // Ancient by mtime, but configured: must be kept.
+        let opts = SweepOpts {
+            now: mtime + ORPHAN_JOURNAL_MAX_AGE * 10,
+            max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
+        };
+        let report = reconcile_journals(dir.path(), &[("active", repo.as_path())], opts);
+        assert!(
+            report.gc_deleted.is_empty(),
+            "a configured watch's journal is never swept: {report:?}"
+        );
+        assert!(dir.path().join(&key).exists());
+    }
+
+    #[test]
+    fn a_migrated_legacy_journal_is_recoverable_under_its_path_key() {
+        // The upgrade path: a pre-VRD-34 name-keyed journal recording a crashed
+        // operation is migrated to its repo's path key, and recovery then finds
+        // it there and cleans the stale lock — the wedge the migration prevents.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_lock(dir.path());
+        let ts = mtime_secs(&lock_path(&repo));
+        let legacy = legacy_journal_file_name("notes");
+        fs::write(
+            dir.path().join(&legacy),
+            format!("begin snapshot pid={} ts={ts}\n", dead_pid()),
+        )
+        .unwrap();
+
+        // Migration renames the legacy file to the repo's path key.
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
+        assert_eq!(report.migrated.len(), 1, "legacy file migrated: {report:?}");
+
+        // Recovery under the path key now proves the lock ours and removes it.
+        let mtime = fs::metadata(lock_path(&repo)).unwrap().modified().unwrap();
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
+        let report = journal.recover(
+            &repo,
+            RecoveryOpts {
+                now: mtime + STALE_LOCK_MIN_AGE + Duration::from_secs(1),
+                min_lock_age: STALE_LOCK_MIN_AGE,
+            },
+        );
+        assert!(
+            matches!(report, RecoveryReport::LockRemoved { .. }),
+            "a migrated legacy journal must recover its stale lock, got: {report}"
+        );
+        assert!(!lock_path(&repo).exists(), "the stale lock is cleaned");
+    }
+
+    #[test]
+    fn reconcile_on_a_missing_dir_is_a_clean_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let report = reconcile_journals(&missing, &[], SweepOpts::new());
+        assert!(
+            report.is_noop(),
+            "missing dir reconciles to nothing: {report:?}"
+        );
     }
 }
