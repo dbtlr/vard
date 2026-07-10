@@ -121,13 +121,17 @@ fn open_backend(spec: &WatchSpec) -> Result<GitBackend, CmdError> {
 /// commit, `restore`'s protective-snapshot-plus-checkout). Only ever called
 /// while this process holds the instance lock — the journal's single-writer
 /// invariant.
+///
+/// The journal is keyed by the watch's repository path (its durable identity),
+/// so `watch_name` is used only to word a diagnostic.
 fn journaled<T>(
     journal_dir: &std::path::Path,
+    repo_path: &std::path::Path,
     watch_name: &str,
     op: &str,
     body: impl FnOnce() -> T,
 ) -> T {
-    let journal = Journal::in_dir(journal_dir, watch_name);
+    let journal = Journal::for_repo_in_dir(journal_dir, repo_path);
     if let Err(err) = journal.begin(op) {
         eprintln!("vard: journal begin for {watch_name:?}: {err}");
     }
@@ -138,16 +142,17 @@ fn journaled<T>(
     result
 }
 
-/// Takes one in-process snapshot for `watch_name`, bracketed in the per-watch
-/// operation journal via [`journaled`]. Returns the backend's own result
-/// untouched; the caller maps it to exit semantics.
+/// Takes one in-process snapshot for the watch rooted at `repo_path`, bracketed
+/// in the per-watch operation journal via [`journaled`]. Returns the backend's
+/// own result untouched; the caller maps it to exit semantics.
 fn journaled_snapshot(
     journal_dir: &std::path::Path,
+    repo_path: &std::path::Path,
     watch_name: &str,
     backend: &GitBackend,
     req: &vard_core::SnapshotRequest,
 ) -> Result<Option<vard_core::SnapshotOutcome>, VcsError> {
-    journaled(journal_dir, watch_name, "snapshot", || {
+    journaled(journal_dir, repo_path, watch_name, "snapshot", || {
         backend.snapshot(req)
     })
 }

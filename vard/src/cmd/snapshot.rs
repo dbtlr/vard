@@ -140,7 +140,7 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
         extra_trailers: Vec::new(),
     };
 
-    match journaled_snapshot(&paths.journal_dir, name, &backend, &req) {
+    match journaled_snapshot(&paths.journal_dir, spec.path(), name, &backend, &req) {
         Ok(Some(outcome)) => (committed_record(name, &outcome), 0),
         Ok(None) => (result_record(name, "no changes", None, None, None), 0),
         Err(VcsError::UnsafeState(reason)) => (
