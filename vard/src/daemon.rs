@@ -1913,13 +1913,19 @@ mod tests {
         // path. If the directory is then removed, the cached key must not flip to
         // the textual fallback — recomputing it would truncate the wrong file on
         // `complete`. The cache is what guarantees stability.
+        // Reach the repo through a symlinked component so canonical and textual
+        // forms provably differ on every platform (macOS tempdirs get this for
+        // free via /var -> /private/var; Linux tempdir paths have no symlink,
+        // so the hazard must be constructed explicitly).
         let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("repo")).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("link")).unwrap();
+        let repo = root.path().join("link").join("repo");
         let identity = id("w", &repo);
         let key_before = identity.journal_key.clone();
 
-        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&real).unwrap();
         // Recomputing from scratch now takes the textual fallback and differs...
         assert_ne!(
             key_before,
