@@ -47,20 +47,30 @@ enum KeyMode {
 
 /// Production entry point for `vard config <subcommand>`.
 pub(crate) fn run(cmd: ConfigCommand, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
-    let out = OutCtx::resolve(color, format);
     match cmd {
+        // `get` and `path` are single-value surfaces: absent an explicit
+        // `--format` they emit the bare value regardless of destination (the
+        // TEXT response type). See `output::format` module docs.
+        //
         // `get` distinguishes found (0) from not-set (1, silent) from an
         // operational error (2, with a message), the way `git config` does — the
         // git-config contract this command deliberately mirrors.
-        ConfigCommand::Get(args) => match cmd_get(&out, &args.key) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::from(1),
-            Err(e) => finish(Err(e)),
-        },
-        ConfigCommand::Set(args) => finish(cmd_set(&out, &args.key, &args.value)),
-        ConfigCommand::Unset(args) => finish(cmd_unset(&out, &args.key)),
-        ConfigCommand::Edit => finish(cmd_edit(&out)),
-        ConfigCommand::Path => finish(cmd_path(&out)),
+        ConfigCommand::Get(args) => {
+            let out = OutCtx::resolve_single_value(color, format);
+            match cmd_get(&out, &args.key) {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(1),
+                Err(e) => finish(Err(e)),
+            }
+        }
+        ConfigCommand::Path => finish(cmd_path(&OutCtx::resolve_single_value(color, format))),
+        ConfigCommand::Set(args) => finish(cmd_set(
+            &OutCtx::resolve(color, format),
+            &args.key,
+            &args.value,
+        )),
+        ConfigCommand::Unset(args) => finish(cmd_unset(&OutCtx::resolve(color, format), &args.key)),
+        ConfigCommand::Edit => finish(cmd_edit(&OutCtx::resolve(color, format))),
     }
 }
 
