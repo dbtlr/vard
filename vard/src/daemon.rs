@@ -84,7 +84,7 @@ use vard_core::{
 };
 
 use crate::config::{Config, ConfigError, LogLevel};
-use crate::health::{self, HealthTracker};
+use crate::health;
 use crate::instance::{InstanceLock, LockError, LockRole};
 use crate::journal::{Journal, RecoveryOpts, RecoveryReport};
 use crate::paths::{self, HomeNotFound};
@@ -434,6 +434,14 @@ async fn run_daemon(
         info!("all configured watches are paused; starting idle (a resume will reload)");
     }
 
+    // Remove any crash-leftover health file up front (after lock acquisition,
+    // before recovery/engine build). A stale document must not be trusted during
+    // the startup window: until the engine is built and the first fresh document
+    // is written, `vard notify` sees the lock held with no readable health and
+    // reports an honest "starting or stopping" line rather than a stale problem
+    // set (or a false all-clear).
+    health::clear(&paths.health_file);
+
     recover_stale_locks(&paths, &specs);
 
     let (handle, events, watch_names) = build_started_engine_from_specs(specs)
@@ -592,7 +600,6 @@ async fn try_rebuild(
     old_handle: EngineHandle,
     mut old_events: EventReceiver,
     old_names: Vec<String>,
-    health: &mut HealthTracker,
 ) -> RebuildOutcome {
     match build_started_engine(paths, &old_names).await {
         Some((handle, mut events, names)) => {
@@ -613,7 +620,7 @@ async fn try_rebuild(
                         _ = &mut shutdown => break,
                         received = events.recv() => {
                             let closed = matches!(received, Err(RecvError::Closed));
-                            if matches!(handle_bus(received, paths, health), Action::EngineFailure) {
+                            if matches!(handle_bus(received, paths), Action::EngineFailure) {
                                 failure_seen = true;
                             }
                             if closed {
@@ -623,14 +630,14 @@ async fn try_rebuild(
                     }
                 }
             }
-            drain_remaining_events(paths, &mut old_events, health);
-            // Reconcile the health tracker to the new active watch set: a reload
-            // that removed or renamed a watch leaves no recovery event behind,
-            // so prune its stale problem here rather than report a watch that no
-            // longer exists forever.
-            if health.retain_active(&names) {
-                write_health(health, paths);
-            }
+            drain_remaining_events(paths, &mut old_events);
+            // Regenerate health from the NEW engine's truth. A reload that
+            // removed or renamed a watch leaves no recovery event behind, but
+            // regeneration from `watch_states()` simply omits the vanished watch
+            // — so a stale problem cannot linger, and a still-blocked watch the
+            // new engine re-probed at startup is reflected at once (no rebuild
+            // amnesia).
+            write_health(&handle, paths);
             RebuildOutcome {
                 handle,
                 events,
@@ -655,18 +662,13 @@ async fn try_rebuild(
 /// complete tail of the stream — draining it here guarantees each journal
 /// `begin` written earlier meets the outcome that completes it, instead of
 /// dangling because the supervisor stopped reading mid-bracket.
-fn drain_remaining_events(
-    paths: &DaemonPaths,
-    events: &mut EventReceiver,
-    health: &mut HealthTracker,
-) {
+fn drain_remaining_events(paths: &DaemonPaths, events: &mut EventReceiver) {
     use vard_core::TryRecvError;
     loop {
         match events.try_recv() {
             Ok(event) => {
                 log_event(&event);
                 journal_event(paths, &event);
-                apply_health(health, paths, &event);
             }
             Err(TryRecvError::Lagged(skipped)) => {
                 warn!(skipped, "event bus lagged during shutdown drain");
@@ -714,17 +716,32 @@ async fn supervise(
     // When set, a source-died rebuild is due at this deadline.
     let mut rebuild_at: Option<TokioInstant> = None;
 
-    // Write a fresh health file on startup: a clean, empty problem set that
-    // supersedes any stale file a previous crash may have left behind.
-    let mut health = HealthTracker::new();
-    write_health(&health, &paths);
+    // The health heartbeat: rewrite the document every ~60s even when nothing
+    // changed, so `written_at` stays fresh (notify uses its age to detect a
+    // wedged daemon) and any health-relevant event a lagging subscriber dropped
+    // is reconciled from the engine's own truth on the next tick.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(health::HEARTBEAT_INTERVAL_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Write a fresh health document on startup, regenerated from the engine's
+    // truth (the initial state probe has already flagged any blocked repo), so
+    // it supersedes the crash-leftover file that was cleared before build.
+    write_health(&handle, &paths);
 
     loop {
+        // Coalesce a burst of health-relevant events into a single write per loop
+        // turn (marked here, written once below), rather than a write per event.
+        let mut health_dirty = false;
         let action = tokio::select! {
             _ = shutdown.notified() => Action::Shutdown,
             _ = reload.notified() => {
                 info!("reload requested (SIGHUP)");
                 Action::Reload
+            }
+            _ = heartbeat.tick() => {
+                // Refresh written_at (and self-heal any missed transition).
+                write_health(&handle, &paths);
+                Action::Continue
             }
             _ = poll.tick() => {
                 process_requests(&paths, &handle, &watch_names);
@@ -740,14 +757,23 @@ async fn supervise(
             {
                 Action::BackoffRebuild
             }
-            received = events.recv() => handle_bus(received, &paths, &mut health),
+            received = events.recv() => {
+                health_dirty = received.as_ref().map(health_relevant).unwrap_or(false);
+                handle_bus(received, &paths)
+            }
         };
+
+        // A watch transition changed the projected health picture: regenerate.
+        // (Rebuild/reload paths write their own health from the new engine.)
+        if health_dirty {
+            write_health(&handle, &paths);
+        }
 
         match action {
             Action::Continue => {}
             Action::Shutdown => break,
             Action::Reload => {
-                let outcome = try_rebuild(&paths, handle, events, watch_names, &mut health).await;
+                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watch_names = outcome.watch_names;
@@ -761,7 +787,7 @@ async fn supervise(
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
-                let outcome = try_rebuild(&paths, handle, events, watch_names, &mut health).await;
+                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watch_names = outcome.watch_names;
@@ -787,10 +813,12 @@ async fn supervise(
     handle.shutdown().await;
     // The drain finishes any in-flight pass, so trailing events (including the
     // final DaemonStopped) are logged and their journal brackets closed.
-    drain_remaining_events(&paths, &mut events, &mut health);
-    // Clean shutdown: remove the health file so `vard notify` reports the
-    // daemon-not-running line rather than treating a stale problem set as
-    // current.
+    drain_remaining_events(&paths, &mut events);
+    // Clean shutdown: remove the health file BEFORE the caller releases the
+    // instance lock, so `vard notify` sees either a running daemon with a live
+    // document or no daemon at all — never a stale problem set presented as
+    // current. The window between this clear and the lock release reads as the
+    // honest "starting or stopping" line.
     health::clear(&paths.health_file);
 }
 
@@ -811,19 +839,17 @@ fn schedule_rebuild(
 }
 
 /// Handles one item from the event bus: logs it, journals the commit window if
-/// applicable, updates the health file if the event changed a watch's state,
-/// and reports whether it signals engine failure (a dead signal source or a
-/// closed bus) that warrants a rebuild.
-fn handle_bus(
-    received: Result<Event, RecvError>,
-    paths: &DaemonPaths,
-    health: &mut HealthTracker,
-) -> Action {
+/// applicable, and reports whether it signals engine failure (a dead signal
+/// source or a closed bus) that warrants a rebuild.
+///
+/// It does *not* write the health file: the caller regenerates health from
+/// [`EngineHandle::watch_states`] once per loop turn when a health-relevant
+/// event arrived (see [`health_relevant`]), so a burst coalesces into one write.
+fn handle_bus(received: Result<Event, RecvError>, paths: &DaemonPaths) -> Action {
     match received {
         Ok(event) => {
             log_event(&event);
             journal_event(paths, &event);
-            apply_health(health, paths, &event);
             if is_source_died(&event) {
                 Action::EngineFailure
             } else {
@@ -839,6 +865,14 @@ fn handle_bus(
             Action::EngineFailure
         }
     }
+}
+
+/// Whether an event can change the projected health picture — only a watch
+/// lifecycle transition can. Snapshot/sync/lifecycle chatter does not, so it
+/// never triggers a health rewrite; the periodic heartbeat covers anything a
+/// dropped transition might have missed.
+fn health_relevant(event: &Event) -> bool {
+    matches!(event, Event::WatchStateChanged { .. })
 }
 
 /// Whether an event reports a watch's signal source dying — the one condition a
@@ -955,23 +989,18 @@ fn journal_event(paths: &DaemonPaths, event: &Event) {
     }
 }
 
-/// Folds one event into the health tracker and, when it changed the problem
-/// set (only [`Event::WatchStateChanged`] can), rewrites the health file so it
-/// always reflects *current* problem state — including a watch recovering to
-/// `Ok`, which clears its entry. A write failure is warned, never fatal: a
-/// health-file hiccup must not crash the daemon or interrupt snapshotting, and
-/// `vard notify` degrades to the daemon-not-running/stale path on its own.
-fn apply_health(health: &mut HealthTracker, paths: &DaemonPaths, event: &Event) {
-    if health.observe(event, health::now_secs()) {
-        write_health(health, paths);
-    }
-}
-
-/// Writes the tracker's current problem set to the health file (atomically),
-/// warning on failure. Shared by the per-event update and the startup
-/// fresh-write.
-fn write_health(health: &HealthTracker, paths: &DaemonPaths) {
-    let doc = health.doc(health::now_secs());
+/// Regenerates the health file from the engine's current per-watch truth
+/// ([`EngineHandle::watch_states`]) and writes it atomically. The document is a
+/// pure projection — never patched incrementally — so every write reflects
+/// exactly what the engine reports right now: a recovered watch drops out, a
+/// renamed watch's stale entry cannot linger, and a still-blocked watch a
+/// restart re-probed is present from the first write.
+///
+/// A write failure is warned, never fatal: a health-file hiccup must not crash
+/// the daemon or interrupt snapshotting, and `vard notify` degrades to the
+/// daemon-not-running / starting / stale path on its own.
+fn write_health(handle: &EngineHandle, paths: &DaemonPaths) {
+    let doc = health::doc_from_states(&handle.watch_states(), health::now_secs());
     if let Err(err) = health::write(&paths.health_file, &doc) {
         warn!(error = %err, "could not write health file");
     }

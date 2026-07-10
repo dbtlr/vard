@@ -604,15 +604,20 @@ mod tests {
             let _seed = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
         } // released, but leaves "pid\ndaemon" on disk (a crashed-daemon leftover)
 
-        // A probe grabs the shared lock, then releases it after a short delay —
-        // shorter than the acquirer's total probe-retry budget.
+        // A probe grabs the shared lock, signals that it holds it, then releases
+        // it after a short delay — shorter than the acquirer's total probe-retry
+        // budget. The ready signal makes the ordering deterministic: the acquirer
+        // only starts once the shared hold is in place.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let probe_path = path.clone();
         let probe = std::thread::spawn(move || {
             let f = File::open(&probe_path).unwrap();
             flock(&f, FlockOperation::NonBlockingLockShared).unwrap();
+            ready_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(30));
             drop(f);
         });
+        ready_rx.recv().unwrap();
 
         // The acquirer must not read the stale role=daemon and refuse; it retries
         // past the transient shared hold and takes the lock.
