@@ -19,6 +19,7 @@ pub mod engine;
 pub mod event;
 pub mod excludes;
 pub mod scheduler;
+pub mod timefmt;
 pub mod vcs;
 pub mod watcher;
 

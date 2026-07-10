@@ -92,8 +92,21 @@ impl VcsBackend for FakeBackend {
         Ok(Vec::new())
     }
 
-    fn diff(&self, _from: &VcsRef, _to: Option<&VcsRef>) -> Result<String, VcsError> {
+    fn diff(
+        &self,
+        _from: &VcsRef,
+        _to: Option<&VcsRef>,
+        _pathspec: Option<&std::path::Path>,
+    ) -> Result<String, VcsError> {
         Ok(String::new())
+    }
+
+    fn verify_ref(&self, _rev: &VcsRef) -> Result<bool, VcsError> {
+        unimplemented!("verify_ref is out of scope for the snapshot engine")
+    }
+
+    fn path_exists_at(&self, _rev: &VcsRef, _path: &std::path::Path) -> Result<bool, VcsError> {
+        unimplemented!("path_exists_at is out of scope for the snapshot engine")
     }
 
     fn restore(&self, _target: &RestoreTarget) -> Result<(), VcsError> {
@@ -276,8 +289,21 @@ impl VcsBackend for GatedBackend {
         Ok(Vec::new())
     }
 
-    fn diff(&self, _from: &VcsRef, _to: Option<&VcsRef>) -> Result<String, VcsError> {
+    fn diff(
+        &self,
+        _from: &VcsRef,
+        _to: Option<&VcsRef>,
+        _pathspec: Option<&std::path::Path>,
+    ) -> Result<String, VcsError> {
         Ok(String::new())
+    }
+
+    fn verify_ref(&self, _rev: &VcsRef) -> Result<bool, VcsError> {
+        unimplemented!("verify_ref is out of scope for the snapshot engine")
+    }
+
+    fn path_exists_at(&self, _rev: &VcsRef, _path: &std::path::Path) -> Result<bool, VcsError> {
+        unimplemented!("path_exists_at is out of scope for the snapshot engine")
     }
 
     fn restore(&self, _target: &RestoreTarget) -> Result<(), VcsError> {

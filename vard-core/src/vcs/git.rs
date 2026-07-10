@@ -418,6 +418,13 @@ impl VcsBackend for GitBackend {
                 .as_secs();
             args.push(format!("--since=@{secs}"));
         }
+        if let Some(until) = filter.until {
+            let secs = until
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| VcsError::Parse("until is before the unix epoch".to_string()))?
+                .as_secs();
+            args.push(format!("--until=@{secs}"));
+        }
         if let Some(limit) = filter.limit {
             args.push(format!("--max-count={limit}"));
         }
@@ -435,12 +442,52 @@ impl VcsBackend for GitBackend {
         parse_log(&String::from_utf8_lossy(&out.stdout))
     }
 
-    fn diff(&self, from: &VcsRef, to: Option<&VcsRef>) -> Result<String, VcsError> {
+    fn diff(
+        &self,
+        from: &VcsRef,
+        to: Option<&VcsRef>,
+        pathspec: Option<&Path>,
+    ) -> Result<String, VcsError> {
         // The trailing `--` marks the end of revisions, so a revision string
-        // can never be reinterpreted as a pathspec (or vice versa).
-        match to {
-            Some(to) => self.run(&[], ["diff", from.as_str(), to.as_str(), "--"]),
-            None => self.run(&[], ["diff", from.as_str(), "--"]),
+        // can never be reinterpreted as a pathspec (or vice versa). A scoped
+        // path is passed as a literal pathspec (`:(literal)<path>`) so pathspec
+        // magic is disabled and quoted/space paths match verbatim.
+        let mut args: Vec<OsString> = vec![OsString::from("diff"), OsString::from(from.as_str())];
+        if let Some(to) = to {
+            args.push(OsString::from(to.as_str()));
+        }
+        args.push(OsString::from("--"));
+        if let Some(path) = pathspec {
+            args.push(literal_pathspec(path));
+        }
+        self.run(&[], args)
+    }
+
+    fn verify_ref(&self, rev: &VcsRef) -> Result<bool, VcsError> {
+        // `<rev>^{commit}` requires the ref to resolve to (or peel to) a commit;
+        // `--verify --quiet` exits 1 with no output for anything that does not.
+        let peeled = format!("{}^{{commit}}", rev.as_str());
+        Ok(self.rev_of(&peeled)?.is_some())
+    }
+
+    fn path_exists_at(&self, rev: &VcsRef, path: &Path) -> Result<bool, VcsError> {
+        // `git ls-tree <rev> -- <pathspec>` lists the entry at that path when it
+        // exists in the revision (blob or tree) and prints nothing when it does
+        // not — exiting 0 either way, so presence is read off the stdout, not
+        // the exit code (a real failure like a bad revision still errors). A
+        // literal pathspec disables pathspec magic for verbatim matching.
+        let spec = literal_pathspec(path);
+        let args: [&OsStr; 4] = [
+            OsStr::new("ls-tree"),
+            OsStr::new(rev.as_str()),
+            OsStr::new("--"),
+            spec.as_os_str(),
+        ];
+        let out = git_output(&self.path, &[], args, false)?;
+        if out.status.success() {
+            Ok(!out.stdout.is_empty())
+        } else {
+            Err(classify_failure("ls-tree", &out))
         }
     }
 
@@ -452,11 +499,15 @@ impl VcsBackend for GitBackend {
         // engine must snapshot before calling this (see the trait docs).
         match &target.path {
             Some(path) => {
+                // A literal pathspec (`:(literal)<path>`) disables pathspec magic
+                // so a path with a space or a leading `:` restores verbatim — the
+                // same spelling the scoped diff preview uses, so the two agree.
+                let spec = literal_pathspec(path);
                 let args: [&OsStr; 4] = [
                     OsStr::new("checkout"),
                     OsStr::new(target.rev.as_str()),
                     OsStr::new("--"),
-                    path.as_os_str(),
+                    spec.as_os_str(),
                 ];
                 self.run(&[CFG_NO_HOOKS], args)?;
             }
@@ -683,6 +734,15 @@ fn current_branch(path: &Path) -> Result<Option<String>, VcsError> {
 /// safe-state probe and reconcile's conflict classification.
 fn rebase_in_progress(git_dir: &Path) -> bool {
     git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+}
+
+/// Builds a literal git pathspec (`:(literal)<path>`) as an `OsString`, so
+/// pathspec magic is disabled and a path containing a space, `*`, or a leading
+/// `:` matches verbatim. Non-UTF-8 path bytes are preserved.
+fn literal_pathspec(path: &Path) -> OsString {
+    let mut spec = OsString::from(":(literal)");
+    spec.push(path.as_os_str());
+    spec
 }
 
 /// Whether two paths refer to the same directory, resolving symlinks (macOS

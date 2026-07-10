@@ -4,7 +4,7 @@
 //! nothing, so it is safe against a watch the daemon is actively snapshotting.
 
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use vard_core::{LogFilter, Snapshot, VcsBackend};
 
@@ -32,7 +32,11 @@ fn run_inner(args: LogArgs, color: ColorWhen, format: Option<OutputFormat>) -> C
         Some(s) => Some(parse_since(s)?),
         None => None,
     };
-    let filter = LogFilter { since, limit: None };
+    let filter = LogFilter {
+        since,
+        until: None,
+        limit: None,
+    };
     let snapshots = backend
         .log(&filter)
         .map_err(|e| CmdError::err(format!("reading log for {:?}: {e}", rw.spec.name())))?;
@@ -42,14 +46,11 @@ fn run_inner(args: LogArgs, color: ColorWhen, format: Option<OutputFormat>) -> C
 }
 
 /// Parses a `--since` duration ("2h", "3d") into the cutoff instant that far in
-/// the past, saturating at the epoch.
+/// the past, saturating at the epoch. Shares [`timefmt::duration_back_from_now`]
+/// with `restore --at`, so the two flags interpret a duration identically.
 fn parse_since(raw: &str) -> Result<SystemTime, CmdError> {
     let duration = vard_core::parse_duration(raw).map_err(|e| CmdError::err(e.to_string()))?;
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let back = since_epoch.checked_sub(duration).unwrap_or_default();
-    Ok(UNIX_EPOCH + back)
+    Ok(timefmt::duration_back_from_now(duration, SystemTime::now()))
 }
 
 /// Builds the display record for one snapshot: full id, RFC 3339 UTC time,
