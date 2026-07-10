@@ -103,11 +103,11 @@ pub fn conceptual_sections_for(cmd_path: &str) -> Vec<(String, String)> {
             format!(
                 "{BIN_NAME} watches the directories named in its config file and commits a \
 snapshot into version control whenever their contents change, so a working \
-tree carries its own timeline without manual commits.\n\nThe daemon is the \
-whole of {BIN_NAME} today: `{BIN_NAME} run` holds a single-instance lock on its state \
+tree carries its own timeline without manual commits.\n\nManage the watch set \
+with `{BIN_NAME} watch add`, `remove`, `list`, `pause`, and `resume`; each edits the \
+config file in place. `{BIN_NAME} run` then holds a single-instance lock on its state \
 directory, resolves the config into per-directory watch specs, and supervises \
-the watch-and-snapshot engine until it is stopped. Query and control \
-subcommands land in later releases."
+the watch-and-snapshot engine until it is stopped."
             ),
         )]
     } else {
