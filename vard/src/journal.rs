@@ -76,7 +76,7 @@
 //! and at most one `begin` record is ever live, which is what lets recovery
 //! treat a dangling `begin` as an unambiguous "our abandoned operation" marker.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -238,11 +238,27 @@ impl Journal {
             Err(detail) => return RecoveryReport::Corrupt { detail },
         };
 
+        // Liveness gates everything, before any journal mutation. A dangling
+        // `begin` whose recorded PID is still alive belongs to an in-flight
+        // operation — possibly one whose git `index.lock` does not exist yet (the
+        // window between our journal `begin` and git creating the lock). Compacting
+        // that record — which the lock-Absent branch below does — would destroy the
+        // only recovery evidence a crash in that window leaves, wedging the repo
+        // unrecoverably. So a live holder returns HolderAlive and nothing is
+        // touched, regardless of lock state; only a dead-owner record proceeds to
+        // the Absent-compaction and recovery gates.
+        if pid_is_alive(dangling.pid) {
+            return RecoveryReport::HolderAlive {
+                op: dangling.op,
+                pid: dangling.pid,
+            };
+        }
+
         let lock_path = repo_path.join(".git").join("index.lock");
         let mtime = match lock_mtime(&lock_path) {
             LockMtime::Absent => {
-                // Nothing wedged; drop the dangling record so we don't
-                // reconsider it every start.
+                // Owner is dead and nothing is wedged; drop the dangling record so
+                // we don't reconsider it every start.
                 let _ = self.compact();
                 return RecoveryReport::NoLockPresent { op: dangling.op };
             }
@@ -251,13 +267,6 @@ impl Journal {
             }
             LockMtime::At(mtime) => mtime,
         };
-
-        if pid_is_alive(dangling.pid) {
-            return RecoveryReport::HolderAlive {
-                op: dangling.op,
-                pid: dangling.pid,
-            };
-        }
 
         // The lock is ours only if its mtime falls inside the recorded
         // operation's window ([STALE_LOCK_TS_SLACK] before the begin timestamp
@@ -465,7 +474,9 @@ pub(crate) enum RecoveryReport {
         op: String,
     },
     /// A dangling operation existed and its recorded PID is still alive; the
-    /// lock (if any) was left untouched.
+    /// journal and the lock (if any) were both left untouched — the live holder
+    /// may still be in the pre-lock window, so its record is preserved as the
+    /// sole recovery evidence for a crash there.
     HolderAlive {
         /// The dangling operation's kind.
         op: String,
@@ -688,6 +699,36 @@ pub(crate) fn journal_file_name(repo_path: &Path) -> String {
     journal_file_name_for_identity(&identity_path(repo_path))
 }
 
+/// Detects canonical journal-key aliasing across an ordered set of watches: two
+/// whose repository paths canonicalize to the same [`journal_file_name`] would
+/// share one operation journal, so at most one can be supervised. The **first**
+/// in order wins; each later collider is an alias of that winner. Returns, per
+/// input position, `Some(winner_name)` when the watch at that position is a later
+/// alias of an earlier one, else `None` — order-preserving so callers can `zip`
+/// it back onto their own watch list.
+///
+/// This is the single first-wins rule the daemon's `dedup_aliased_specs` skip and
+/// the `status` / `watch list` markers all share, so the surfaces cannot drift on
+/// *which* watch is the supervised one.
+pub(crate) fn alias_winners<'a, I>(watches: I) -> Vec<Option<String>>
+where
+    I: IntoIterator<Item = (&'a str, &'a Path)>,
+{
+    let mut winners: HashMap<String, String> = HashMap::new();
+    let mut out = Vec::new();
+    for (name, path) in watches {
+        let key = journal_file_name(path);
+        match winners.get(&key) {
+            Some(winner) => out.push(Some(winner.clone())),
+            None => {
+                winners.insert(key, name.to_string());
+                out.push(None);
+            }
+        }
+    }
+    out
+}
+
 /// Derives the journal filename from an already-resolved identity path: the
 /// repo's sanitized final path segment (for a human eyeballing the directory), a
 /// hyphen, then a hash of the full identity path so two repos that share a final
@@ -798,10 +839,19 @@ pub(crate) struct ReconcileReport {
     pub recovered: Vec<(PathBuf, RecoveryReport)>,
     /// Clean orphan journals deleted for exceeding [`ORPHAN_JOURNAL_MAX_AGE`].
     pub gc_deleted: Vec<PathBuf>,
-    /// Dangling orphan journals *retained* rather than swept: a legacy record
-    /// with no `path=`, or one whose lock recovery could not settle. Operator-
-    /// visible so the residual manual cleanup is not silent.
+    /// Dangling orphan journals *retained* rather than swept because recovery
+    /// could not settle them and no live holder explains it: a legacy record with
+    /// no `path=`, a lock still too fresh, or an I/O failure. Operator-visible so
+    /// the residual manual cleanup is not silent.
     pub retained: Vec<PathBuf>,
+    /// Dangling orphan journals whose recorded holder is *still running* (typically
+    /// this very daemon, mid in-flight op — e.g. a watch removed during a snapshot):
+    /// their record was left untouched and is expected to settle on the holder's
+    /// own drain, so this is a benign deferral, distinct from [`retained`]'s
+    /// manual-cleanup class.
+    ///
+    /// [`retained`]: Self::retained
+    pub deferred: Vec<PathBuf>,
     /// Non-fatal trouble (a failed rename or delete, an unreadable dir): every
     /// entry is a human-readable line. Reconciliation never fails the daemon.
     pub trouble: Vec<String>,
@@ -814,6 +864,7 @@ impl ReconcileReport {
             && self.recovered.is_empty()
             && self.gc_deleted.is_empty()
             && self.retained.is_empty()
+            && self.deferred.is_empty()
             && self.trouble.is_empty()
     }
 }
@@ -920,10 +971,42 @@ fn try_migrate_legacy(dir: &Path, name: &str, path_key: &str, report: &mut Recon
     }
 }
 
+/// How [`reconcile_orphan`] should treat an orphan after running recovery
+/// against its encoded repository. Derived from the [`RecoveryReport`] so the
+/// "settle / defer / retain" rule lives in one exhaustive match.
+enum OrphanDisposition {
+    /// Recovery settled the record (compacted it clean, or proved there was
+    /// nothing to do): the orphan is clean and eligible for age-based GC.
+    Settled,
+    /// The record's holder is still running (typically this very daemon, mid
+    /// in-flight op): the record was left untouched and its retention is expected
+    /// to clear on the holder's own drain, so it is a benign deferral.
+    Deferred,
+    /// Recovery could not settle the record and no live holder explains it (a
+    /// too-fresh lock, an I/O failure): retained as live evidence for an operator.
+    Retained,
+}
+
+impl OrphanDisposition {
+    fn of(rep: &RecoveryReport) -> Self {
+        match rep {
+            RecoveryReport::Clean
+            | RecoveryReport::LockRemoved { .. }
+            | RecoveryReport::NoLockPresent { .. }
+            | RecoveryReport::LockNotOurs { .. } => Self::Settled,
+            RecoveryReport::HolderAlive { .. } => Self::Deferred,
+            RecoveryReport::LockTooFresh { .. }
+            | RecoveryReport::Corrupt { .. }
+            | RecoveryReport::Failed { .. } => Self::Retained,
+        }
+    }
+}
+
 /// Recover-then-GC for one orphan journal file (key matches no configured
 /// watch). Recovers a path-bearing dangling record against its repository, then
 /// deletes the file only if it is now clean and past the age window; a dangling
-/// record that cannot be settled is retained. Folds every outcome into `report`.
+/// record whose live holder still runs is deferred, and one that cannot be
+/// settled at all is retained. Folds every outcome into `report`.
 fn reconcile_orphan(
     path: &Path,
     sweep: SweepOpts,
@@ -944,31 +1027,35 @@ fn reconcile_orphan(
         }
     };
 
-    let clean = match dangling {
-        None => true, // no dangling begin — a clean orphan.
+    match dangling {
+        // No dangling begin — a clean orphan; fall through to age-based GC.
+        None => {}
         Some(op) => match op.path {
             Some(repo) => {
                 // Path-bearing: run recovery against the encoded repo, then judge
-                // whether it settled the file (compacted it clean).
+                // whether it settled the file (compacted it clean), is merely
+                // deferred behind a live holder, or is genuinely retained.
                 let rep = journal.recover(&repo, recover);
-                let settled = matches!(
-                    rep,
-                    RecoveryReport::Clean
-                        | RecoveryReport::LockRemoved { .. }
-                        | RecoveryReport::NoLockPresent { .. }
-                        | RecoveryReport::LockNotOurs { .. }
-                );
+                let disposition = OrphanDisposition::of(&rep);
                 report.recovered.push((path.to_path_buf(), rep));
-                settled
+                match disposition {
+                    OrphanDisposition::Settled => {} // fall through to GC
+                    OrphanDisposition::Deferred => {
+                        report.deferred.push(path.to_path_buf());
+                        return;
+                    }
+                    OrphanDisposition::Retained => {
+                        report.retained.push(path.to_path_buf());
+                        return;
+                    }
+                }
             }
             // Legacy record with no encoded path: unrecoverable. Retain.
-            None => false,
+            None => {
+                report.retained.push(path.to_path_buf());
+                return;
+            }
         },
-    };
-
-    if !clean {
-        report.retained.push(path.to_path_buf());
-        return;
     }
 
     // Clean orphan: GC once it ages past the window. (A file recovery just
@@ -1216,6 +1303,34 @@ mod tests {
             "got: {report}"
         );
         assert!(lock_path(&repo).exists(), "live owner's lock must be kept");
+    }
+
+    #[test]
+    fn dangling_alive_pid_absent_lock_preserves_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        // A repo with `.git` but NO `index.lock`: the pre-lock window a live op
+        // sits in between writing its journal `begin` and git creating the lock.
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
+        // Our own PID is alive.
+        write_dangling(&journal, "snapshot", std::process::id(), 0);
+        let before = fs::read(journal.path()).unwrap();
+
+        let report = journal.recover(&repo, RecoveryOpts::new());
+        assert!(
+            matches!(report, RecoveryReport::HolderAlive { .. }),
+            "a live holder's dangling begin must not be compacted even with no lock; got: {report}"
+        );
+        assert_eq!(
+            fs::read(journal.path()).unwrap(),
+            before,
+            "the live holder's recovery evidence must be preserved intact"
+        );
+        assert!(
+            !lock_path(&repo).exists(),
+            "no lock existed and recovery must not create one"
+        );
     }
 
     #[test]
@@ -1722,6 +1837,53 @@ mod tests {
         let report = reconcile_journals(&journal_dir, &[], opts, RecoveryOpts::new());
         assert_eq!(report.gc_deleted.len(), 1, "clean orphan swept: {report:?}");
         assert!(!journal_dir.join(&key).exists());
+    }
+
+    #[test]
+    fn sweep_defers_an_orphan_whose_holder_is_still_running() {
+        // A watch removed during an in-flight snapshot leaves a path-bearing
+        // dangling begin recording THIS process (alive). Recovery returns
+        // HolderAlive, so the sweep must classify it as *deferred* (settles on the
+        // holder's own drain), not *retained* (manual cleanup), and leave the
+        // record untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("live-repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git").join("index.lock"), b"lock").unwrap();
+
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin snapshot pid={} ts=1 path={}\n",
+                std::process::id(),
+                hex_encode(identity_path(&repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+        let before = fs::read(journal.path()).unwrap();
+
+        let report = reconcile_journals(&journal_dir, &[], SweepOpts::new(), RecoveryOpts::new());
+        assert_eq!(
+            report.deferred.len(),
+            1,
+            "a live-holder orphan is deferred: {report:?}"
+        );
+        assert!(
+            report.retained.is_empty(),
+            "a live holder is not manual-cleanup retention: {report:?}"
+        );
+        assert!(
+            report.gc_deleted.is_empty(),
+            "a deferred orphan is never GC'd: {report:?}"
+        );
+        assert_eq!(
+            fs::read(journal.path()).unwrap(),
+            before,
+            "the live holder's record must be left untouched"
+        );
     }
 
     #[test]

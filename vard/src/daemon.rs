@@ -523,9 +523,13 @@ async fn run_daemon(
 
     // Migrate any legacy name-keyed journals to their path keys and sweep old
     // orphans, then recover stale locks — migration first, so a pre-upgrade
-    // journal is under its path key before recovery looks for it there.
+    // journal is under its path key before recovery looks for it there. Recovery
+    // runs over every *defined* watch, paused included: a watch that crashed while
+    // active and was then paused still owns a provably-ours stale lock wedging the
+    // user's own git, and recovery is read-only unless the lock proves ours and
+    // stale — so covering paused watches is safe and never leaves such a lock.
     reconcile_journals(&paths, &defined);
-    recover_stale_locks(&paths, &specs);
+    recover_stale_locks(&paths, defined.iter().map(|w| &w.spec));
 
     let (handle, events, watches) = build_started_engine_from_specs(specs)
         .await
@@ -582,9 +586,16 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
     }
     for path in &report.retained {
         // A dangling orphan the sweep could not settle (legacy record with no
-        // encoded path, or a lock recovery could not prove ours): retained as
+        // encoded path, a lock still too fresh, or an I/O failure): retained as
         // live evidence and surfaced so an operator can clean it up by hand.
         warn!(journal = %path.display(), "retained a dangling orphan journal; recovery could not settle it — manual cleanup may be needed");
+    }
+    for path in &report.deferred {
+        // A dangling orphan whose holder is still running (e.g. a watch removed
+        // during an in-flight snapshot on this very daemon): untouched and expected
+        // to settle on the holder's own drain, so it is informational, not a
+        // manual-cleanup warning.
+        info!(journal = %path.display(), "deferred a dangling orphan journal; its holder is still running and will settle it");
     }
     for trouble in &report.trouble {
         warn!(detail = %trouble, "journal reconciliation hiccup");
@@ -592,9 +603,12 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
 }
 
 /// Runs journal recovery for the given watches, cleaning a provably stale git
-/// index lock left by a previous crash. Every non-`Clean` outcome is logged;
-/// nothing here can fail the daemon (recovery folds all trouble into its
-/// report).
+/// index lock left by a previous crash. Callers pass every *defined* watch
+/// (paused included), not just the active ones: a paused watch that crashed while
+/// active still owns a provably-ours stale lock, and recovery is read-only unless
+/// the lock proves ours and stale — so covering a paused watch never touches a
+/// live or foreign lock. Every non-`Clean` outcome is logged; nothing here can
+/// fail the daemon (recovery folds all trouble into its report).
 fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = &'a WatchSpec>) {
     for spec in specs {
         let journal = Journal::for_repo_in_dir(&paths.journal_dir, spec.path());
@@ -639,12 +653,12 @@ async fn build_started_engine_from_specs(
 /// time"; it runs on both the initial build and every reload, since both funnel
 /// through here.
 fn dedup_aliased_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
-    let mut winners: std::collections::HashMap<String, String> =
-        std::collections::HashMap::with_capacity(specs.len());
+    // Detect aliases with the shared first-wins rule so the daemon's skip and the
+    // `status` / `watch list` markers cannot drift on which watch is supervised.
+    let aliases = journal::alias_winners(specs.iter().map(|s| (s.name(), s.path())));
     let mut kept = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let key = journal::journal_file_name(spec.path());
-        if let Some(winner) = winners.get(&key) {
+    for (spec, alias) in specs.into_iter().zip(aliases) {
+        if let Some(winner) = alias {
             warn!(
                 skipped = spec.name(),
                 kept = %winner,
@@ -654,7 +668,6 @@ fn dedup_aliased_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
             );
             continue;
         }
-        winners.insert(key, spec.name().to_string());
         kept.push(spec);
     }
     kept
@@ -716,11 +729,17 @@ async fn build_started_engine(
         info!("reload: all watches are paused; running idle");
     }
 
+    // Recover stale locks for every *defined* watch (paused included, same as
+    // startup) that this reload newly introduces — one whose journal key was not
+    // already supervised. A watch that crashed-then-paused across a reload still
+    // owns a provably-ours stale lock; recovery is read-only unless the lock
+    // proves ours and stale, so covering paused watches never wedges anything.
     let known_keys = WatchIdentity::key_set(known);
     recover_stale_locks(
         paths,
-        specs
+        defined
             .iter()
+            .map(|w| &w.spec)
             .filter(|spec| !known_keys.contains(&journal::journal_file_name(spec.path()))),
     );
 
@@ -2026,6 +2045,68 @@ mod tests {
         assert!(
             !daemon.is_finished(),
             "an all-paused daemon must stay running idle, not exit"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("idle daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(
+            result.is_ok(),
+            "clean idle shutdown returns Ok, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovers_a_paused_watchs_stale_lock() {
+        // A watch that crashed while active and was then paused still owns a
+        // provably-ours stale index.lock wedging the user's own git. Startup
+        // recovery must cover every DEFINED watch, paused included — not just the
+        // active engine specs — so the lock is cleaned even though the paused watch
+        // never enters the (idle) engine.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!("version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\npaused = true\n"),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        // Plant a crash residue (dead-pid path-keyed journal + aged lock) for the
+        // paused repo.
+        let (_repo, lock) = plant_crashed(&paths.journal_dir, &repo);
+        assert!(lock.exists(), "precondition: the stale lock is present");
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths,
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // Give startup time to run recovery, then confirm the paused watch's stale
+        // lock was cleaned.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !lock.exists(),
+            "a paused watch's provably-ours stale lock must be recovered at startup"
         );
 
         shutdown.notify_one();
