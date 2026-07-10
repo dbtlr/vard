@@ -6,10 +6,10 @@
 //! record blocks carry an identity-line header over aligned key/value rows with
 //! hanging-indent wrap; the separator draws a capped rule.
 //!
-//! These primitives are not yet consumed by a `vard` command (the read/list
-//! commands land in VRD-15+); the module carries an `allow(dead_code)` and is
-//! exercised by the tests below until those commands wire it in.
-#![allow(dead_code)]
+//! The count line, record blocks, and separator are wired into `vard watch
+//! list` (via [`record`](super::record)). The status headline and severity
+//! tally have no consumer yet — they carry a targeted `allow(dead_code)` and
+//! are exercised by the tests below until a status/check command lands.
 
 use std::io::{self, Write};
 
@@ -17,6 +17,7 @@ use super::glyphs::{self, Glyph};
 use super::palette::Palette;
 
 /// Status headline: `{text}…` in `dim`. One trailing newline.
+#[allow(dead_code)] // No consumer yet; a future status command will use it.
 pub fn status_headline(out: &mut dyn Write, p: &Palette, text: &str) -> io::Result<()> {
     write!(out, "{}{text}…{}", p.dim.render(), p.dim.render_reset())?;
     writeln!(out)
@@ -161,6 +162,7 @@ pub fn separator(out: &mut dyn Write, p: &Palette, term_width: usize) -> io::Res
     writeln!(out, "{}{}{}", p.dim.render(), bar, p.dim.render_reset())
 }
 
+#[allow(dead_code)] // Consumed by a future status/notes command.
 #[derive(Debug, Clone, Copy)]
 pub enum NoteLabel {
     Note,
@@ -168,6 +170,7 @@ pub enum NoteLabel {
 }
 
 /// Note line: `{label}: {body}` — label in `accent`, body in `dim`.
+#[allow(dead_code)] // No consumer yet; a future status/notes command will use it.
 pub fn note_line(out: &mut dyn Write, p: &Palette, label: NoteLabel, body: &str) -> io::Result<()> {
     let label_str = match label {
         NoteLabel::Note => "note",
@@ -187,6 +190,7 @@ pub fn note_line(out: &mut dyn Write, p: &Palette, label: NoteLabel, body: &str)
 /// elided and right-aligned counts. If all three are zero, emits a single
 /// "0 {noun} pass" row so the caller still has a visible "the command ran"
 /// signal.
+#[allow(dead_code)] // No consumer yet; a future check/status command will use it.
 pub fn severity_tally(
     out: &mut dyn Write,
     p: &Palette,

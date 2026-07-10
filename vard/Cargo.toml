@@ -19,6 +19,7 @@ vard-core = { path = "../vard-core" }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 rustix = { workspace = true }
 # CLI output + help contract: `anstyle` backs the color palette; `terminal_size`
 # feeds terminal-width wrapping and the pager gate. See `src/output`.

@@ -17,15 +17,71 @@ use super::bin_name::BIN_NAME;
 /// examples.
 pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
     let run = format!("{BIN_NAME} run");
+    let watch = format!("{BIN_NAME} watch");
     if cmd_path == BIN_NAME {
-        vec![(
-            run,
-            "watch every configured directory and snapshot on change".to_string(),
-        )]
+        vec![
+            (
+                run.clone(),
+                "watch every configured directory and snapshot on change".to_string(),
+            ),
+            (
+                format!("{watch} add ~/notes"),
+                "start watching a directory".to_string(),
+            ),
+        ]
     } else if cmd_path == run.as_str() {
         vec![(
             run,
             "run in the foreground until SIGINT or SIGTERM".to_string(),
+        )]
+    } else if cmd_path == watch.as_str() {
+        vec![
+            (
+                format!("{watch} add ~/notes"),
+                "register ~/notes (offering git init if needed)".to_string(),
+            ),
+            (format!("{watch} list"), "show every watch".to_string()),
+        ]
+    } else if cmd_path == format!("{watch} add") {
+        vec![
+            (
+                format!("{watch} add ~/notes"),
+                "watch ~/notes, naming it after the directory".to_string(),
+            ),
+            (
+                format!("{watch} add ~/site --name blog --no-sync"),
+                "watch locally under a custom name, never pushing".to_string(),
+            ),
+            (
+                format!("{watch} add /srv/data --init --branch backup"),
+                "init a repo on branch backup, non-interactively".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{watch} remove") {
+        vec![
+            (
+                format!("{watch} remove notes"),
+                "unregister the watch named notes".to_string(),
+            ),
+            (
+                format!("{watch} remove ~/notes --purge"),
+                "unregister by path and drop its metadata".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{watch} list") {
+        vec![(
+            format!("{watch} list --format json"),
+            "emit the watch list as JSON for a script".to_string(),
+        )]
+    } else if cmd_path == format!("{watch} pause") {
+        vec![(
+            format!("{watch} pause notes"),
+            "stop snapshotting notes until resumed".to_string(),
+        )]
+    } else if cmd_path == format!("{watch} resume") {
+        vec![(
+            format!("{watch} resume notes"),
+            "resume a paused watch".to_string(),
         )]
     } else {
         vec![]
@@ -76,6 +132,35 @@ mod tests {
     #[test]
     fn run_path_has_examples() {
         assert!(!examples_for("vard run").is_empty());
+    }
+
+    #[test]
+    fn watch_subcommands_have_examples() {
+        for path in [
+            "vard watch",
+            "vard watch add",
+            "vard watch remove",
+            "vard watch list",
+            "vard watch pause",
+            "vard watch resume",
+        ] {
+            assert!(
+                !examples_for(path).is_empty(),
+                "missing examples for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn examples_are_keyed_off_bin_name() {
+        // Every example command line starts with the configured BIN_NAME, so a
+        // rename keeps them attached to the right paths.
+        for (cmd, _) in examples_for("vard watch add") {
+            assert!(
+                cmd.starts_with(BIN_NAME),
+                "example not BIN_NAME-prefixed: {cmd}"
+            );
+        }
     }
 
     #[test]

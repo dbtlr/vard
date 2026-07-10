@@ -1,11 +1,13 @@
 mod cli;
 mod config;
+mod config_edit;
 mod daemon;
 mod help;
 mod instance;
 mod journal;
 mod output;
 mod paths;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -32,6 +34,14 @@ fn main() -> ExitCode {
 
     match cli.command {
         Some(Command::Run) => daemon::run(),
+        // A bare `vard watch` (no subcommand) prints watch's short help, like a
+        // bare `vard`.
+        Some(Command::Watch { command: None }) => {
+            ExitCode::from(help::print_command_short(&["watch"], cli.color) as u8)
+        }
+        Some(Command::Watch {
+            command: Some(watch_cmd),
+        }) => watch::run(watch_cmd, cli.color, cli.format),
         None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }

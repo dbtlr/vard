@@ -35,7 +35,7 @@ use vard_core::{TriggerMode, WatchSpec};
 use crate::paths;
 
 /// The only config schema version this binary understands.
-const SUPPORTED_VERSION: i64 = 1;
+pub(crate) const SUPPORTED_VERSION: i64 = 1;
 
 /// Default `[daemon].log_level`, absent an explicit value.
 ///
@@ -167,6 +167,12 @@ pub(crate) struct WatchConfig {
     pub poll_interval: Option<Duration>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Whether the watch is paused. A paused watch stays registered in the
+    /// config and keeps its metadata, but resolves to no [`WatchSpec`], so the
+    /// daemon does not supervise it (see [`Config::resolve`]). Set and cleared by
+    /// `vard watch pause` / `vard watch resume`; absent means not paused.
+    #[serde(default)]
+    pub paused: bool,
     /// Tolerated opaquely for the known-future spec §12 surface.
     #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
@@ -219,7 +225,7 @@ impl Config {
         toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
-    /// Resolves the config into validated [`WatchSpec`]s.
+    /// Resolves the config into validated [`WatchSpec`]s for the daemon.
     ///
     /// Each of `trigger`, `interval`, `quiesce`, `sync`, and `sync_interval`
     /// is resolved watch value > `[defaults]` > core constant, then the watch
@@ -229,17 +235,39 @@ impl Config {
     /// collide on case-insensitive filesystems) and duplicate expanded paths
     /// are rejected.
     ///
+    /// Paused watches are validated like any other (so a typo in a paused
+    /// watch's fields still surfaces) but are then filtered out: a paused watch
+    /// yields no spec, so the daemon does not supervise it. Use
+    /// [`resolve_all`](Self::resolve_all) to see paused watches too — that is
+    /// what `vard watch list` renders.
+    ///
     /// Resolution-stage errors name the offending watch (or `[defaults]`);
     /// malformed durations and type errors surface earlier, at parse time,
     /// with TOML line/column spans instead.
     pub fn resolve(&self) -> Result<Vec<WatchSpec>, ConfigError> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        self.resolve_with_home(home.as_deref())
+        Ok(self
+            .resolve_all()?
+            .into_iter()
+            .filter(|entry| !entry.paused)
+            .map(|entry| entry.spec)
+            .collect())
     }
 
-    /// [`resolve`](Self::resolve) with an explicit home directory, so tests
-    /// need not mutate the process environment.
-    fn resolve_with_home(&self, home: Option<&Path>) -> Result<Vec<WatchSpec>, ConfigError> {
+    /// Resolves every watch — paused ones included — into a [`ResolvedWatch`]
+    /// carrying its validated [`WatchSpec`] and its paused flag. This is the
+    /// listing view; the daemon uses [`resolve`](Self::resolve), which drops
+    /// paused watches.
+    pub fn resolve_all(&self) -> Result<Vec<ResolvedWatch>, ConfigError> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        self.resolve_all_with_home(home.as_deref())
+    }
+
+    /// [`resolve_all`](Self::resolve_all) with an explicit home directory, so
+    /// tests need not mutate the process environment.
+    fn resolve_all_with_home(
+        &self,
+        home: Option<&Path>,
+    ) -> Result<Vec<ResolvedWatch>, ConfigError> {
         // Parse [defaults].trigger once, up front: an error there belongs to
         // [defaults], not to whichever watch happens to inherit it first.
         let default_trigger = self
@@ -255,7 +283,7 @@ impl Config {
         // only: catching canonicalization-level collisions (symlinks, case
         // folding) is the daemon's job at registration time.
         let mut seen_paths: HashMap<PathBuf, String> = HashMap::new();
-        let mut specs = Vec::with_capacity(self.watches.len());
+        let mut resolved = Vec::with_capacity(self.watches.len());
 
         for watch in &self.watches {
             if !seen_names.insert(watch.name.to_lowercase()) {
@@ -317,11 +345,37 @@ impl Config {
                 name: watch.name.clone(),
                 source: e,
             })?;
-            specs.push(spec);
+            resolved.push(ResolvedWatch {
+                spec,
+                paused: watch.paused,
+            });
         }
 
-        Ok(specs)
+        Ok(resolved)
     }
+
+    /// [`resolve`](Self::resolve) with an explicit home directory, so tests
+    /// need not mutate the process environment.
+    #[cfg(test)]
+    fn resolve_with_home(&self, home: Option<&Path>) -> Result<Vec<WatchSpec>, ConfigError> {
+        Ok(self
+            .resolve_all_with_home(home)?
+            .into_iter()
+            .filter(|entry| !entry.paused)
+            .map(|entry| entry.spec)
+            .collect())
+    }
+}
+
+/// One resolved watch: its validated [`WatchSpec`] plus whether it is paused.
+/// The listing view ([`Config::resolve_all`]) returns these so `vard watch
+/// list` can render paused watches, which [`Config::resolve`] filters out.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedWatch {
+    /// The validated watch specification (effective values after inheritance).
+    pub spec: WatchSpec,
+    /// Whether the watch is paused.
+    pub paused: bool,
 }
 
 /// Expands a leading `~/` (or a bare `~`) against `home`. Any other path —
@@ -330,7 +384,7 @@ impl Config {
 ///
 /// Only textual expansion happens here; canonicalization and symlink
 /// resolution stay a registration/daemon concern.
-fn expand_tilde(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn expand_tilde(path: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let Some(s) = path.to_str() else {
         return Some(path.to_path_buf());
     };
@@ -1094,6 +1148,73 @@ poll_interval = "45s"
         )
         .unwrap_err();
         assert!(err.to_string().contains("poll_interval"), "got: {err}");
+    }
+
+    #[test]
+    fn paused_watch_is_filtered_from_resolve_but_kept_in_resolve_all() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "active"
+path = "/data/active"
+
+[[watch]]
+name = "sleeping"
+path = "/data/sleeping"
+paused = true
+"#,
+        )
+        .unwrap();
+        // resolve() (the daemon view) drops the paused watch.
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name(), "active");
+        // resolve_all() (the listing view) keeps both, flagged.
+        let all = config.resolve_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(!all[0].paused);
+        assert!(all[1].paused);
+        assert_eq!(all[1].spec.name(), "sleeping");
+    }
+
+    #[test]
+    fn absent_paused_defaults_to_not_paused() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "w"
+path = "/data/w"
+"#,
+        )
+        .unwrap();
+        let all = config.resolve_all().unwrap();
+        assert!(!all[0].paused);
+    }
+
+    #[test]
+    fn paused_watch_still_has_its_fields_validated() {
+        // A paused watch is dropped from resolve(), but a typo in its fields
+        // must still surface — it is validated before the filter.
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "bad"
+path = "/data/bad"
+paused = true
+trigger = "sometimes"
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.resolve().is_err(),
+            "paused watch must still validate"
+        );
     }
 
     #[test]
