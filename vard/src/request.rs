@@ -70,9 +70,14 @@ impl Request {
 
     /// How long ago this request was written, relative to `now`. Zero when the
     /// stamp is in the future (a clock skew), so a skewed request is treated as
-    /// fresh rather than as impossibly old.
+    /// fresh rather than as impossibly old. A stamp too large to represent as a
+    /// `SystemTime` (corruption or tampering — it still parses as a valid
+    /// `u64`, so the poison path never sees it) reports `Duration::MAX` so the
+    /// staleness gate discards it instead of panicking the daemon.
     pub(crate) fn age(&self, now: SystemTime) -> Duration {
-        let stamped = UNIX_EPOCH + Duration::from_secs(self.requested_at);
+        let Some(stamped) = UNIX_EPOCH.checked_add(Duration::from_secs(self.requested_at)) else {
+            return Duration::MAX;
+        };
         now.duration_since(stamped).unwrap_or(Duration::ZERO)
     }
 }
@@ -167,6 +172,20 @@ mod tests {
         };
         let now = UNIX_EPOCH + Duration::from_secs(1_600);
         assert_eq!(req.age(now), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn age_of_an_unrepresentable_stamp_is_max_not_a_panic() {
+        // A u64 stamp beyond SystemTime's range parses cleanly (the poison
+        // path never sees it), so age() must degrade to "infinitely old" —
+        // the staleness gate then discards the request — rather than panic
+        // the daemon's poll loop with the file still on disk (crash loop).
+        let req = Request {
+            kind: RequestKind::Snapshot,
+            watch: None,
+            requested_at: u64::MAX,
+        };
+        assert_eq!(req.age(SystemTime::now()), Duration::MAX);
     }
 
     #[test]

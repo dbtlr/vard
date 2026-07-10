@@ -108,12 +108,12 @@ const SOURCE_DIED_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 /// treated as a new incident, not a continuation of the previous storm.
 const SOURCE_DIED_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
-/// The concrete filesystem locations the daemon reads and writes, resolved once
 /// How long the daemon waits out a *transient CLI* lock holder before refusing
 /// to start. A CLI `snapshot` taking the lock in-process finishes in well under
 /// this; a duplicate *daemon* holder is refused immediately, not waited on.
 const CLI_HOLDER_WAIT: Duration = Duration::from_secs(3);
 
+/// The concrete filesystem locations the daemon reads and writes, resolved once
 /// at startup. Held explicitly (rather than re-derived from XDG on each use) so
 /// tests can inject a tempdir; [`from_xdg`](Self::from_xdg) is the production
 /// resolver.
