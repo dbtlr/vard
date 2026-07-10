@@ -6,6 +6,12 @@ on:
   pull_request:
   schedule:
     - cron: "17 4 * * 1" # weekly cargo audit / cargo deny refresh
+  workflow_dispatch:
+
+# Superseded runs are cancelled for PRs; main/tag/schedule runs always complete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -76,3 +82,59 @@ jobs:
       # one source and cannot drift.
       - name: binary + artifact smokes (scripts/ci-smoke.sh)
         run: scripts/ci-smoke.sh
+
+  # Cross-target build coverage for the triples release.yml ships via dist.
+  # Build coverage only: no artifact uploads, no publishing — releases stay
+  # tag-driven through release.yml. This job just proves the workspace still
+  # compiles for each release target, and that the dist profile (thin LTO)
+  # actually links, ahead of a tag push.
+  cross:
+    # An every-PR compile gate; the weekly schedule exists only for the lint
+    # job's cargo-audit/deny refresh and gains nothing from a cross build.
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Target triples mirror dist-workspace.toml's `targets` list.
+        include:
+          - os: ubuntu-latest
+            check-targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            dist-target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            check-targets: x86_64-apple-darwin aarch64-apple-darwin
+            dist-target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned toolchain: keep in lockstep with rust-toolchain.toml and mise.toml.
+      - uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: rustup target add
+        run: rustup target add ${{ matrix.check-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-target key so cross caches don't thrash the test job's cache.
+          key: cross-${{ matrix.dist-target }}
+
+      - name: install musl-tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Harmless while the tree is pure Rust; the moment a *-sys/cc dependency
+      # arrives, the musl dist build needs a C compiler wired or it would fail
+      # here even though release.yml's dist container would succeed.
+      - name: wire musl C toolchain
+        if: runner.os == 'Linux'
+        run: echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: cargo check --workspace --locked (cross targets)
+        run: |
+          for target in ${{ matrix.check-targets }}; do
+            cargo check --workspace --locked --target "$target"
+          done
+
+      # Only a real build exercises the dist profile's thin-LTO link stage.
+      - name: cargo build -p vard --profile dist --locked (dist-profile link)
+        run: cargo build -p vard --profile dist --locked --target ${{ matrix.dist-target }}
