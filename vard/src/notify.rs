@@ -135,7 +135,7 @@ fn collect(
             Some(doc) => {
                 if doc.version != health::VERSION {
                     return Err(format!(
-                        "health file schema version {} is newer than this vard understands \
+                        "health file schema version {} is not supported by this vard \
                          (expected {}); upgrade vard",
                         doc.version,
                         health::VERSION

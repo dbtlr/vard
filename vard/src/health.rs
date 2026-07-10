@@ -124,6 +124,19 @@ impl HealthTracker {
         }
     }
 
+    /// Drops problems for watches no longer in `active`, returning whether
+    /// anything was removed. A config reload can shrink or rename the watch set
+    /// (`daemon::build_started_engine`), and a watch that vanishes emits no
+    /// recovery event — so without this reconciliation a watch that was troubled
+    /// when it was removed or renamed would linger in the health file forever,
+    /// and `vard notify` would report a watch that no longer exists.
+    pub(crate) fn retain_active(&mut self, active: &[String]) -> bool {
+        let before = self.problems.len();
+        self.problems
+            .retain(|name, _| active.iter().any(|a| a == name));
+        self.problems.len() != before
+    }
+
     /// Snapshots the current problems into a document stamped `written_at =
     /// now`.
     pub(crate) fn doc(&self, now: u64) -> HealthDoc {
@@ -285,6 +298,20 @@ mod tests {
             1
         ));
         assert!(t.doc(0).problems.is_empty());
+    }
+
+    #[test]
+    fn retain_active_prunes_removed_watches_and_reports_the_change() {
+        let mut t = HealthTracker::new();
+        t.observe(&changed("kept", WatchState::Conflicted, None), 1);
+        t.observe(&changed("removed", WatchState::Attention, None), 1);
+        // A reload leaves only "kept" active; "removed" (troubled) must be
+        // pruned so notify stops reporting a watch that no longer exists.
+        assert!(t.retain_active(&["kept".to_string()]));
+        let names: Vec<_> = t.doc(0).problems.iter().map(|p| p.watch.clone()).collect();
+        assert_eq!(names, vec!["kept"]);
+        // No change when every troubled watch is still active.
+        assert!(!t.retain_active(&["kept".to_string(), "other".to_string()]));
     }
 
     #[test]

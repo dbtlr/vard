@@ -624,6 +624,13 @@ async fn try_rebuild(
                 }
             }
             drain_remaining_events(paths, &mut old_events, health);
+            // Reconcile the health tracker to the new active watch set: a reload
+            // that removed or renamed a watch leaves no recovery event behind,
+            // so prune its stale problem here rather than report a watch that no
+            // longer exists forever.
+            if health.retain_active(&names) {
+                write_health(health, paths);
+            }
             RebuildOutcome {
                 handle,
                 events,

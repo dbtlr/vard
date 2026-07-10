@@ -103,17 +103,25 @@ pub(crate) enum DaemonProbe {
 /// Non-blocking, read-only probe of whether a daemon owns the instance lock at
 /// `path`. Unlike [`acquire_for_cli`](InstanceLock::acquire_for_cli) this never
 /// writes to or creates the lock file and never retries: it opens the file
-/// read-only, attempts one non-blocking exclusive `flock`, and reports the
+/// read-only, attempts one non-blocking *shared* `flock`, and reports the
 /// outcome in microseconds —
 ///
 /// - the file is missing ⇒ no daemon ever ran ⇒ [`DaemonProbe::NotRunning`];
-/// - the lock is free (we take it, then immediately release it on return) ⇒
-///   [`DaemonProbe::NotRunning`];
-/// - the lock is held and the recorded role is `daemon` ⇒
-///   [`DaemonProbe::Running`];
-/// - the lock is held by a non-daemon role, or the role is unreadable ⇒
-///   [`DaemonProbe::NotRunning`] (a CLI holding the lock truthfully means no
-///   daemon).
+/// - the shared lock is granted (nobody holds it exclusively — we take it, then
+///   immediately release it on return) ⇒ [`DaemonProbe::NotRunning`];
+/// - an exclusive holder blocks the shared request and the recorded role is
+///   `daemon` ⇒ [`DaemonProbe::Running`];
+/// - an exclusive holder blocks it but the role is a non-daemon (CLI) or
+///   unreadable ⇒ [`DaemonProbe::NotRunning`] (a CLI holding the lock truthfully
+///   means no daemon).
+///
+/// The lock is taken *shared*, not exclusive, precisely so two concurrent
+/// probes never contend with each other: an exclusive probe would `WOULDBLOCK`
+/// against a peer probe and then misread a crashed daemon's leftover
+/// `role = daemon` as a live daemon (a false `Running`, in the worst case a
+/// silent healthy read of a stale file). Shared probes coexist, yet a shared
+/// request still `WOULDBLOCK`s against the daemon's (or a CLI's) *exclusive*
+/// hold — which is the only thing this needs to detect.
 ///
 /// Any other I/O error (a permission problem opening the file, say) is returned
 /// so the caller can surface an honest operational error rather than guess.
@@ -132,9 +140,9 @@ pub(crate) fn probe_daemon(path: &Path) -> Result<DaemonProbe, LockError> {
         }
     };
 
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        // We took the lock, so nobody held it: no daemon. Dropping `file` on
-        // return releases the flock; we never wrote to the file.
+    match flock(&file, FlockOperation::NonBlockingLockShared) {
+        // The shared lock was granted, so no one holds it exclusively: no
+        // daemon. Dropping `file` on return releases it; we never wrote to it.
         Ok(()) => Ok(DaemonProbe::NotRunning),
         Err(Errno::WOULDBLOCK) => {
             let (_holder, role) = read_holder(path);
@@ -520,6 +528,27 @@ mod tests {
         let held = InstanceLock::acquire_at(&path, LockRole::Cli).unwrap();
         assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
         drop(held);
+    }
+
+    #[test]
+    fn concurrent_probes_do_not_misread_a_crashed_daemon_as_running() {
+        // A crashed daemon (not a clean shutdown) leaves the lock file on disk
+        // still recording role=daemon, but with no live flock holder.
+        let (_dir, path) = temp_lock_path();
+        {
+            let _lock = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        } // dropped: the flock is released, but "pid\ndaemon" remains in the file.
+
+        // A peer `vard notify` probe is mid-flight, holding its *shared* lock on
+        // the same file (exactly what probe_daemon takes).
+        let peer = File::open(&path).unwrap();
+        flock(&peer, FlockOperation::NonBlockingLockShared).unwrap();
+
+        // A second concurrent probe must still report NotRunning: shared locks
+        // coexist, so it never falls into the stale-role read that an exclusive
+        // probe would (which would misreport the dead daemon as Running).
+        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
+        drop(peer);
     }
 
     #[test]
