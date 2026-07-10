@@ -116,6 +116,17 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "show everything that changed since five snapshots ago".to_string(),
             ),
         ]
+    } else if cmd_path == format!("{BIN_NAME} notify") {
+        vec![
+            (
+                format!("{BIN_NAME} notify"),
+                "print a line per troubled watch, silent when healthy".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} notify --format json"),
+                "emit problems as a JSON array for a status bar".to_string(),
+            ),
+        ]
     } else if cmd_path == format!("{BIN_NAME} restore") {
         vec![
             (
@@ -205,6 +216,11 @@ mod tests {
                 "example not BIN_NAME-prefixed: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn notify_path_has_examples() {
+        assert!(!examples_for("vard notify").is_empty());
     }
 
     #[test]
