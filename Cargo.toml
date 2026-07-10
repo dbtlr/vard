@@ -25,7 +25,7 @@ ignore = "0.4"
 # which rewrites config.toml in place without disturbing a user's comments or
 # formatting. See VRD-9 / VRD-15.
 serde = { version = "1", features = ["derive"] }
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "display", "serde"] }
 toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }
 # Advisory `flock` single-instance locking and `kill(pid, 0)` liveness probes
 # for stale-lock recovery back the daemon shell (vard only). `fs` supplies

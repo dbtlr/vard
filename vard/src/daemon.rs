@@ -20,12 +20,14 @@
 //! # The request-file contract (ADR 0004, spec §11)
 //!
 //! The CLI (VRD-15/16) and the daemon do not share memory; they rendezvous
-//! through files under [`paths::request_dir`]. Each file is a small TOML
-//! document:
+//! through files under [`paths::request_dir`]. The schema is owned by
+//! [`crate::request`] (one serde type both sides share); each file is a small
+//! TOML document:
 //!
 //! ```toml
-//! kind = "snapshot"   # or "sync"
-//! watch = "vault"     # optional; omitted means "every watch"
+//! kind = "snapshot"          # or "sync"
+//! watch = "vault"            # optional; omitted means "every watch"
+//! requested_at = 1752000000  # unix seconds; a request too old is discarded
 //! ```
 //!
 //! The daemon polls the directory, and for each file:
@@ -72,7 +74,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
@@ -83,9 +84,10 @@ use vard_core::{
 };
 
 use crate::config::{Config, ConfigError, LogLevel};
-use crate::instance::InstanceLock;
+use crate::instance::{InstanceLock, LockError, LockRole};
 use crate::journal::{Journal, RecoveryOpts, RecoveryReport};
 use crate::paths::{self, HomeNotFound};
+use crate::request::{self, Request, RequestKind};
 
 /// How often the supervisor polls the config file's mtime and drains the
 /// request directory. A control-plane cadence: fast enough that a manual
@@ -107,6 +109,11 @@ const SOURCE_DIED_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 const SOURCE_DIED_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
 
 /// The concrete filesystem locations the daemon reads and writes, resolved once
+/// How long the daemon waits out a *transient CLI* lock holder before refusing
+/// to start. A CLI `snapshot` taking the lock in-process finishes in well under
+/// this; a duplicate *daemon* holder is refused immediately, not waited on.
+const CLI_HOLDER_WAIT: Duration = Duration::from_secs(3);
+
 /// at startup. Held explicitly (rather than re-derived from XDG on each use) so
 /// tests can inject a tempdir; [`from_xdg`](Self::from_xdg) is the production
 /// resolver.
@@ -148,9 +155,32 @@ pub(crate) fn run() -> ExitCode {
         }
     };
 
-    // Hold the lock for the daemon's whole lifetime; contention exits 2.
-    let lock = match InstanceLock::acquire_at(&paths.lock_file) {
+    // Hold the lock for the daemon's whole lifetime; contention exits 2. A
+    // duplicate daemon is refused outright; a transient CLI holder is waited
+    // out briefly, and its message names it as a passing command (not a rival
+    // daemon) so the diagnostic is honest.
+    let lock = match InstanceLock::acquire_for_daemon(&paths.lock_file, CLI_HOLDER_WAIT) {
         Ok(lock) => lock,
+        Err(LockError::Held {
+            holder,
+            role: Some(LockRole::Daemon),
+            ..
+        }) => {
+            eprintln!(
+                "vard: another vard daemon ({}) already owns this state directory; \
+                 only one daemon may run per directory",
+                holder_desc(holder)
+            );
+            return ExitCode::from(2);
+        }
+        Err(LockError::Held { holder, .. }) => {
+            eprintln!(
+                "vard: a transient vard command ({}) is holding the instance lock; \
+                 it should release it shortly — retry `vard run`",
+                holder_desc(holder)
+            );
+            return ExitCode::from(2);
+        }
         Err(err) => {
             eprintln!("vard: {err}");
             return ExitCode::from(2);
@@ -196,6 +226,12 @@ pub(crate) fn run() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Renders a lock holder's PID for a diagnostic, or a placeholder when it could
+/// not be read.
+fn holder_desc(holder: Option<u32>) -> String {
+    holder.map_or_else(|| "PID unknown".to_string(), |pid| format!("PID {pid}"))
 }
 
 /// Loads and validates the config for startup, mapping every failure to a clear
@@ -887,11 +923,28 @@ fn journal_event(paths: &DaemonPaths, event: &Event) {
 }
 
 /// Drains the request directory into the engine (see [`drain_request_dir`] for
-/// the consumption rules).
+/// the consumption rules), discarding any request that has aged past the
+/// staleness window before it reaches the engine.
 fn process_requests(paths: &DaemonPaths, handle: &EngineHandle, watch_names: &[String]) {
+    let now = SystemTime::now();
     drain_request_dir(&paths.request_dir, |request| {
+        if request_is_stale(&request, now) {
+            warn!(
+                ?request,
+                age_secs = request.age(now).as_secs(),
+                "discarding a request older than the staleness window"
+            );
+            return;
+        }
         apply_request(request, handle, watch_names);
     });
+}
+
+/// Whether a drained request is too old to act on: a machine that slept for
+/// hours must not wake to a burst of stale manual snapshots (see
+/// [`request::STALE_AFTER`]).
+fn request_is_stale(request: &Request, now: SystemTime) -> bool {
+    request.age(now) > request::STALE_AFTER
 }
 
 /// Whether `name` is a *settled* request file the daemon may consume: a plain
@@ -937,7 +990,7 @@ fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
             continue;
         }
         match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_request(&text) {
+            Ok(text) => match request::parse(&text) {
                 Ok(request) => on_request(request),
                 Err(err) => {
                     warn!(file = %path.display(), error = %err, "malformed request file; dropping");
@@ -981,34 +1034,6 @@ fn apply_request(request: Request, handle: &EngineHandle, watch_names: &[String]
             info!("sync requested but not yet implemented (VRD-19); dropping");
         }
     }
-}
-
-/// A parsed request file (see the [module docs](self) for the contract).
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    /// The operation requested.
-    kind: RequestKind,
-    /// The target watch; `None` means every watch.
-    #[serde(default)]
-    watch: Option<String>,
-}
-
-/// The operations a request file can name.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum RequestKind {
-    /// Take a snapshot now.
-    Snapshot,
-    /// Sync with the remote (not yet implemented).
-    Sync,
-}
-
-/// Parses a request file's TOML text, returning a human-readable error string on
-/// any malformation (missing/unknown `kind`, unknown fields, or invalid TOML) so
-/// the poison file can be logged and dropped.
-fn parse_request(text: &str) -> Result<Request, String> {
-    toml::from_str(text).map_err(|err| err.to_string())
 }
 
 /// Reads a file's modification time, or `None` if it is missing or unreadable.
@@ -1104,56 +1129,25 @@ impl SourceDiedBackoff {
 mod tests {
     use super::*;
 
-    // --- request-file parsing ------------------------------------------------
+    // --- request-file staleness ----------------------------------------------
 
     #[test]
-    fn parses_a_snapshot_request_with_a_watch() {
-        let req = parse_request("kind = \"snapshot\"\nwatch = \"vault\"\n").unwrap();
-        assert_eq!(
-            req,
-            Request {
-                kind: RequestKind::Snapshot,
-                watch: Some("vault".to_string()),
-            }
-        );
+    fn a_request_within_the_window_is_not_stale() {
+        let now = SystemTime::now();
+        let req = Request::snapshot(Some("w".to_string()));
+        assert!(!request_is_stale(&req, now));
     }
 
     #[test]
-    fn parses_a_snapshot_request_without_a_watch() {
-        let req = parse_request("kind = \"snapshot\"\n").unwrap();
-        assert_eq!(req.kind, RequestKind::Snapshot);
-        assert_eq!(req.watch, None, "an absent watch fans out to all watches");
-    }
-
-    #[test]
-    fn parses_a_sync_request() {
-        let req = parse_request("kind = \"sync\"\n").unwrap();
-        assert_eq!(req.kind, RequestKind::Sync);
-    }
-
-    #[test]
-    fn missing_kind_is_an_error() {
-        let err = parse_request("watch = \"vault\"\n").unwrap_err();
-        assert!(
-            err.contains("kind"),
-            "error should name the missing key: {err}"
-        );
-    }
-
-    #[test]
-    fn unknown_kind_is_an_error() {
-        assert!(parse_request("kind = \"restore\"\n").is_err());
-    }
-
-    #[test]
-    fn unknown_field_is_rejected() {
-        // A poison file with a stray key must be rejected, not silently accepted.
-        assert!(parse_request("kind = \"snapshot\"\nwhen = \"now\"\n").is_err());
-    }
-
-    #[test]
-    fn invalid_toml_is_an_error_not_a_panic() {
-        assert!(parse_request("this is not toml = = =").is_err());
+    fn a_request_past_the_window_is_stale() {
+        let now = SystemTime::UNIX_EPOCH + request::STALE_AFTER + Duration::from_secs(1_000);
+        // Stamped at the epoch: well past the staleness window relative to now.
+        let req = Request {
+            kind: RequestKind::Snapshot,
+            watch: None,
+            requested_at: 0,
+        };
+        assert!(request_is_stale(&req, now));
     }
 
     // --- request-file consumption --------------------------------------------
@@ -1178,7 +1172,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = |name: &str| dir.path().join(name);
         // A settled, valid request.
-        std::fs::write(file("ok.toml"), "kind = \"snapshot\"\nwatch = \"vault\"\n").unwrap();
+        std::fs::write(
+            file("ok.toml"),
+            "kind = \"snapshot\"\nwatch = \"vault\"\nrequested_at = 1752000000\n",
+        )
+        .unwrap();
         // A settled poison file: consumed (deleted) but produces no request.
         std::fs::write(file("poison.toml"), "not toml = = =").unwrap();
         // Unsettled names: a writer mid-flight, must be left untouched.
@@ -1194,6 +1192,7 @@ mod tests {
             vec![Request {
                 kind: RequestKind::Snapshot,
                 watch: Some("vault".to_string()),
+                requested_at: 1_752_000_000,
             }],
             "exactly the one valid settled request is delivered"
         );
@@ -1434,9 +1433,11 @@ mod tests {
         // Make the interval-only watch dirty (no watcher, so nothing auto-fires)
         // and drop a manual snapshot request for it: only the request commits it.
         std::fs::write(manual.join("note.md"), b"manual note").unwrap();
-        std::fs::write(
-            paths.request_dir.join("req-1.toml"),
-            "kind = \"snapshot\"\nwatch = \"manual\"\n",
+        // A fresh manual request for the interval-only watch, stamped now so it
+        // clears the daemon's staleness gate.
+        request::write(
+            &paths.request_dir,
+            &request::Request::snapshot(Some("manual".to_string())),
         )
         .unwrap();
         wait_for_commits(&manual, 2, None).await;
@@ -1446,15 +1447,26 @@ mod tests {
             head_message(&manual)
         );
 
-        // The consumed request file is deleted.
+        // The consumed request file is deleted: no settled `*.toml` remains.
+        let settled_remaining = || {
+            std::fs::read_dir(&paths.request_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.file_name().to_str().is_some_and(is_settled_request_name))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
         for _ in 0..50 {
-            if !paths.request_dir.join("req-1.toml").exists() {
+            if settled_remaining() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            !paths.request_dir.join("req-1.toml").exists(),
+        assert_eq!(
+            settled_remaining(),
+            0,
             "a consumed request file must be deleted"
         );
 

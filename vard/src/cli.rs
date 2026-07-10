@@ -163,7 +163,15 @@ commit (or `no changes`) is reported per watch.
 
 A repository that is not in a safe state — mid-merge, mid-rebase, on the wrong \
 branch, or with a detached HEAD — is skipped with an explanation and the \
-command exits 1 (attention), never committing into an in-progress operation.
+command exits 1 (attention), never committing into an in-progress operation. A \
+running daemon defers its manual snapshots the same way, so finish the \
+merge/rebase (or leave the wrong branch) and re-run.
+
+A watch that is paused is not snapshotted by the daemon: when a daemon is \
+running, requesting a snapshot of a paused watch exits 1 rather than silently \
+queuing work the daemon will drop — resume it, or stop the daemon to snapshot \
+in-process (an in-process manual snapshot of a paused watch is still allowed, \
+as explicit intent).
 
 `-m` prepends a message paragraph to the generated snapshot subject.")]
     Snapshot(SnapshotArgs),
@@ -217,20 +225,26 @@ Choose the point to restore from with exactly one of:
 
   --ref <sha>   a snapshot id (or any revision git understands)
   --at <when>   the snapshot current as of a past time — a duration counted
-                back from now (`2h`, `3d`), or an absolute date `YYYY-MM-DD`
-                or `YYYY-MM-DD HH:MM` (interpreted as UTC). Natural-language
-                forms like `yesterday 3pm` are deliberately NOT supported and
-                are rejected with this list.
+                back from now (`2h`, `3d`), or an absolute UTC date/time
+                `YYYY-MM-DDThh:mm` (the `T` needs no shell quoting). A bare
+                `YYYY-MM-DD` means the END of that day (state as of that day);
+                the space form `YYYY-MM-DD hh:mm` also works but must be quoted.
+                Natural-language forms like `yesterday 3pm` are deliberately NOT
+                supported and are rejected with this list.
 
 `--file <subpath>` restores just that one path (relative to the watch root) \
 instead of the whole tree. `--dry-run` previews the differences a restore \
 would overwrite, via a diff, without changing anything (and without taking the \
-protective snapshot, since nothing is modified).
+protective snapshot, since nothing is modified). A whole-tree dry-run excludes \
+files added after the chosen point, which a restore keeps rather than removes.
 
 If the daemon is running it keeps ownership of the repository; the restore \
-still proceeds, and the daemon will snapshot the restored state afterward — \
-that is by design. Restoring a path that does not exist at the chosen \
-reference reports a friendly error naming the path and the reference.")]
+still proceeds (git's own index lock serializes it against the daemon), and the \
+daemon will snapshot the restored state afterward — that is by design. In that \
+daemon-running case the restore is NOT journaled (only the lock holder journals), \
+so if this command crashes mid-restore a leftover git lock may need clearing by \
+hand — a tracked doctor-tool follow-up. Restoring a path that does not exist at \
+the chosen reference reports a friendly error naming the path and the reference.")]
     Restore(RestoreArgs),
 }
 
@@ -284,7 +298,8 @@ pub struct RestoreArgs {
     pub reference: Option<String>,
 
     /// Restore the snapshot current as of a past time: a duration back from now
-    /// (2h, 3d), or an absolute UTC date YYYY-MM-DD optionally with HH:MM.
+    /// (2h, 3d), or an absolute UTC date/time YYYY-MM-DDThh:mm (a bare
+    /// YYYY-MM-DD means end of that day; the space form needs quoting).
     #[arg(long, value_name = "WHEN")]
     pub at: Option<String>,
 

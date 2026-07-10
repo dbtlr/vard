@@ -9,42 +9,56 @@
 //! overwrite is committed to history and recoverable from the log. `--dry-run`
 //! takes no protective snapshot because it changes nothing.
 //!
-//! # Interaction with a running daemon (documented, not locked)
+//! The chosen revision is validated (see [`VcsBackend::verify_ref`]) *before*
+//! any protective snapshot, so a typo'd `--ref` fails cleanly with nothing
+//! changed — and the dry-run and real paths reject bad input identically.
 //!
-//! Unlike `snapshot`, restore cannot use the single-instance lock as a guard:
-//! when a daemon is running it *holds* that lock, so the CLI could never take
-//! it. Restore therefore proceeds without it. Two honest consequences:
+//! # The journal single-writer invariant
 //!
-//! * The daemon will observe the restored files change and snapshot the
-//!   restored state shortly after — that is by design; the restore is just
-//!   another edit as far as the daemon is concerned.
-//! * The protective snapshot and the restore each shell out to git while the
-//!   daemon may also be committing the same repo. git's own `index.lock`
-//!   serializes them, so the worst case is a [`VcsError::LockContended`], which
-//!   is surfaced as a retryable "attention" outcome — never data loss. The
-//!   per-watch operation journal is keyed by watch name and is written by both
-//!   the daemon and this command; because each brackets its own operation and
-//!   compacts on completion, a concurrent write can at worst leave a transient
-//!   record naming the live daemon (so a later recovery sees a live holder and
-//!   declines to touch the lock — the conservative outcome). No ad-hoc locking
-//!   is invented here; the residual race is documented rather than papered
-//!   over.
+//! The per-watch operation journal has exactly one writer: whoever holds the
+//! instance lock. The daemon holds it for its lifetime; an in-process CLI holds
+//! it for the duration of its operation. Restore honors this by *trying* to
+//! acquire the instance lock and branching on who holds it:
+//!
+//! * **We acquire it** (no daemon): we hold it across BOTH the protective
+//!   snapshot and the checkout, journaling the pair as one
+//!   `begin("restore")`→`complete` bracket, so a crash mid-restore leaves one
+//!   recoverable record. This is the common, fully-protected case.
+//! * **A daemon holds it**: the daemon is the journal's writer, so we must NOT
+//!   write it. We proceed without journaling — git's own `index.lock`
+//!   serializes our two git commands against the daemon's, so the worst case is
+//!   a [`VcsError::LockContended`], surfaced as a retryable "attention"
+//!   outcome, never data loss. The residual risk is narrow: if *this* process
+//!   crashes between the protective snapshot's `git add`/`commit` and its
+//!   completion, no journal record names the abandoned `index.lock`, so the
+//!   next daemon start cannot prove it stale and clean it — a human (or the
+//!   tracked doctor-tool follow-up) must remove it. This is the honest cost of
+//!   not owning the lock; it is documented rather than papered over with ad-hoc
+//!   locking.
+//! * **A peer CLI holds it**: we wait a bounded spell and then report honestly
+//!   that another command is running, rather than racing it.
 
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use vard_core::{
-    LogFilter, RestoreTarget, SafeState, SnapshotRequest, Trigger, VcsBackend, VcsError, VcsRef,
+    LogFilter, RestoreTarget, SafeState, SnapshotOutcome, SnapshotRequest, Trigger, VcsBackend,
+    VcsError, VcsRef,
 };
 
 use super::timefmt::{format_rfc3339_utc, parse_at};
 use super::{
-    CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_raw_paged, journaled_snapshot,
-    load_config, open_backend, select_one,
+    CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_raw_paged, load_config, open_backend,
+    select_one,
 };
 use crate::cli::{ColorWhen, OutputFormat, RestoreArgs};
+use crate::instance::{CliLock, InstanceLock};
 use crate::output::record::{Record, RecordField};
+
+/// How long a real restore waits out a *peer CLI* lock holder before reporting
+/// that another command is running (matching `vard snapshot`).
+const CLI_LOCK_BUDGET: Duration = Duration::from_secs(10);
 
 /// Entry point for `vard restore`.
 pub(crate) fn run(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
@@ -61,15 +75,63 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
     let name = rw.spec.name();
 
     let rev = resolve_rev(&backend, &args, name)?;
+    // Validate the revision BEFORE any protective snapshot, so a typo'd --ref
+    // fails with nothing changed and the dry-run and real paths agree on bad
+    // input. (`--at` always resolves to a real snapshot id, but verifying it too
+    // costs nothing and keeps one code path.)
+    if !backend
+        .verify_ref(&rev)
+        .map_err(|e| CmdError::err(format!("verifying {rev} in watch {name:?}: {e}")))?
+    {
+        return Err(CmdError::err(format!(
+            "no such revision {rev} in watch {name:?}"
+        )));
+    }
     let file = args.file.clone();
 
     if args.dry_run {
         return dry_run(&out, &backend, &rev, file.as_deref(), name);
     }
 
+    // A real restore journals only while holding the instance lock (the
+    // single-writer invariant). Branch on who holds it.
+    match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
+        Ok(CliLock::Acquired(lock)) => {
+            let result = real_restore(&paths, &out, &backend, &rev, file.as_deref(), name, true);
+            // Hold the lock across the whole restore; drop it only now.
+            drop(lock);
+            result
+        }
+        // A daemon owns the repo; git's index.lock serializes us against it, so
+        // restore WITHOUT journaling (we are not the journal's writer).
+        Ok(CliLock::DaemonHeld) => {
+            real_restore(&paths, &out, &backend, &rev, file.as_deref(), name, false)
+        }
+        Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
+            "another vard command is running; retry in a moment",
+        )),
+        Err(e) => Err(CmdError::err(format!("acquiring instance lock: {e}"))),
+    }
+}
+
+/// Performs a real restore: protective snapshot, then checkout. When `journaled`
+/// (we hold the instance lock), both are bracketed as one `begin("restore")`→
+/// `complete` operation; otherwise (a daemon holds the lock) they run
+/// unjournaled — see the [module docs](self) for why.
+#[allow(clippy::too_many_arguments)]
+fn real_restore(
+    paths: &CmdPaths,
+    out: &OutCtx,
+    backend: &impl VcsBackend,
+    rev: &VcsRef,
+    file: Option<&Path>,
+    name: &str,
+    journaled: bool,
+) -> CmdResult {
     // Protective snapshot first — a real restore may never destroy the only
     // copy of uncommitted work. The repo must be safe to commit into to protect
-    // it; if it is not, refuse the restore rather than restore unprotected.
+    // it; if it is not, refuse rather than restore unprotected. This check sits
+    // OUTSIDE the journal bracket so a doomed restore writes no record.
     match backend
         .is_safe_state()
         .map_err(|e| CmdError::err(format!("checking {name:?}: {e}")))?
@@ -88,37 +150,48 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
         user_text: Some(format!("pre-restore snapshot before restoring to {rev}")),
         extra_trailers: Vec::new(),
     };
-    let protective = match journaled_snapshot(&paths.journal_dir, name, &backend, &req) {
-        Ok(outcome) => outcome,
-        Err(VcsError::UnsafeState(reason)) => {
-            return Err(CmdError::attention(format!(
-                "cannot restore {name:?}: repository became unsafe ({reason}); nothing was changed"
-            )));
-        }
-        Err(VcsError::LockContended { .. }) => {
-            return Err(CmdError::attention(
-                "another vard operation holds the git lock; retry later — nothing was changed",
-            ));
-        }
-        Err(e) => {
-            return Err(CmdError::err(format!(
-                "protective snapshot failed for {name:?}: {e}; restore aborted"
-            )));
-        }
-    };
-
-    // Now overwrite the tree (or the one file) with the target revision.
     let target = RestoreTarget {
         rev: rev.clone(),
-        path: file.clone(),
+        path: file.map(Path::to_path_buf),
     };
-    backend
-        .restore(&target)
-        .map_err(|e| map_restore_err(e, &rev, file.as_deref(), name))?;
+
+    // The protective snapshot AND the checkout are one operation: the protective
+    // snapshot uses the RAW backend call (not `journaled_snapshot`) so it opens
+    // no nested bracket that would clobber the outer `restore` one.
+    let flow = || -> Result<Option<SnapshotOutcome>, CmdError> {
+        let protective = match backend.snapshot(&req) {
+            Ok(outcome) => outcome,
+            Err(VcsError::UnsafeState(reason)) => {
+                return Err(CmdError::attention(format!(
+                    "cannot restore {name:?}: repository became unsafe ({reason}); \
+                     nothing was changed"
+                )));
+            }
+            Err(VcsError::LockContended { .. }) => {
+                return Err(CmdError::attention(
+                    "another vard operation holds the git lock; retry later — nothing was changed",
+                ));
+            }
+            Err(e) => {
+                return Err(CmdError::err(format!(
+                    "protective snapshot failed for {name:?}: {e}; restore aborted"
+                )));
+            }
+        };
+        backend
+            .restore(&target)
+            .map_err(|e| map_restore_err(e, rev, target.path.as_deref(), name))?;
+        Ok(protective)
+    };
+
+    let protective = if journaled {
+        super::journaled(&paths.journal_dir, name, "restore", flow)
+    } else {
+        flow()
+    }?;
 
     let protective_id = protective.map(|o| o.id.as_str().to_string());
     let scope = file
-        .as_ref()
         .map(|f| format!("{} in ", f.display()))
         .unwrap_or_default();
     let human = match &protective_id {
@@ -133,14 +206,11 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
             RecordField::str("name", name),
             RecordField::str("status", "restored"),
             RecordField::str("restored_to", rev.as_str()),
-            RecordField::opt(
-                "file",
-                file.as_ref().map(|f| f.to_string_lossy().to_string()),
-            ),
+            RecordField::opt("file", file.map(|f| f.to_string_lossy().to_string())),
             RecordField::opt("protective_snapshot", protective_id),
         ],
     };
-    emit_action(&out, &human, &record)
+    emit_action(out, &human, &record)
 }
 
 /// Resolves the revision to restore from: `--ref` directly, or `--at`
@@ -160,19 +230,19 @@ fn resolve_rev(
     }
 }
 
-/// Composes `--at` from the log: parse the time expression, then pick the most
-/// recent snapshot committed at or before it (the state that was current then).
+/// Composes `--at` from the log: parse the time expression, then ask git
+/// directly for the newest snapshot at or before it (`--until` + a limit of one)
+/// — the state that was current then — rather than fetching the whole history.
 fn resolve_at(backend: &impl VcsBackend, at_expr: &str, name: &str) -> Result<VcsRef, CmdError> {
     let cutoff = parse_at(at_expr, SystemTime::now()).map_err(CmdError::err)?;
     let snapshots = backend
         .log(&LogFilter {
             since: None,
-            limit: None,
+            until: Some(cutoff),
+            limit: Some(1),
         })
         .map_err(|e| CmdError::err(format!("reading log for {name:?}: {e}")))?;
-    // The log is most-recent-first, so the first entry at or before the cutoff
-    // is the snapshot that was current at that time.
-    match snapshots.iter().find(|s| s.time <= cutoff) {
+    match snapshots.first() {
         Some(snapshot) => Ok(VcsRef::from(&snapshot.id)),
         None => Err(CmdError::err(format!(
             "no snapshot at or before {} for watch {name:?}",
@@ -181,10 +251,11 @@ fn resolve_at(backend: &impl VcsBackend, at_expr: &str, name: &str) -> Result<Vc
     }
 }
 
-/// `--dry-run`: preview the differences a restore would overwrite, via a diff
-/// of the target revision against the current tree, without changing anything.
-/// For a single `--file`, the whole-tree diff is filtered to that path's
-/// sections so the preview matches the scoped restore.
+/// `--dry-run`: preview the differences a restore would overwrite, without
+/// changing anything. A `--file` preview is scoped at the git level to that one
+/// literal path (so a `--file` restore and its preview agree); a whole-tree
+/// preview excludes files added *after* the target revision, which the real
+/// whole-tree checkout keeps rather than overwrites.
 fn dry_run(
     out: &OutCtx,
     backend: &impl VcsBackend,
@@ -192,49 +263,115 @@ fn dry_run(
     file: Option<&Path>,
     name: &str,
 ) -> CmdResult {
-    let diff = backend
-        .diff(rev, None)
-        .map_err(|e| CmdError::err(format!("previewing restore of {name:?}: {e}")))?;
-    let scoped = match file {
-        Some(path) => filter_diff_by_path(&diff, path),
-        None => diff,
-    };
+    match file {
+        Some(path) => dry_run_file(out, backend, rev, path, name),
+        None => dry_run_tree(out, backend, rev, name),
+    }
+}
 
-    if scoped.trim().is_empty() {
-        let scope = file
-            .map(|p| format!("{} in ", p.display()))
-            .unwrap_or_default();
+/// Whole-tree dry-run. Files added after `rev` are excluded from the preview and
+/// summarized in a note, because the real whole-tree restore keeps them.
+fn dry_run_tree(out: &OutCtx, backend: &impl VcsBackend, rev: &VcsRef, name: &str) -> CmdResult {
+    let diff = backend
+        .diff(rev, None, None)
+        .map_err(|e| CmdError::err(format!("previewing restore of {name:?}: {e}")))?;
+    let (overwritten, added) = exclude_pure_additions(&diff);
+
+    if added > 0 {
         eprintln!(
-            "vard: dry-run: {scope}{name:?} already matches {rev}; a restore would change nothing"
+            "vard: dry-run: {added} file(s) added since {rev} are kept by restore \
+             (excluded from this preview)"
         );
+    }
+    if overwritten.trim().is_empty() {
+        eprintln!("vard: dry-run: {name:?} already matches {rev}; a restore would change nothing");
         return Ok(());
     }
 
     eprintln!(
         "vard: dry-run: the diff below is what a restore of {name:?} to {rev} would overwrite"
     );
-    emit_raw_paged(out, scoped.as_bytes(), "vard restore --dry-run")
+    emit_raw_paged(out, overwritten.as_bytes(), "vard restore --dry-run")
 }
 
-/// Keeps only the unified-diff sections whose `diff --git a/… b/…` header names
-/// `path`. Best-effort (paths with spaces are git-quoted and will not match);
-/// the whole-tree preview is unaffected.
-fn filter_diff_by_path(diff: &str, path: &Path) -> String {
-    let needle = path.to_string_lossy();
-    let a = format!("a/{needle}");
-    let b = format!("b/{needle}");
-    let mut out = String::new();
-    let mut keep = false;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            keep = rest.split_whitespace().any(|t| t == a || t == b);
-        }
-        if keep {
-            out.push_str(line);
-            out.push('\n');
+/// Single-file dry-run. Pre-checks the path exists at `rev` — exactly as the
+/// real restore does — and emits the same friendly error when it does not, so
+/// the two agree; otherwise shows the scoped diff.
+fn dry_run_file(
+    out: &OutCtx,
+    backend: &impl VcsBackend,
+    rev: &VcsRef,
+    path: &Path,
+    name: &str,
+) -> CmdResult {
+    if !backend
+        .path_exists_at(rev, path)
+        .map_err(|e| CmdError::err(format!("checking {name:?}: {e}")))?
+    {
+        return Err(CmdError::err(path_absent_msg(
+            &path.display().to_string(),
+            rev,
+            name,
+        )));
+    }
+
+    let diff = backend
+        .diff(rev, None, Some(path))
+        .map_err(|e| CmdError::err(format!("previewing restore of {name:?}: {e}")))?;
+    if diff.trim().is_empty() {
+        eprintln!(
+            "vard: dry-run: {} in {name:?} already matches {rev}; a restore would change nothing",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "vard: dry-run: the diff below is what a restore of {} in {name:?} to {rev} would overwrite",
+        path.display()
+    );
+    emit_raw_paged(out, diff.as_bytes(), "vard restore --dry-run")
+}
+
+/// Splits a unified diff into per-file sections and drops the pure additions —
+/// files present in the work tree but absent at the target revision, which a
+/// whole-tree restore leaves untouched. Returns the retained diff and the count
+/// of excluded additions. A pure addition is a section carrying git's `new file
+/// mode` line.
+fn exclude_pure_additions(diff: &str) -> (String, usize) {
+    let mut kept = String::new();
+    let mut added = 0usize;
+    for section in split_git_sections(diff) {
+        if section.lines().any(|l| l.starts_with("new file mode")) {
+            added += 1;
+        } else {
+            kept.push_str(&section);
         }
     }
-    out
+    (kept, added)
+}
+
+/// Splits a unified diff into sections, each beginning at a `diff --git` header.
+fn split_git_sections(diff: &str) -> Vec<String> {
+    let mut sections = Vec::new();
+    let mut current = String::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") && !current.is_empty() {
+            sections.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.is_empty() {
+        sections.push(current);
+    }
+    sections
+}
+
+/// The friendly "path absent at revision" message, shared by the real restore's
+/// error mapping and the dry-run pre-check so the two are byte-identical.
+fn path_absent_msg(path_display: &str, rev: &VcsRef, name: &str) -> String {
+    format!("{path_display:?} does not exist at {rev} in watch {name:?}")
 }
 
 /// Maps a restore failure: a path absent at the target revision becomes a
@@ -248,12 +385,69 @@ fn map_restore_err(e: VcsError, rev: &VcsRef, file: Option<&Path>, name: &str) -
             let p = file
                 .map(|f| f.display().to_string())
                 .unwrap_or_else(|| ".".to_string());
-            CmdError::err(format!("{p:?} does not exist at {rev} in watch {name:?}"))
+            CmdError::err(path_absent_msg(&p, rev, name))
         }
         VcsError::LockContended { .. } => CmdError::attention(format!(
             "another vard operation holds the git lock; retry later — the protective snapshot \
              of {name:?} was taken but the restore did not run"
         )),
         _ => CmdError::err(format!("restoring {name:?} to {rev}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_pure_additions_drops_new_files_and_counts_them() {
+        let diff = "\
+diff --git a/kept.txt b/kept.txt
+index 111..222 100644
+--- a/kept.txt
++++ b/kept.txt
+@@ -1 +1 @@
+-old
++new
+diff --git a/added.txt b/added.txt
+new file mode 100644
+index 000..333
+--- /dev/null
++++ b/added.txt
+@@ -0,0 +1 @@
++brand new
+";
+        let (kept, added) = exclude_pure_additions(diff);
+        assert_eq!(added, 1, "one pure addition excluded");
+        assert!(kept.contains("kept.txt"), "the modification is retained");
+        assert!(!kept.contains("added.txt"), "the addition is excluded");
+    }
+
+    #[test]
+    fn exclude_pure_additions_keeps_modifications_and_deletions() {
+        // A file present at rev but deleted in the work tree (`+++ /dev/null`)
+        // is NOT a pure addition — restoring it back IS an overwrite, so it must
+        // stay in the preview.
+        let diff = "\
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 444..000
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-was here
+";
+        let (kept, added) = exclude_pure_additions(diff);
+        assert_eq!(added, 0);
+        assert!(kept.contains("gone.txt"));
+    }
+
+    #[test]
+    fn path_absent_msg_is_stable() {
+        let rev = VcsRef::new("abc123");
+        assert_eq!(
+            path_absent_msg("with space.txt", &rev, "notes"),
+            "\"with space.txt\" does not exist at abc123 in watch \"notes\""
+        );
     }
 }

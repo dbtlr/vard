@@ -1,19 +1,20 @@
 //! `vard snapshot [name|path] [-m msg]` — take a manual snapshot now.
 //!
-//! Dispatch hinges on the single-instance flock as a race-free discriminator
-//! (see the [module docs](super)): acquiring it proves no daemon is running, so
-//! the snapshot is taken in-process while the lock is *held* — a daemon that
-//! starts concurrently cannot collide, because it would fail to take the lock.
-//! If the lock is already held, a daemon owns the repositories and the snapshot
-//! is handed to it as a request file instead.
+//! Dispatch hinges on the single-instance lock plus its role discriminator (see
+//! [`crate::instance`]): if we acquire the lock, no daemon is running and the
+//! snapshot is taken in-process while the lock is *held* — a daemon that starts
+//! concurrently cannot collide, because it would fail to take the lock. If a
+//! *daemon* holds it, the daemon owns the repositories and the snapshot is
+//! handed to it as a request file. If a *peer CLI* holds it, we wait a bounded
+//! spell for it to finish and then either take the lock or report honestly that
+//! another command is running — never write a request no daemon will drain.
 
-use std::fs;
-use std::path::Path;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use vard_core::{
-    CommitMessage, SafeState, SnapshotOutcome, SnapshotRequest, Trigger, VcsBackend, VcsError,
+    CommitMessage, SafeState, SnapshotOutcome, SnapshotRequest, Trigger, UnsafeReason, VcsBackend,
+    VcsError,
 };
 
 use super::{
@@ -22,8 +23,14 @@ use super::{
 };
 use crate::cli::{ColorWhen, OutputFormat, SnapshotArgs};
 use crate::config::ResolvedWatch;
-use crate::instance::{InstanceLock, LockError};
+use crate::instance::{CliLock, InstanceLock};
 use crate::output::record::{Record, RecordField};
+use crate::request::{self, Request};
+
+/// How long a CLI `snapshot` waits out a *peer CLI* lock holder before
+/// reporting that another command is running. A daemon holder short-circuits to
+/// the request path immediately; only a transient peer is waited on.
+const CLI_LOCK_BUDGET: Duration = Duration::from_secs(10);
 
 /// Entry point for `vard snapshot`.
 pub(crate) fn run(args: SnapshotArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
@@ -34,17 +41,23 @@ fn run_inner(args: SnapshotArgs, color: ColorWhen, format: Option<OutputFormat>)
     let paths = CmdPaths::from_xdg().map_err(|e| CmdError::err(e.to_string()))?;
     let out = OutCtx::resolve(color, format);
 
-    // TRY the instance lock. Acquired ⇒ no daemon ⇒ snapshot in-process while
-    // holding it. Held ⇒ a daemon owns the repos ⇒ hand it a request.
-    match InstanceLock::acquire_at(&paths.lock_file) {
-        Ok(lock) => {
+    // Acquire the instance lock, distinguishing *who* holds it if we cannot:
+    //   * we hold it       ⇒ no daemon ⇒ snapshot in-process while holding it
+    //   * a daemon holds it ⇒ hand it a request
+    //   * a peer CLI holds it past the budget ⇒ honest "another command is
+    //     running" (never a false success, never an orphaned request)
+    match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
+        Ok(CliLock::Acquired(lock)) => {
             let result = in_process(&paths, &out, &args);
             // Hold the lock across the whole in-process snapshot; drop it only
             // now, once every targeted watch is done.
             drop(lock);
             result
         }
-        Err(LockError::Held { .. }) => via_request(&paths, &out, &args),
+        Ok(CliLock::DaemonHeld) => via_request(&paths, &out, &args),
+        Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
+            "another vard command is running; retry in a moment",
+        )),
         Err(e) => Err(CmdError::err(format!("acquiring instance lock: {e}"))),
     }
 }
@@ -108,7 +121,7 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
     match backend.is_safe_state() {
         Ok(SafeState::Unsafe(reason)) => {
             return (
-                result_record(name, "unsafe", Some(&reason.to_string()), None, None),
+                result_record(name, "unsafe", Some(&unsafe_detail(&reason)), None, None),
                 1,
             );
         }
@@ -131,7 +144,7 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
         Ok(Some(outcome)) => (committed_record(name, &outcome), 0),
         Ok(None) => (result_record(name, "no changes", None, None, None), 0),
         Err(VcsError::UnsafeState(reason)) => (
-            result_record(name, "unsafe", Some(&reason.to_string()), None, None),
+            result_record(name, "unsafe", Some(&unsafe_detail(&reason)), None, None),
             1,
         ),
         Err(VcsError::LockContended { .. }) => (
@@ -156,11 +169,22 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
 /// the request was queued — never a commit result it cannot know.
 fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SnapshotArgs) -> CmdResult {
     // Resolve a selector to the watch's *name* — the daemon routes requests by
-    // name (see `crate::daemon::apply_request`).
+    // name (see `crate::daemon::apply_request`). A paused watch is refused here:
+    // the daemon will not snapshot it, so a request would be a silent no-op that
+    // looks like success. (In-process snapshotting of a paused watch — when no
+    // daemon runs — is still allowed; a manual snapshot is explicit intent.)
     let watch_name = match &args.target {
         Some(t) => {
             let config = load_config(&paths.config_file)?;
-            Some(select_one(&config, t)?.spec.name().to_string())
+            let rw = select_one(&config, t)?;
+            if rw.paused {
+                return Err(CmdError::attention(format!(
+                    "watch {} is paused; the daemon will not snapshot it — resume it, \
+                     or stop the daemon to snapshot in-process",
+                    rw.spec.name()
+                )));
+            }
+            Some(rw.spec.name().to_string())
         }
         None => None,
     };
@@ -171,7 +195,8 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SnapshotArgs) -> CmdResult
         eprintln!("vard: note: -m/--message is ignored when a running daemon takes the snapshot");
     }
 
-    write_request(&paths.request_dir, watch_name.as_deref())?;
+    request::write(&paths.request_dir, &Request::snapshot(watch_name.clone()))
+        .map_err(CmdError::err)?;
 
     let (human, record) = match &watch_name {
         Some(w) => (
@@ -186,42 +211,14 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SnapshotArgs) -> CmdResult
     emit_action(out, &human, &record)
 }
 
-/// Writes a settled snapshot request into the request dir per the daemon's
-/// contract: a temp (dotfile) name written first, then `rename(2)`-d to a
-/// `*.toml` name — atomic on POSIX, so the daemon only ever reads a complete
-/// file. `watch` is `None` for an all-watches request.
-fn write_request(request_dir: &Path, watch: Option<&str>) -> CmdResult {
-    fs::create_dir_all(request_dir)
-        .map_err(|e| CmdError::err(format!("creating request dir: {e}")))?;
-
-    let mut text = String::from("kind = \"snapshot\"\n");
-    if let Some(w) = watch {
-        text.push_str(&format!("watch = \"{}\"\n", toml_basic_escape(w)));
-    }
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    // A dotfile temp name is "unsettled" per the contract, so the daemon
-    // ignores it while it is being written.
-    let tmp = request_dir.join(format!(".snapshot-{pid}-{nanos}.tmp"));
-    let settled = request_dir.join(format!("snapshot-{pid}-{nanos}.toml"));
-
-    fs::write(&tmp, text.as_bytes())
-        .map_err(|e| CmdError::err(format!("writing request file: {e}")))?;
-    fs::rename(&tmp, &settled).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        CmdError::err(format!("finalizing request file: {e}"))
-    })?;
-    Ok(())
-}
-
-/// Escapes a value for a TOML basic string. Watch names are validated to a safe
-/// charset, so escaping the two structural characters is sufficient.
-fn toml_basic_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// The detail shown when a watch is skipped for an unsafe repository: the reason
+/// plus guidance. A running daemon defers *its* manual snapshots the same way,
+/// so the advice is to finish the in-progress operation and re-run either path.
+fn unsafe_detail(reason: &UnsafeReason) -> String {
+    format!(
+        "{reason}; finish the merge/rebase (or leave the wrong branch) and re-run — \
+         a running daemon likewise defers manual snapshots until the repo is safe again"
+    )
 }
 
 /// Builds the result record for a committed snapshot: full id and the commit's

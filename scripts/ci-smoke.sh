@@ -95,7 +95,14 @@ grep -q 'paused = true' "$XDG_CONFIG_HOME/vard/config.toml" || fail "vard watch 
 echo "smoke snapshot content" > "$WDIR/note.txt"
 "$VARD" --format json snapshot smoke | grep -q '"status":"committed"' || fail "vard snapshot did not commit"
 test "$(git -C "$WDIR" rev-list --count HEAD)" = "1" || fail "vard snapshot did not land exactly one commit"
-for j in "$XDG_STATE_HOME"/vard/journal/*.journal; do
+# The in-process snapshot MUST have written a journal for the watch, and it must
+# be compacted to empty (no dangling begin). nullglob keeps a missing journal
+# from making the loop vacuously pass on the literal glob pattern.
+shopt -s nullglob
+journals=("$XDG_STATE_HOME"/vard/journal/*.journal)
+shopt -u nullglob
+test "${#journals[@]}" -gt 0 || fail "no operation journal was written for the in-process snapshot"
+for j in "${journals[@]}"; do
   test ! -s "$j" || fail "operation journal $j holds a dangling begin after a clean snapshot"
 done
 "$VARD" --format json log smoke | grep -q '"trigger":"manual"' || fail "vard log did not show the manual snapshot"

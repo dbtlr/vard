@@ -1,5 +1,7 @@
+mod atomic;
 mod cli;
 mod cmd;
+mod command;
 mod config;
 mod config_edit;
 mod daemon;
@@ -8,6 +10,7 @@ mod instance;
 mod journal;
 mod output;
 mod paths;
+mod request;
 mod watch;
 
 use std::process::ExitCode;

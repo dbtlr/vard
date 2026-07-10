@@ -111,8 +111,7 @@ pub trait VcsBackend {
     /// Reports whether `path` exists at `rev` (as a tracked blob or tree).
     /// Lets a `--file` restore preview pre-check exactly what the real restore
     /// checks, so both agree on a path absent at the chosen revision.
-    fn path_exists_at(&self, rev: &VcsRef, path: &std::path::Path)
-    -> Result<bool, VcsError>;
+    fn path_exists_at(&self, rev: &VcsRef, path: &std::path::Path) -> Result<bool, VcsError>;
 
     /// Restores the work tree (or a single path within it) to a prior
     /// reference.

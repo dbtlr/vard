@@ -33,60 +33,22 @@ pub(crate) mod snapshot;
 // `super::timefmt`, unchanged by the move.
 pub(crate) use vard_core::timefmt;
 
-use std::io::{self, IsTerminal, Write};
+use std::io;
 use std::path::PathBuf;
 
 use vard_core::{GitBackend, VcsBackend, VcsError, WatchSpec};
 
-use crate::cli::{ColorWhen, OutputFormat};
 use crate::config::{Config, ConfigError, ResolvedWatch};
 use crate::journal::Journal;
-use crate::output::format;
-use crate::output::pager::{should_page, spawn_pager_or_passthrough};
-use crate::output::palette::{self, Palette};
-use crate::output::record::{self, Record};
 use crate::paths::{self, HomeNotFound};
 use crate::watch::select;
 
-/// A command failure carrying the message to print and the process exit code
-/// (2 for an error, 1 for "attention needed" such as an unsafe repository).
-pub(crate) struct CmdError {
-    message: String,
-    code: u8,
-}
-
-impl CmdError {
-    /// An error (exit code 2).
-    pub(crate) fn err(message: impl Into<String>) -> Self {
-        CmdError {
-            message: message.into(),
-            code: 2,
-        }
-    }
-
-    /// An "attention needed" outcome (exit code 1): the command did not fail,
-    /// but it also did not fully complete — e.g. a repository was not in a safe
-    /// state, or a git lock was contended.
-    pub(crate) fn attention(message: impl Into<String>) -> Self {
-        CmdError {
-            message: message.into(),
-            code: 1,
-        }
-    }
-
-    /// The higher-severity of two exit codes (2 beats 1 beats 0), for
-    /// aggregating per-watch outcomes.
-    fn worse(a: u8, b: u8) -> u8 {
-        a.max(b)
-    }
-
-    /// The error's human-readable message.
-    fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-pub(crate) type CmdResult = Result<(), CmdError>;
+// The command-outcome layer (error/exit-code, output resolution, emitters) is
+// shared with the `watch` commands; re-exported so the submodules reach it as
+// `super::…`, unchanged by the extraction.
+pub(crate) use crate::command::{
+    CmdError, CmdResult, OutCtx, emit_action, emit_raw_paged, emit_records, finish,
+};
 
 /// The filesystem locations the commands read, resolved once. Kept together so
 /// tests (and the dispatch code) thread one value.
@@ -105,37 +67,6 @@ impl CmdPaths {
             request_dir: paths::request_dir()?,
             lock_file: paths::lock_file()?,
         })
-    }
-}
-
-/// Resolved output settings shared by every command's emitter.
-struct OutCtx {
-    /// The effective format after resolving the global `--format` against the
-    /// destination.
-    format: OutputFormat,
-    /// The raw `--format` flag, before destination resolution. `diff` needs it
-    /// to tell an explicit `--format json` (rejected) from the piped default.
-    raw_format: Option<OutputFormat>,
-    palette: Palette,
-    term_width: usize,
-    term_height: usize,
-    is_tty: bool,
-}
-
-impl OutCtx {
-    fn resolve(color: ColorWhen, format_flag: Option<OutputFormat>) -> OutCtx {
-        let is_tty = io::stdout().is_terminal();
-        let (term_width, term_height) = terminal_size::terminal_size()
-            .map(|(w, h)| (w.0 as usize, h.0 as usize))
-            .unwrap_or((80, 24));
-        OutCtx {
-            format: format::resolve(format_flag, is_tty),
-            raw_format: format_flag,
-            palette: palette::resolve_with_tty(color, is_tty),
-            term_width,
-            term_height,
-            is_tty,
-        }
     }
 }
 
@@ -179,95 +110,44 @@ fn open_backend(spec: &WatchSpec) -> Result<GitBackend, CmdError> {
         .map_err(|e| CmdError::err(format!("opening watch {:?}: {e}", spec.name())))
 }
 
-/// Takes one in-process snapshot for `watch_name`, bracketing the backend call
-/// in the per-watch operation journal exactly as the daemon's event handler
-/// does: `begin` before, `complete` after — on success, no-op, AND failure —
-/// so a crash mid-commit leaves a recoverable dangling record and a clean exit
-/// leaves none. Journal I/O trouble is warned, never fatal (matching the
-/// daemon), so a journaling hiccup cannot block a manual snapshot.
+/// Runs `body` bracketed in the per-watch operation journal: `begin(op)`
+/// before, `complete` after — on every outcome, success or failure — exactly as
+/// the daemon's event handler brackets a commit window. A crash mid-operation
+/// therefore leaves one recoverable dangling record and a clean exit leaves
+/// none. Journal I/O trouble is warned, never fatal (matching the daemon), so a
+/// journaling hiccup cannot block a manual operation.
 ///
-/// Returns the backend's own result untouched; the caller maps it to exit
-/// semantics.
-fn journaled_snapshot(
+/// The one journal-bracket helper the CLI paths share (`snapshot`'s in-process
+/// commit, `restore`'s protective-snapshot-plus-checkout). Only ever called
+/// while this process holds the instance lock — the journal's single-writer
+/// invariant.
+fn journaled<T>(
     journal_dir: &std::path::Path,
     watch_name: &str,
-    backend: &GitBackend,
-    req: &vard_core::SnapshotRequest,
-) -> Result<Option<vard_core::SnapshotOutcome>, VcsError> {
+    op: &str,
+    body: impl FnOnce() -> T,
+) -> T {
     let journal = Journal::in_dir(journal_dir, watch_name);
-    if let Err(err) = journal.begin("snapshot") {
+    if let Err(err) = journal.begin(op) {
         eprintln!("vard: journal begin for {watch_name:?}: {err}");
     }
-    let result = backend.snapshot(req);
+    let result = body();
     if let Err(err) = journal.complete() {
         eprintln!("vard: journal complete for {watch_name:?}: {err}");
     }
     result
 }
 
-/// Emits a list of records in the resolved format under a collective noun.
-fn emit_records(out: &OutCtx, records: &[Record], noun: &str) -> CmdResult {
-    let mut w = io::stdout().lock();
-    let res = match out.format {
-        OutputFormat::Records => {
-            record::render_records(&mut w, &out.palette, records, noun, out.term_width)
-        }
-        OutputFormat::Json => record::render_json(&mut w, records),
-        OutputFormat::Jsonl => record::render_jsonl(&mut w, records),
-    };
-    finish_write(res)
-}
-
-/// Emits a single command result: a human line in the records form, or a
-/// single JSON object in the machine forms.
-fn emit_action(out: &OutCtx, human: &str, record: &Record) -> CmdResult {
-    let mut w = io::stdout().lock();
-    let res = match out.format {
-        OutputFormat::Records => writeln!(w, "{human}"),
-        OutputFormat::Json | OutputFormat::Jsonl => {
-            record::write_json_object(&mut w, record).and_then(|()| w.write_all(b"\n"))
-        }
-    };
-    finish_write(res)
-}
-
-/// Emits raw bytes to stdout, paging through the resolved pager when they
-/// overflow a terminal, and passing them through untouched when piped. Used for
-/// the raw unified diff, which bypasses record shaping entirely.
-fn emit_raw_paged(out: &OutCtx, buf: &[u8], context: &str) -> CmdResult {
-    let line_count = buf.iter().filter(|b| **b == b'\n').count();
-    let res = if should_page(
-        line_count,
-        /* no_pager */ false,
-        out.is_tty,
-        out.term_height,
-    ) {
-        let mut stderr = io::stderr();
-        let mut stdout = io::stdout().lock();
-        spawn_pager_or_passthrough(buf, &mut stdout, &mut stderr, context)
-    } else {
-        io::stdout().lock().write_all(buf)
-    };
-    finish_write(res)
-}
-
-/// Folds a write result into a [`CmdResult`], treating a broken pipe (the
-/// reader went away, e.g. `| head`) as success rather than an error.
-fn finish_write(res: io::Result<()>) -> CmdResult {
-    match res {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(CmdError::err(format!("writing output: {e}"))),
-    }
-}
-
-/// Maps a [`CmdResult`] to a process exit code, printing any error to stderr.
-fn finish(result: CmdResult) -> std::process::ExitCode {
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("vard: {}", err.message);
-            std::process::ExitCode::from(err.code)
-        }
-    }
+/// Takes one in-process snapshot for `watch_name`, bracketed in the per-watch
+/// operation journal via [`journaled`]. Returns the backend's own result
+/// untouched; the caller maps it to exit semantics.
+fn journaled_snapshot(
+    journal_dir: &std::path::Path,
+    watch_name: &str,
+    backend: &GitBackend,
+    req: &vard_core::SnapshotRequest,
+) -> Result<Option<vard_core::SnapshotOutcome>, VcsError> {
+    journaled(journal_dir, watch_name, "snapshot", || {
+        backend.snapshot(req)
+    })
 }

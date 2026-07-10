@@ -47,8 +47,19 @@
 //! ```
 //!
 //! On clean completion the file is compacted to empty. An empty **or** absent
-//! journal therefore means "no dangling operation". Operations against one
-//! watch are serial, so at most one `begin` record is ever live.
+//! journal therefore means "no dangling operation".
+//!
+//! # The single-writer invariant
+//!
+//! A watch's journal has exactly one writer at a time: **whoever holds the
+//! instance lock** ([`crate::instance`]). The daemon holds that lock for its
+//! whole lifetime, so it alone journals while it runs; an in-process CLI
+//! operation (`snapshot`, or a `restore` that acquired the lock) holds it for
+//! the operation's duration and journals only then. A CLI command that finds a
+//! daemon holding the lock does **not** journal — it is not the writer. Because
+//! the lock serializes every writer, operations against one watch are serial
+//! and at most one `begin` record is ever live, which is what lets recovery
+//! treat a dangling `begin` as an unambiguous "our abandoned operation" marker.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};

@@ -49,6 +49,7 @@ fn run_inner(args: DiffArgs, color: ColorWhen, format: Option<OutputFormat>) -> 
         let recent = backend
             .log(&LogFilter {
                 since: None,
+                until: None,
                 limit: Some(1),
             })
             .map_err(|e| CmdError::err(format!("reading log for {name:?}: {e}")))?;
@@ -59,7 +60,7 @@ fn run_inner(args: DiffArgs, color: ColorWhen, format: Option<OutputFormat>) -> 
     }
 
     let diff = backend
-        .diff(&VcsRef::new(&from), None)
+        .diff(&VcsRef::new(&from), None, None)
         .map_err(|e| map_diff_err(e, &from, name))?;
 
     if diff.is_empty() {
