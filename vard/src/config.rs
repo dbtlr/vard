@@ -244,6 +244,10 @@ impl Config {
     /// Resolution-stage errors name the offending watch (or `[defaults]`);
     /// malformed durations and type errors surface earlier, at parse time,
     /// with TOML line/column spans instead.
+    // The daemon resolves via `resolve_all` (it needs the paused flags to
+    // distinguish "no watches defined" from "all watches paused"); this active
+    // -only view is the documented counterpart, exercised by the tests below.
+    #[allow(dead_code)]
     pub fn resolve(&self) -> Result<Vec<WatchSpec>, ConfigError> {
         Ok(self
             .resolve_all()?
