@@ -52,6 +52,8 @@ Each **watch** shows one state:
 
 A problem state also reports how long the watch has been in it.
 
+A watch whose path canonicalizes onto an earlier watch's — two config entries that resolve to the same repository, for example a path and a symlink to it — is reported as `attention` with the summary `path aliases watch '<other>'; not supervised`. The daemon supervises only the first of the pair, so the later one is flagged rather than shown as `ok`.
+
 ```bash
 vard status --format json
 ```

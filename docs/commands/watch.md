@@ -76,7 +76,7 @@ The repository is never modified. The one residual that automatic recovery canno
 
 ## list
 
-List every registered watch. Each watch reports its name, path, branch and remote, trigger and interval, whether it syncs, and whether it is paused.
+List every registered watch. Each watch reports its name, path, branch and remote, trigger and interval, whether it syncs, and whether it is paused. If two watches resolve to the same canonical repository (for example a path and a symlink to it), only the first is supervised; `list` marks the later one with an `aliases` field naming the watch it collides with.
 
 Output follows the global `--format`: human-readable records on a terminal, JSON (or JSONL) when piped.
 
@@ -98,7 +98,7 @@ vard watch list --format json
 ```
 
 ```json
-[{"name":"notes","path":"~/notes","branch":null,"remote":"origin","trigger":"both","interval":"15m","sync":true,"paused":false}]
+[{"name":"notes","path":"~/notes","branch":null,"remote":"origin","trigger":"both","interval":"15m","sync":true,"paused":false,"aliases":null}]
 ```
 
 ## pause / resume

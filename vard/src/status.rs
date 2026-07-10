@@ -38,6 +38,7 @@ use crate::cli::{ColorWhen, OutputFormat, StatusArgs};
 use crate::command::{self, CmdError, CmdResult, OutCtx};
 use crate::config::{Config, ResolvedWatch};
 use crate::health::{self, HealthProblem, HealthReport};
+use crate::journal;
 use crate::output::glyphs::{self, Glyph};
 use crate::output::palette::Palette;
 use crate::output::primitives::clean_line;
@@ -110,6 +111,13 @@ fn report(
         .iter()
         .map(|w| w.spec.name().to_lowercase())
         .collect();
+    // Canonical journal-key aliasing: a watch whose path canonicalizes onto an
+    // earlier watch's journal is not supervised by the daemon (it skips the later
+    // collider), so status must surface it rather than show a false `ok`. Computed
+    // over the whole resolved set — before any selector narrows it — with the same
+    // first-wins rule the daemon uses. Maps the aliased watch's lowercased name to
+    // its winner's name.
+    let aliases = alias_map(&watches);
 
     // A selector narrows to one watch (and reports not-found / ambiguous as an
     // operational error); with no selector every configured watch is reported.
@@ -134,7 +142,13 @@ fn report(
     // Join: overlay the health problems onto the reported watches and, for the
     // whole-fleet view, append any orphaned problems. Orphans are only meaningful
     // without a selector — a selector already narrows to one named config watch.
-    let rows = join_rows(&report, &reported, &configured_names, target.is_none());
+    let rows = join_rows(
+        &report,
+        &reported,
+        &configured_names,
+        &aliases,
+        target.is_none(),
+    );
 
     // Exit code: daemon-level attention always folds in; the per-watch component
     // is only the reported watches (a selector narrows it). Paused, ok, and
@@ -161,6 +175,7 @@ fn join_rows(
     report: &HealthReport,
     reported: &[ResolvedWatch],
     configured_names: &HashSet<String>,
+    aliases: &HashMap<String, String>,
     include_orphans: bool,
 ) -> Vec<WatchRow> {
     let problems = problems_map(report);
@@ -169,7 +184,12 @@ fn join_rows(
     let monitoring = matches!(report, HealthReport::Running { .. });
     let mut rows: Vec<WatchRow> = reported
         .iter()
-        .map(|rw| WatchRow::project(rw, &problems, monitoring))
+        .map(|rw| {
+            let alias_of = aliases
+                .get(&rw.spec.name().to_lowercase())
+                .map(String::as_str);
+            WatchRow::project(rw, &problems, monitoring, alias_of)
+        })
         .collect();
 
     if include_orphans && let HealthReport::Running { problems, .. } = report {
@@ -180,6 +200,18 @@ fn join_rows(
         }
     }
     rows
+}
+
+/// Maps each canonical-path-aliased watch's lowercased name to the name of the
+/// earlier watch it aliases, using the shared [`journal::alias_winners`] rule so
+/// status agrees with the daemon on which colliding watch is supervised. An
+/// unaliased watch is absent from the map.
+fn alias_map(watches: &[ResolvedWatch]) -> HashMap<String, String> {
+    journal::alias_winners(watches.iter().map(|w| (w.spec.name(), w.spec.path())))
+        .into_iter()
+        .zip(watches)
+        .filter_map(|(alias, w)| alias.map(|winner| (w.spec.name().to_lowercase(), winner)))
+        .collect()
 }
 
 /// Indexes the health problems by their watch name, lowercased on both insert
@@ -265,16 +297,20 @@ struct WatchRow {
 }
 
 impl WatchRow {
-    /// Joins one config watch with the health projection: a health problem wins,
-    /// then a config pause, then `ok` when a daemon is monitoring, else `unknown`
-    /// (nothing is watching it).
+    /// Joins one config watch with the health projection: a canonical-path alias
+    /// wins first (the daemon never supervises it, so no health could be honest),
+    /// then a health problem, then a config pause, then `ok` when a daemon is
+    /// monitoring, else `unknown` (nothing is watching it).
     fn project(
         rw: &ResolvedWatch,
         problems: &HashMap<String, &HealthProblem>,
         monitoring: bool,
+        alias_of: Option<&str>,
     ) -> WatchRow {
         let name = rw.spec.name();
-        if let Some(p) = problems.get(&name.to_lowercase()) {
+        if let Some(winner) = alias_of {
+            WatchRow::alias(name.to_string(), winner)
+        } else if let Some(p) = problems.get(&name.to_lowercase()) {
             WatchRow::from_problem(name.to_string(), p)
         } else if rw.paused {
             WatchRow::plain(name.to_string(), "paused")
@@ -282,6 +318,19 @@ impl WatchRow {
             WatchRow::plain(name.to_string(), "ok")
         } else {
             WatchRow::plain(name.to_string(), "unknown")
+        }
+    }
+
+    /// A row for a watch whose canonical path aliases an earlier watch's: the
+    /// daemon skips it, so it is unsupervised. Reported as `attention` (folding
+    /// exit 1) with a summary naming the watch it collides with.
+    fn alias(name: String, winner: &str) -> WatchRow {
+        WatchRow {
+            name,
+            state: "attention".to_string(),
+            kind: Some("aliased".to_string()),
+            summary: Some(format!("path aliases watch '{winner}'; not supervised")),
+            since: None,
         }
     }
 
@@ -510,7 +559,7 @@ mod tests {
     fn project_prefers_a_health_problem_over_paused_and_ok() {
         let p = problem("vault", "conflicted", 100);
         let map = map_of(std::slice::from_ref(&p));
-        let row = WatchRow::project(&resolved("vault", true), &map, true);
+        let row = WatchRow::project(&resolved("vault", true), &map, true, None);
         assert_eq!(row.state, "conflicted");
         assert_eq!(row.kind.as_deref(), Some("conflicted"));
         assert!(row.is_problem());
@@ -521,14 +570,14 @@ mod tests {
         // Health names the watch "Vault"; the config names it "vault".
         let p = problem("Vault", "conflicted", 100);
         let map = map_of(std::slice::from_ref(&p));
-        let row = WatchRow::project(&resolved("vault", false), &map, true);
+        let row = WatchRow::project(&resolved("vault", false), &map, true, None);
         assert_eq!(row.state, "conflicted", "a case difference must still join");
     }
 
     #[test]
     fn project_shows_paused_when_no_problem() {
         let map: HashMap<String, &HealthProblem> = HashMap::new();
-        let row = WatchRow::project(&resolved("notes", true), &map, true);
+        let row = WatchRow::project(&resolved("notes", true), &map, true, None);
         assert_eq!(row.state, "paused");
         assert!(!row.is_problem(), "a deliberate pause is not attention");
     }
@@ -536,7 +585,7 @@ mod tests {
     #[test]
     fn project_shows_ok_when_healthy_and_monitored() {
         let map: HashMap<String, &HealthProblem> = HashMap::new();
-        let row = WatchRow::project(&resolved("work", false), &map, true);
+        let row = WatchRow::project(&resolved("work", false), &map, true, None);
         assert_eq!(row.state, "ok");
         assert!(!row.is_problem());
     }
@@ -545,12 +594,49 @@ mod tests {
     fn project_shows_unknown_when_nothing_is_monitoring() {
         // Daemon not running / starting: an unpaused watch is `unknown`, not `ok`.
         let map: HashMap<String, &HealthProblem> = HashMap::new();
-        let row = WatchRow::project(&resolved("work", false), &map, /* monitoring */ false);
+        let row = WatchRow::project(
+            &resolved("work", false),
+            &map,
+            /* monitoring */ false,
+            None,
+        );
         assert_eq!(row.state, "unknown");
         assert!(!row.is_problem(), "unknown is neutral, not attention");
         // A config-paused watch still shows paused even when nothing monitors it.
-        let paused = WatchRow::project(&resolved("nap", true), &map, false);
+        let paused = WatchRow::project(&resolved("nap", true), &map, false, None);
         assert_eq!(paused.state, "paused");
+    }
+
+    #[test]
+    fn project_marks_an_aliased_watch_as_unsupervised_attention() {
+        let map: HashMap<String, &HealthProblem> = HashMap::new();
+        // An alias beats every other signal — the daemon never supervises it, so a
+        // false `ok`/`paused` would hide that it is unwatched.
+        let row = WatchRow::project(&resolved("second", true), &map, true, Some("first"));
+        assert_eq!(row.state, "attention");
+        assert_eq!(row.kind.as_deref(), Some("aliased"));
+        assert!(
+            row.summary
+                .as_deref()
+                .unwrap()
+                .contains("aliases watch 'first'"),
+            "the summary names the winner: {:?}",
+            row.summary
+        );
+        assert!(
+            row.is_problem(),
+            "an aliased watch folds into the exit code"
+        );
+    }
+
+    #[test]
+    fn alias_map_flags_the_later_of_two_same_path_watches() {
+        // Two watches whose paths canonicalize identically share a journal key;
+        // the first in order wins and the second is marked its alias.
+        let watches = [resolved("first", false), resolved("second", false)];
+        let aliases = alias_map(&watches);
+        assert_eq!(aliases.get("second").map(String::as_str), Some("first"));
+        assert!(!aliases.contains_key("first"), "the winner is not an alias");
     }
 
     #[test]
@@ -561,7 +647,13 @@ mod tests {
             written_at: 1000,
         };
         let configured: HashSet<String> = ["kept".to_string()].into_iter().collect();
-        let rows = join_rows(&report, &[resolved("kept", false)], &configured, true);
+        let rows = join_rows(
+            &report,
+            &[resolved("kept", false)],
+            &configured,
+            &HashMap::new(),
+            true,
+        );
         assert_eq!(rows.len(), 2, "the kept watch plus the orphan");
         let orphan = rows.iter().find(|r| r.name == "ghost").expect("orphan row");
         assert_eq!(orphan.state, "conflicted");
@@ -587,7 +679,13 @@ mod tests {
             written_at: 1000,
         };
         let configured: HashSet<String> = ["kept".to_string()].into_iter().collect();
-        let rows = join_rows(&report, &[resolved("kept", false)], &configured, false);
+        let rows = join_rows(
+            &report,
+            &[resolved("kept", false)],
+            &configured,
+            &HashMap::new(),
+            false,
+        );
         assert_eq!(rows.len(), 1, "no orphans appended under a selector");
         assert_eq!(rows[0].name, "kept");
     }

@@ -38,7 +38,7 @@ use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, fin
 use crate::config::{Config, ResolvedWatch, WatchConfig, expand_tilde};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::instance::{CliLock, InstanceLock};
-use crate::journal::Journal;
+use crate::journal::{self, Journal};
 use crate::output::record::{self, Record, RecordField};
 use crate::paths::{self, HomeNotFound};
 
@@ -566,7 +566,17 @@ fn cmd_list(paths: &WatchPaths, out: &OutCtx) -> CmdResult {
     // the raw watches and exits 1 (attention) with a warning, never 2.
     match config.resolve_all() {
         Ok(watches) => {
-            let records: Vec<Record> = watches.iter().map(watch_record).collect();
+            // Flag canonical journal-key aliasing with the shared first-wins rule
+            // the daemon uses to skip such a watch: a later collider shares one
+            // journal and is therefore not supervised, so `list` must not show it
+            // as an ordinary watch.
+            let aliases =
+                journal::alias_winners(watches.iter().map(|w| (w.spec.name(), w.spec.path())));
+            let records: Vec<Record> = watches
+                .iter()
+                .zip(&aliases)
+                .map(|(rw, alias)| watch_record(rw, alias.as_deref()))
+                .collect();
             emit_list(out, &records)
         }
         Err(e) => {
@@ -581,7 +591,10 @@ fn cmd_list(paths: &WatchPaths, out: &OutCtx) -> CmdResult {
 
 /// Builds the display record for one resolved watch (effective values plus its
 /// paused flag). Name is a field, not a header, so the machine forms carry it.
-fn watch_record(rw: &ResolvedWatch) -> Record {
+/// `alias_of` is the name of an earlier watch this one canonically aliases, if
+/// any — such a watch is not supervised (the daemon skips it), surfaced here as
+/// an `aliases` marker so `list` never shows a silent duplicate as ordinary.
+fn watch_record(rw: &ResolvedWatch, alias_of: Option<&str>) -> Record {
     let spec = &rw.spec;
     Record {
         header: None,
@@ -594,6 +607,8 @@ fn watch_record(rw: &ResolvedWatch) -> Record {
             RecordField::str("interval", record::format_duration(spec.interval())),
             RecordField::bool("sync", spec.sync()),
             RecordField::bool("paused", rw.paused).highlighted(rw.paused),
+            RecordField::opt("aliases", alias_of.map(str::to_string))
+                .highlighted(alias_of.is_some()),
         ],
     }
 }
@@ -616,6 +631,10 @@ fn raw_watch_record(w: &WatchConfig) -> Record {
             // machine consumer's parse must not depend on config validity.
             RecordField::opt_bool("sync", w.sync),
             RecordField::bool("paused", w.paused).highlighted(w.paused),
+            // Aliasing needs canonical paths this lenient view has not resolved, so
+            // it is always absent here — the field is present only to keep the
+            // record shape identical to the resolved view's.
+            RecordField::opt("aliases", None::<String>),
         ],
     }
 }
@@ -825,5 +844,55 @@ mod tests {
         assert!(!drained);
         assert!(matches!(purge_metadata(&paths, &repo, drained), Ok(true)));
         assert!(!journal.path().exists(), "a clean journal is safe to purge");
+    }
+
+    #[test]
+    fn list_marks_a_canonically_aliased_watch() {
+        // Two watches whose paths canonicalize to one repo (a directory and a
+        // symlink to it) share a journal key. The daemon supervises only the
+        // first, so `list` must carry an `aliases` marker naming the winner on the
+        // second and leave the first unmarked.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+
+        let watches = [
+            ResolvedWatch {
+                spec: vard_core::WatchSpec::builder("first", &repo)
+                    .build()
+                    .unwrap(),
+                paused: false,
+            },
+            ResolvedWatch {
+                spec: vard_core::WatchSpec::builder("second", &link)
+                    .build()
+                    .unwrap(),
+                paused: false,
+            },
+        ];
+        let aliases =
+            journal::alias_winners(watches.iter().map(|w| (w.spec.name(), w.spec.path())));
+
+        let alias_cell = |rec: &Record| {
+            rec.fields
+                .iter()
+                .find(|f| f.key == "aliases")
+                .expect("aliases field present")
+                .cell
+                .clone()
+        };
+        let first_rec = watch_record(&watches[0], aliases[0].as_deref());
+        let second_rec = watch_record(&watches[1], aliases[1].as_deref());
+
+        assert!(
+            matches!(alias_cell(&first_rec), record::Cell::Absent),
+            "the first (winning) watch is not aliased"
+        );
+        assert!(
+            matches!(alias_cell(&second_rec), record::Cell::Str(s) if s == "first"),
+            "the second watch is marked as aliasing the first"
+        );
     }
 }
