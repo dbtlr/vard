@@ -8,6 +8,11 @@ on:
     - cron: "17 4 * * 1" # weekly cargo audit / cargo deny refresh
   workflow_dispatch:
 
+# Superseded runs are cancelled for PRs; main/tag/schedule runs always complete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -84,6 +89,9 @@ jobs:
   # compiles for each release target, and that the dist profile (thin LTO)
   # actually links, ahead of a tag push.
   cross:
+    # An every-PR compile gate; the weekly schedule exists only for the lint
+    # job's cargo-audit/deny refresh and gains nothing from a cross build.
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -113,6 +121,13 @@ jobs:
       - name: install musl-tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Harmless while the tree is pure Rust; the moment a *-sys/cc dependency
+      # arrives, the musl dist build needs a C compiler wired or it would fail
+      # here even though release.yml's dist container would succeed.
+      - name: wire musl C toolchain
+        if: runner.os == 'Linux'
+        run: echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
       - name: cargo check --workspace --locked (cross targets)
         run: |
