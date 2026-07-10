@@ -329,7 +329,7 @@ pub(crate) fn write(path: &Path, doc: &HealthDoc) -> Result<(), String> {
         .map_err(|e| format!("writing health file {}: {e}", path.display()))
 }
 
-/// Temp-file + `rename(2)` install without any `fsync` (see [`write`]).
+/// Temp-file + `rename(2)` install without any `fsync` (see [`write()`]).
 fn write_atomic_no_fsync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
@@ -401,7 +401,12 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn status(name: &str, state: WatchState, trouble: Option<TroubleKind>, reason: &str) -> WatchStatus {
+    fn status(
+        name: &str,
+        state: WatchState,
+        trouble: Option<TroubleKind>,
+        reason: &str,
+    ) -> WatchStatus {
         WatchStatus {
             name: name.to_string(),
             state,
@@ -430,10 +435,17 @@ mod tests {
         )];
         let p = &doc_from_states(&states, 2000).problems[0];
         assert_eq!(p.watch, "vault");
-        assert_eq!(p.state, "blocked", "the word 'paused' is reserved for user pauses");
+        assert_eq!(
+            p.state, "blocked",
+            "the word 'paused' is reserved for user pauses"
+        );
         assert_eq!(p.kind, "unsafe-pause");
         assert!(p.summary.contains("unsafe state"), "got: {}", p.summary);
-        assert!(p.summary.contains("resolve it"), "action guidance: {}", p.summary);
+        assert!(
+            p.summary.contains("resolve it"),
+            "action guidance: {}",
+            p.summary
+        );
         assert_eq!(p.since, 1000);
     }
 
@@ -448,7 +460,11 @@ mod tests {
         let p = &doc_from_states(&states, 2000).problems[0];
         assert_eq!(p.state, "snapshots-failing");
         assert_eq!(p.kind, "snapshots-failing");
-        assert!(p.summary.contains("boom"), "the error reason must be surfaced: {}", p.summary);
+        assert!(
+            p.summary.contains("boom"),
+            "the error reason must be surfaced: {}",
+            p.summary
+        );
     }
 
     #[test]

@@ -34,6 +34,16 @@ use crate::output::palette::{self, Palette};
 /// intercepted. Scanning raw args first lets help render regardless.
 pub fn intercept_from_args() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
+
+    // Cheap raw-argv gate FIRST: build the (comparatively expensive) clap
+    // command tree only when help is actually requested. Every non-help
+    // invocation — most importantly the `vard notify` prompt hook, run on every
+    // shell prompt — returns here without ever constructing the tree, which
+    // roughly halves its startup cost.
+    if !wants_help(&args) {
+        return None;
+    }
+
     let root = Cli::command();
 
     // A hand-rolled `--color` value that clap would reject must surface as
@@ -61,6 +71,27 @@ pub fn intercept_from_args() -> Option<i32> {
     }
     let model = build_model(subcmd, &root, &cmd_path, form);
     Some(emit(form, &model, color))
+}
+
+/// A conservative, clap-free scan of raw argv for any sign a help path might be
+/// taken: a `-h`/`--help` flag or a bare `help` token before a `--` terminator.
+///
+/// It deliberately over-approximates — a `help` appearing as a flag *value*
+/// (say `--color help`) also trips it — because the precise disambiguation
+/// (which needs clap arg metadata) runs afterward in [`handle_help_subcommand`]
+/// / [`detect_help_form`]. The point is only to answer "could this be help?"
+/// without building the clap tree, so the overwhelmingly common no-help path
+/// (every real command, the prompt hook included) never pays for it.
+fn wants_help(args: &[String]) -> bool {
+    for a in args.iter().skip(1) {
+        if a == "--" {
+            break;
+        }
+        if a == "-h" || a == "--help" || a == "help" {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan the args (respecting a `--` terminator) for `-h`/`--help`. Long wins
@@ -449,6 +480,20 @@ mod tests {
         let root = Cli::command();
         let args = argv(&["nope"]);
         assert_eq!(resolve_help_topic(&root, args.iter()).unwrap_err(), "nope");
+    }
+
+    #[test]
+    fn wants_help_gates_the_clap_tree_build() {
+        // The hot path: no help token means no tree is built.
+        assert!(!wants_help(&argv(&["vard", "notify"])));
+        assert!(!wants_help(&argv(&["vard", "run"])));
+        assert!(!wants_help(&argv(&["vard", "snapshot", "vault"])));
+        // Every help path trips the gate.
+        assert!(wants_help(&argv(&["vard", "--help"])));
+        assert!(wants_help(&argv(&["vard", "run", "-h"])));
+        assert!(wants_help(&argv(&["vard", "help", "run"])));
+        // A help flag after `--` is an operand, not a request.
+        assert!(!wants_help(&argv(&["vard", "--", "--help"])));
     }
 
     #[test]

@@ -139,7 +139,10 @@ fn collect(
             if now.saturating_sub(written_at) > health::STALE_AFTER_SECS {
                 return Ok(vec![NotifyProblem::Stale { written_at }]);
             }
-            Ok(problems.into_iter().map(NotifyProblem::from_health).collect())
+            Ok(problems
+                .into_iter()
+                .map(NotifyProblem::from_health)
+                .collect())
         }
     }
 }
@@ -224,9 +227,7 @@ fn human_line(problem: &NotifyProblem, palette: &Palette, now: u64, ascii: bool)
             format!("{glyph} vard: daemon not running — start it with `vard run`{staleness}")
         }
         NotifyProblem::Starting => {
-            format!(
-                "{glyph} vard: daemon is starting or stopping; health not yet available"
-            )
+            format!("{glyph} vard: daemon is starting or stopping; health not yet available")
         }
         NotifyProblem::Stale { written_at } => {
             let age = format_duration(Duration::from_secs(now.saturating_sub(*written_at)));
@@ -378,10 +379,20 @@ mod tests {
 
     #[test]
     fn human_line_flattens_a_multiline_summary_to_one_line() {
-        let p = watch_problem("snapshots-failing", "git commit failed:\nfatal: boom\n\nline two", 10);
+        let p = watch_problem(
+            "snapshots-failing",
+            "git commit failed:\nfatal: boom\n\nline two",
+            10,
+        );
         let line = human_line(&p, &Palette::off(), 20, false);
-        assert!(!line.contains('\n'), "a prompt line must be single-line: {line:?}");
-        assert!(line.contains("git commit failed:; fatal: boom; line two"), "got: {line}");
+        assert!(
+            !line.contains('\n'),
+            "a prompt line must be single-line: {line:?}"
+        );
+        assert!(
+            line.contains("git commit failed:; fatal: boom; line two"),
+            "got: {line}"
+        );
     }
 
     #[test]

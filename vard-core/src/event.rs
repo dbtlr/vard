@@ -337,7 +337,7 @@ pub enum TroubleKind {
     /// Snapshots are failing for this watch: a hard [`snapshot`](crate::VcsBackend::snapshot)
     /// error, or a failed [`is_safe_state`](crate::VcsBackend::is_safe_state)
     /// probe, is preventing the pending change from being committed. Unlike
-    /// [`SourceDied`] the signal source is alive; the engine preserves the
+    /// [`SourceDied`](TroubleKind::SourceDied) the signal source is alive; the engine preserves the
     /// pending change and retries it on a bounded timer, and the next successful
     /// (or skip-to-clean) snapshot clears the condition. Surfacing this as a
     /// state — not merely a one-off [`Event::SnapshotFailed`] — is what lets

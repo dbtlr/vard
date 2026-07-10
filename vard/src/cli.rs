@@ -253,27 +253,35 @@ the chosen reference reports a friendly error naming the path and the reference.
     #[command(long_about = "\
 Print a short health summary, designed to be wired into a shell prompt, tmux \
 status line, or starship module.
-\n\n\
+
 `notify` is built for speed above all else: it opens a small health file the \
 daemon keeps up to date, reads a few bytes, and exits. It never talks to the \
 daemon and never runs git, so it is safe to call on every shell prompt. When \
 every watch is healthy it prints nothing and exits 0.
-\n\n\
+
 When something needs attention it prints one line per problem and exits 1 — a \
-paused, conflicted, sync-erroring, or attention-needing watch, each with how \
-long it has been in that state. If the daemon is not running that is itself one \
-reported line (it replaces any stale per-watch entries), so a prompt hook can \
-tell \"all quiet\" from \"nothing is watching your files\".
-\n\n\
-Exit codes make it scriptable: 0 healthy, 1 problems (including a stopped \
-daemon), 2 an operational error. Output follows the global `--format`: \
-human-readable lines by default, or a stable JSON/JSONL array of problem \
-objects (an empty array when healthy) for a status-bar program to consume.
-\n\n\
+blocked (unsafe-repo), snapshots-failing, conflicted, sync-erroring, or \
+attention-needing watch, each with how long it has been in that state. A watch \
+you deliberately paused is not reported here (that is not a problem); `vard \
+status` lists paused watches. If the daemon is not running that is itself one \
+reported line (it replaces any stale per-watch entries), and while it is \
+starting or stopping notify says so rather than reporting a false all-clear — \
+so a prompt hook can tell \"all quiet\" from \"nothing is watching your files\".
+
+Exit codes make it scriptable: 0 healthy, 1 problems (including a stopped, \
+starting, or stale daemon), 2 an operational error. Output follows the global \
+`--format`: human-readable lines by default, or a stable JSON/JSONL array of \
+problem objects (an empty array when healthy) for a status-bar program to \
+consume.
+
 Wire it into a prompt by running it before each prompt and showing its output; \
 because it exits non-zero on trouble, a prompt can also branch on the status \
-without parsing the text. Set VARD_ASCII (or a non-UTF-8 locale) to get an \
-ASCII fallback glyph instead of the Unicode warning sign.")]
+without parsing the text. The warning glyph is colored only when color is \
+enabled: `--color auto` (the default) disables color when its output is \
+captured — which a prompt substitution always does — so pass `--color always` \
+(or set CLICOLOR_FORCE=1) to keep the glyph colored in a prompt. Set VARD_ASCII \
+(or use a non-UTF-8 locale) for an ASCII fallback glyph instead of the Unicode \
+warning sign.")]
     Notify,
 }
 

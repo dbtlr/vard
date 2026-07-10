@@ -2769,14 +2769,16 @@ mod tests {
         loop {
             match advance_until_event(&mut events, Duration::from_secs(30)).await {
                 Event::WatchStateChanged {
-                    to: WatchState::Ok,
-                    ..
+                    to: WatchState::Ok, ..
                 } => saw_resume = true,
                 Event::SnapshotFailed { .. } => break,
                 other => panic!("unexpected event before the new failure: {other:?}"),
             }
         }
-        assert!(saw_resume, "the unsafe pause must resolve to Ok before failing");
+        assert!(
+            saw_resume,
+            "the unsafe pause must resolve to Ok before failing"
+        );
 
         // It converges (Clean) and no second failure is emitted.
         advance_until_snapshot_calls(&backend, 2, Duration::from_secs(30)).await;
@@ -3030,7 +3032,10 @@ mod tests {
         .await;
 
         // The retry converges and the projection returns to Ok.
-        wait_status(&handle, "w", |s| s.state == WatchState::Ok && s.trouble.is_none()).await;
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Ok && s.trouble.is_none()
+        })
+        .await;
 
         handle.shutdown().await;
     }
