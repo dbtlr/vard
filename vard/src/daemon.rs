@@ -199,15 +199,22 @@ pub(crate) fn run() -> ExitCode {
 }
 
 /// Loads and validates the config for startup, mapping every failure to a clear
-/// stderr message and exit code 2. A missing file and an empty watch set are
-/// both "nothing to do" errors that point at the (later) `vard watch add`.
+/// stderr message and exit code 2. A missing file and a config that *defines*
+/// no watches are both "nothing to do" errors that point at `vard watch add`.
+///
+/// A config that defines watches but has them *all paused* is not an error: the
+/// daemon starts idle (supervising nothing) and a `vard watch resume`
+/// hot-reloads it back to work. The zero-defined check therefore keys off
+/// [`Config::resolve_all`] (every defined watch, paused or not), not
+/// [`Config::resolve`] (active watches only). `resolve_all` also validates, so a
+/// genuinely invalid config still exits 2.
 fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
     let config = match Config::load(&paths.config_file) {
         Ok(config) => config,
         Err(ConfigError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "vard: no config file at {}; there is nothing to watch yet. \
-                 Add a watch with `vard watch add` (landing in a later release).",
+                 Add a watch with `vard watch add`.",
                 paths.config_file.display()
             );
             return Err(ExitCode::from(2));
@@ -218,11 +225,10 @@ fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
         }
     };
 
-    match config.resolve() {
-        Ok(specs) if specs.is_empty() => {
+    match config.resolve_all() {
+        Ok(defined) if defined.is_empty() => {
             eprintln!(
-                "vard: config at {} defines no watches; \
-                 add one with `vard watch add` (landing in a later release).",
+                "vard: config at {} defines no watches; add one with `vard watch add`.",
                 paths.config_file.display()
             );
             Err(ExitCode::from(2))
@@ -370,9 +376,21 @@ async fn run_daemon(
     reload: Arc<Notify>,
     poll_interval: Duration,
 ) -> Result<(), StartupError> {
-    let specs = config.resolve().map_err(StartupError::Config)?;
-    if specs.is_empty() {
+    // `resolve_all` gives every *defined* watch (paused or not) and validates
+    // them; `defined.is_empty()` is the true "nothing configured" condition.
+    // The active specs (paused filtered out) may be empty when every watch is
+    // paused — a legitimate idle daemon that a later resume hot-reloads.
+    let defined = config.resolve_all().map_err(StartupError::Config)?;
+    if defined.is_empty() {
         return Err(StartupError::NoWatches);
+    }
+    let specs: Vec<WatchSpec> = defined
+        .iter()
+        .filter(|w| !w.paused)
+        .map(|w| w.spec.clone())
+        .collect();
+    if specs.is_empty() {
+        info!("all configured watches are paused; starting idle (a resume will reload)");
     }
 
     recover_stale_locks(&paths, &specs);
@@ -458,16 +476,31 @@ async fn build_started_engine(
             return None;
         }
     };
-    let specs = match config.resolve() {
-        Ok(specs) => specs,
+    // Resolve every defined watch (this also validates). On any error — the
+    // never-reload guard's real purpose — keep the current engine so a bad edit
+    // cannot take a healthy daemon down.
+    let defined = match config.resolve_all() {
+        Ok(defined) => defined,
         Err(err) => {
             error!(error = %err, "reload: could not resolve config; keeping current engine");
             return None;
         }
     };
-    if specs.is_empty() {
+    // A successfully-loaded config that defines *zero* watches is treated as a
+    // suspicious edit, not a request to idle: keep the current engine. But a
+    // config that defines watches which are all *paused* is a legitimate idle
+    // state — build a zero-active engine so a later resume reloads it back.
+    if defined.is_empty() {
         error!("reload: config defines no watches; keeping current engine");
         return None;
+    }
+    let specs: Vec<WatchSpec> = defined
+        .iter()
+        .filter(|w| !w.paused)
+        .map(|w| w.spec.clone())
+        .collect();
+    if specs.is_empty() {
+        info!("reload: all watches are paused; running idle");
     }
 
     recover_stale_locks(
@@ -1448,5 +1481,123 @@ mod tests {
                 "watch {watch:?} journal must hold no dangling begin after a clean shutdown"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_paused_startup_runs_idle_then_shuts_down_cleanly() {
+        // A config that defines a watch but has it paused is not "no watches":
+        // the daemon must start idle (supervising nothing) rather than exit,
+        // so a later resume can hot-reload it back.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!("version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\npaused = true\n"),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths,
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // Give it a moment to reach its idle supervise loop, then confirm it is
+        // still running (a wrong "no watches" exit would have finished it).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !daemon.is_finished(),
+            "an all-paused daemon must stay running idle, not exit"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("idle daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(
+            result.is_ok(),
+            "clean idle shutdown returns Ok, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reloading_to_all_paused_keeps_the_daemon_idle() {
+        // Pausing the last active watch is a legitimate reload to an idle
+        // engine, not a config that should be rejected: the daemon must stay up
+        // and shut down cleanly rather than dying on a "no watches" reload.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        let active = format!(
+            "version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"500ms\"\n",
+        );
+        std::fs::write(&config_file, &active).unwrap();
+
+        let paths = DaemonPaths {
+            config_file: config_file.clone(),
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // The active watch snapshots a write, proving it is live before we pause.
+        let note = repo.join("note.md");
+        std::fs::write(&note, b"first").unwrap();
+        wait_for_commits(&repo, 2, Some(&note)).await;
+
+        // Pause the last watch and reload: the daemon rebuilds to an idle engine.
+        std::fs::write(
+            &config_file,
+            format!("version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"500ms\"\npaused = true\n"),
+        )
+        .unwrap();
+        reload.notify_one();
+
+        // Give the reload time to swap in the idle engine, then confirm the
+        // daemon is still alive (a "no watches" reject would have kept the old
+        // engine; a wrong exit would have finished the task).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !daemon.is_finished(),
+            "daemon must stay running after pausing its last watch"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
     }
 }

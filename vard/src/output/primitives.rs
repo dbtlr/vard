@@ -6,10 +6,10 @@
 //! record blocks carry an identity-line header over aligned key/value rows with
 //! hanging-indent wrap; the separator draws a capped rule.
 //!
-//! These primitives are not yet consumed by a `vard` command (the read/list
-//! commands land in VRD-15+); the module carries an `allow(dead_code)` and is
-//! exercised by the tests below until those commands wire it in.
-#![allow(dead_code)]
+//! The count line, record blocks, and separator are wired into `vard watch
+//! list` (via [`record`](super::record)). The status headline and severity
+//! tally have no consumer yet — they carry a targeted `allow(dead_code)` and
+//! are exercised by the tests below until a status/check command lands.
 
 use std::io::{self, Write};
 
@@ -17,6 +17,7 @@ use super::glyphs::{self, Glyph};
 use super::palette::Palette;
 
 /// Status headline: `{text}…` in `dim`. One trailing newline.
+#[allow(dead_code)] // No consumer yet; a future status command will use it.
 pub fn status_headline(out: &mut dyn Write, p: &Palette, text: &str) -> io::Result<()> {
     write!(out, "{}{text}…{}", p.dim.render(), p.dim.render_reset())?;
     writeln!(out)
@@ -67,6 +68,7 @@ pub fn record_block(
     term_width: usize,
 ) -> io::Result<()> {
     if let Some(h) = header {
+        let h = sanitize_controls(h);
         writeln!(out, "{}{h}{}", p.header.render(), p.header.render_reset())?;
     }
     if fields.is_empty() {
@@ -77,7 +79,8 @@ pub fn record_block(
 
     for f in fields {
         let val_style = if f.highlight { &p.accent } else { &p.fg };
-        let wrapped = wrap_value(f.value, value_w);
+        let value = sanitize_controls(f.value);
+        let wrapped = wrap_value(&value, value_w);
         for (i, line) in wrapped.iter().enumerate() {
             if i == 0 {
                 writeln!(
@@ -101,6 +104,25 @@ pub fn record_block(
         }
     }
     Ok(())
+}
+
+/// Replaces C0 control characters — except tab and newline, which the wrapper
+/// handles as layout — and DEL (`0x7f`) with the Unicode replacement character
+/// `U+FFFD`, so a value carrying a raw `ESC` (or other control) cannot inject
+/// terminal escape sequences into records/TTY output. Applied at the primitives
+/// layer, every records consumer inherits it. The JSON path escapes separately
+/// (see [`super::record`]) and is left untouched.
+fn sanitize_controls(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (cp < 0x20 && c != '\n' && c != '\t') || cp == 0x7f {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn wrap_value(value: &str, width: usize) -> Vec<String> {
@@ -161,6 +183,7 @@ pub fn separator(out: &mut dyn Write, p: &Palette, term_width: usize) -> io::Res
     writeln!(out, "{}{}{}", p.dim.render(), bar, p.dim.render_reset())
 }
 
+#[allow(dead_code)] // Consumed by a future status/notes command.
 #[derive(Debug, Clone, Copy)]
 pub enum NoteLabel {
     Note,
@@ -168,6 +191,7 @@ pub enum NoteLabel {
 }
 
 /// Note line: `{label}: {body}` — label in `accent`, body in `dim`.
+#[allow(dead_code)] // No consumer yet; a future status/notes command will use it.
 pub fn note_line(out: &mut dyn Write, p: &Palette, label: NoteLabel, body: &str) -> io::Result<()> {
     let label_str = match label {
         NoteLabel::Note => "note",
@@ -187,6 +211,7 @@ pub fn note_line(out: &mut dyn Write, p: &Palette, label: NoteLabel, body: &str)
 /// elided and right-aligned counts. If all three are zero, emits a single
 /// "0 {noun} pass" row so the caller still has a visible "the command ran"
 /// signal.
+#[allow(dead_code)] // No consumer yet; a future check/status command will use it.
 pub fn severity_tally(
     out: &mut dyn Write,
     p: &Palette,
@@ -376,6 +401,38 @@ mod tests {
         // Label column width = max("path", "status") + 2 = 8 → "path    " / "status  ".
         assert_eq!(lines[1], "  path    ~/notes");
         assert_eq!(lines[2], "  status  watching");
+    }
+
+    #[test]
+    fn record_block_sanitizes_control_characters_in_values_and_headers() {
+        // A value carrying a raw ESC (as a malicious watch name/path might) must
+        // not reach the terminal as an escape sequence — it renders as U+FFFD.
+        let mut out = Vec::new();
+        let fields = [Field {
+            label: "name",
+            value: "evil\x1b[31mred\x07",
+            highlight: false,
+        }];
+        record_block(&mut out, &Palette::off(), Some("hd\x1br"), &fields, 80).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains('\x1b'), "raw ESC must not survive: {s:?}");
+        assert!(!s.contains('\x07'), "raw BEL must not survive: {s:?}");
+        assert!(s.contains('\u{fffd}'), "expected replacement char: {s:?}");
+        // Tab is layout whitespace, not a dangerous control: it must NOT be
+        // sanitized to U+FFFD (the wrapper collapses it as whitespace instead).
+        let mut out2 = Vec::new();
+        let tabbed = [Field {
+            label: "k",
+            value: "a\tb",
+            highlight: false,
+        }];
+        record_block(&mut out2, &Palette::off(), None, &tabbed, 80).unwrap();
+        let s2 = String::from_utf8(out2).unwrap();
+        assert!(
+            !s2.contains('\u{fffd}'),
+            "tab must not be sanitized: {s2:?}"
+        );
+        assert!(s2.contains("a b") || s2.contains("a\tb"), "got: {s2:?}");
     }
 
     #[test]

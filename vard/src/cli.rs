@@ -16,7 +16,9 @@
 //! skeleton exists so completion and manpage generation track real definitions
 //! from day one.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 // Top-level `vard` command. `name`/`version`/`about` are the single source of
 // truth for the binary's identity, its `--version` string, and the manpage.
@@ -111,6 +113,194 @@ SIGHUP or when the config file changes on disk, rebuilds a watch whose event \
 source dies (with exponential backoff), and shuts down cleanly on SIGINT or \
 SIGTERM.")]
     Run,
+
+    /// Manage the set of watched directories: add, remove, list, pause, resume.
+    //
+    // The teaching prose lives in `long_about`. A bare `vard watch` (no
+    // subcommand) prints this command's short help, mirroring a bare `vard`, so
+    // the nested subcommand is `Option`al rather than required.
+    #[command(disable_help_flag = true)]
+    #[command(disable_help_subcommand = true)]
+    #[command(long_about = "\
+Manage the set of directories vard watches.
+
+Each watch is one directory tracked as its own git repository. These commands \
+edit the config file in place, preserving your comments and formatting; the \
+running daemon reloads the change automatically, so edits take effect without a \
+restart. A watch is keyed by its canonicalized path and its stable name — \
+selectors accept either.
+
+  add     register a directory (offering `git init` when it is not yet a repo)
+  remove  unregister a watch (never touching the repository or its history)
+  list    show every watch and its settings
+  pause   stop snapshotting a watch without unregistering it
+  resume  resume a paused watch")]
+    Watch {
+        /// The chosen watch subcommand. Absent (a bare `vard watch`) prints
+        /// this command's short help.
+        #[command(subcommand)]
+        command: Option<WatchCommand>,
+    },
+}
+
+/// The `vard watch` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WatchCommand {
+    /// Register a directory as a watch, seeding its git excludes.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Register a directory as a watch.
+
+The directory must be a git repository. If it is not, `vard watch add` offers to \
+run `git init` for you: on a terminal it prompts; non-interactively it declines \
+unless `--init` is passed. The watch is recorded by its canonicalized path (with \
+symlinks resolved) plus a stable name — `--name`, or the directory's own name by \
+default.
+
+Adding also seeds the repository's private `.git/info/exclude` (never your \
+tracked `.gitignore`) with vard's default excludes: dependency and build \
+directories, OS cruft, and well-known secret shapes such as `.env`, `*.pem`, and \
+`id_rsa*`. The write is idempotent — re-adding never duplicates lines and leaves \
+your own exclude entries untouched.
+
+Re-adding an existing name at a new path relinks that watch to the new location, \
+keeping its metadata — the recovery path for a directory that moved.")]
+    Add(WatchAddArgs),
+
+    /// Unregister a watch, leaving its repository untouched.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Unregister a watch.
+
+This removes the watch from the config file only. It never touches the \
+repository, its working tree, or its history — the directory and every snapshot \
+vard ever took remain exactly as they were. The watch may be named by its stable \
+name or by its path.
+
+By default vard's own metadata for the watch (its operation journal and other \
+per-watch state) is left in place, so re-adding the same name later resumes \
+cleanly. Pass `--purge` to drop that metadata as well.")]
+    Remove(WatchRemoveArgs),
+
+    /// List every watch and its settings.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+List every registered watch.
+
+Output follows the global `--format`: human-readable records on a terminal, and \
+JSON (or JSONL) when piped, so scripts get a stable machine contract. Each watch \
+reports its name, path, branch and remote, trigger and interval, whether it \
+syncs, and whether it is paused.")]
+    List,
+
+    /// Pause a watch without unregistering it.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Pause a watch.
+
+A paused watch stays registered and keeps all of its metadata, but the daemon \
+stops snapshotting it until it is resumed. The pause is recorded as `paused = \
+true` in the config file, so it survives a daemon restart and the running daemon \
+applies it on its next reload. The watch may be named by its stable name or by \
+its path.")]
+    Pause(WatchSelectArgs),
+
+    /// Resume a paused watch.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Resume a paused watch.
+
+Clears the watch's paused flag so the daemon resumes snapshotting it on its next \
+reload. Resuming a watch that is not paused is a no-op. The watch may be named by \
+its stable name or by its path.")]
+    Resume(WatchSelectArgs),
+}
+
+/// Arguments to `vard watch add`.
+#[derive(Debug, Args)]
+pub struct WatchAddArgs {
+    /// The directory to watch. Registered by its canonicalized path.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+
+    /// Stable name for the watch. Defaults to the directory's own name.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Remote the watch pushes to and pulls from (default: origin).
+    #[arg(long, value_name = "REMOTE")]
+    pub remote: Option<String>,
+
+    /// Branch the watch commits to (default: the repository's current branch).
+    #[arg(long, value_name = "BRANCH")]
+    pub branch: Option<String>,
+
+    /// Which automatic triggers arm snapshots.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub trigger: Option<TriggerArg>,
+
+    /// Interval between periodic snapshots, e.g. 15m or 1h30m.
+    #[arg(long, value_name = "DURATION")]
+    pub interval: Option<String>,
+
+    /// How long file activity must settle before a snapshot, e.g. 10s.
+    #[arg(long, value_name = "DURATION")]
+    pub quiesce: Option<String>,
+
+    /// Register the watch as local-only: never sync to a remote.
+    #[arg(long = "no-sync")]
+    pub no_sync: bool,
+
+    /// If the directory is not a git repository, initialize one without
+    /// prompting. The script-friendly escape hatch for non-interactive use.
+    #[arg(long)]
+    pub init: bool,
+}
+
+/// Arguments to `vard watch remove`.
+#[derive(Debug, Args)]
+pub struct WatchRemoveArgs {
+    /// The watch to remove, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// Also drop vard's own metadata for the watch (its journal and per-watch
+    /// state). Never touches the repository.
+    #[arg(long)]
+    pub purge: bool,
+}
+
+/// Arguments to `vard watch pause` and `vard watch resume`.
+#[derive(Debug, Args)]
+pub struct WatchSelectArgs {
+    /// The watch to act on, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+}
+
+/// Which automatic snapshot triggers a watch arms. The CLI mirror of
+/// `vard_core::TriggerMode`; kept here so `cli.rs` stays dependency-free for the
+/// `build.rs` include (the conversion lives in [`crate::watch`]).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerArg {
+    /// Snapshot only in response to filesystem changes.
+    Events,
+    /// Snapshot only when the periodic interval elapses.
+    Interval,
+    /// Arm both change and interval triggers.
+    Both,
+}
+
+impl TriggerArg {
+    /// The canonical config/spelling of this mode (`events`, `interval`,
+    /// `both`) — the string written to config and parsed by `vard_core`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerArg::Events => "events",
+            TriggerArg::Interval => "interval",
+            TriggerArg::Both => "both",
+        }
+    }
 }
 
 /// When to colorize output. Resolved against TTY detection plus the `NO_COLOR`

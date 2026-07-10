@@ -20,10 +20,13 @@ notify = "8"
 ignore = "0.4"
 # serde derive + toml back the binary's file-config layer (vard only). Duration
 # strings deserialize through vard-core's parser, so no humantime crate is
-# needed. toml is trimmed to parse+serde: vard reads config, it never writes
-# TOML. See VRD-9.
+# needed. `toml` is trimmed to parse+serde for the read path; `toml_edit` backs
+# the comment-preserving mutation path (`vard watch add/remove/pause/resume`),
+# which rewrites config.toml in place without disturbing a user's comments or
+# formatting. See VRD-9 / VRD-15.
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }
 # Advisory `flock` single-instance locking and `kill(pid, 0)` liveness probes
 # for stale-lock recovery back the daemon shell (vard only). `fs` supplies
 # `flock`; `process` supplies `test_kill_process`/`Pid`. Kept default-features

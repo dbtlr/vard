@@ -167,6 +167,26 @@ pub fn print_root_short(color: ColorWhen) -> i32 {
     emit(HelpForm::Short, &model, color)
 }
 
+/// Render short help for the subcommand named by `path` (e.g. `["watch"]` for
+/// a bare `vard watch`). Falls back to the root when a name does not resolve.
+/// Returns the process exit code.
+pub fn print_command_short(path: &[&str], color: ColorWhen) -> i32 {
+    let root = Cli::command();
+    let mut current = &root;
+    let mut rendered = BIN_NAME.to_string();
+    for name in path {
+        match current.get_subcommands().find(|c| c.get_name() == *name) {
+            Some(child) => {
+                rendered = format!("{rendered} {name}");
+                current = child;
+            }
+            None => break,
+        }
+    }
+    let model = build_model(current, &root, &rendered, HelpForm::Short);
+    emit(HelpForm::Short, &model, color)
+}
+
 /// Fallback after a successful `Cli::parse()`: if the help flags survived
 /// interception (they normally do not), render help rather than silently
 /// starting the daemon. Returns `Some(exit_code)` when help was rendered.
@@ -181,6 +201,7 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
     let root = Cli::command();
     let sub_name: Option<&str> = cli.command.as_ref().map(|c| match c {
         Command::Run => "run",
+        Command::Watch { .. } => "watch",
     });
     let (cmd, path) =
         match sub_name.and_then(|n| root.get_subcommands().find(|c| c.get_name() == n)) {

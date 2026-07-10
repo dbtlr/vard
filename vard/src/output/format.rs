@@ -4,9 +4,7 @@
 //! The settled convention (replacing a per-command `--json`): an explicit
 //! `--format` always wins; absent it, output auto-detects by destination —
 //! human-readable records on a TTY, machine-readable JSON when piped. The
-//! read/list commands (VRD-15+) consume this at the point they emit output, so
-//! the resolver is foundation-only for now and carries an `allow(dead_code)`.
-#![allow(dead_code)]
+//! `vard watch list` command consumes this at the point it emits output.
 
 use crate::cli::OutputFormat;
 
