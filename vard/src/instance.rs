@@ -52,10 +52,15 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// wrongly refuse. Retrying briefly lets a transient probe clear: persistent
 /// `WOULDBLOCK` across every retry then means a *genuine* exclusive holder,
 /// whose role content — written under its own lock — is trustworthy.
-const PROBE_CONTENTION_RETRIES: u32 = 5;
+/// Four fast attempts (~24 ms total) — a probe's shared hold lasts
+/// microseconds (plus scheduler noise), so a couple dozen milliseconds of
+/// patience rides it out, while the common genuinely-held case (a running
+/// daemon) pays an imperceptible pause instead of a tenth of a second on
+/// every CLI invocation.
+const PROBE_CONTENTION_RETRIES: u32 = 4;
 
-/// The pause between [`PROBE_CONTENTION_RETRIES`] attempts (~100 ms total).
-const PROBE_CONTENTION_INTERVAL: Duration = Duration::from_millis(20);
+/// The pause between [`PROBE_CONTENTION_RETRIES`] attempts (~24 ms total).
+const PROBE_CONTENTION_INTERVAL: Duration = Duration::from_millis(6);
 
 /// The role recorded in the lock file, so a contending CLI can tell a daemon
 /// holder (route work to it) from a peer CLI (wait for it).
@@ -605,8 +610,9 @@ mod tests {
         } // released, but leaves "pid\ndaemon" on disk (a crashed-daemon leftover)
 
         // A probe grabs the shared lock, signals that it holds it, then releases
-        // it after a short delay — shorter than the acquirer's total probe-retry
-        // budget. The ready signal makes the ordering deterministic: the acquirer
+        // it after a short delay — a realistic probe hold (microseconds plus
+        // scheduler noise), well inside the acquirer's total probe-retry budget.
+        // The ready signal makes the ordering deterministic: the acquirer
         // only starts once the shared hold is in place.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let probe_path = path.clone();
@@ -614,7 +620,7 @@ mod tests {
             let f = File::open(&probe_path).unwrap();
             flock(&f, FlockOperation::NonBlockingLockShared).unwrap();
             ready_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(30));
+            std::thread::sleep(Duration::from_millis(10));
             drop(f);
         });
         ready_rx.recv().unwrap();

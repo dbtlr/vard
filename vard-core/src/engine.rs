@@ -423,6 +423,11 @@ struct Worker {
     pending: Option<Provenance>,
     /// The last reported lifecycle state (drives change-only event emission).
     state: WatchState,
+    /// The trouble reported with `state` — part of the change-only dedup key:
+    /// an Attention→Attention transition with a DIFFERENT trouble (e.g.
+    /// snapshots-failing → source-died) is a real change subscribers depend on
+    /// (the daemon's dead-source rebuild matches the SourceDied event).
+    trouble: Option<TroubleKind>,
     /// The shared status cell the [`EngineHandle`] reads: mirrors `state` (and
     /// its trouble/reason/entered_at) on every transition so a host can query
     /// per-watch truth without reconstructing it from the event stream.
@@ -799,12 +804,23 @@ impl Worker {
     /// `Some` only for a transition caused by trouble (a `Trouble` signal or a
     /// backend panic); every other transition (a resolved-safe `Ok`, an
     /// unsafe-repo `Paused`) passes `None`.
+    ///
+    /// The dedup key is `(state, trouble)`, not the state alone: an
+    /// Attention→Attention change of trouble (snapshots-failing → source-died)
+    /// must emit — the daemon's dead-source rebuild triggers on the SourceDied
+    /// event. A reason-only refresh updates the shared cell (so queries stay
+    /// accurate) without bumping `entered_at` or emitting.
     fn set_state(&mut self, to: WatchState, trouble: Option<TroubleKind>, reason: Option<String>) {
-        if self.state == to {
+        if self.state == to && self.trouble == trouble {
+            let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            if shared.reason != reason {
+                shared.reason = reason;
+            }
             return;
         }
         let from = self.state;
         self.state = to;
+        self.trouble = trouble;
         // Mirror the transition into the shared cell the handle reads, stamping a
         // fresh `entered_at`. Held only for this update; recover a poisoned lock
         // rather than propagate a panic into an unrelated worker.
@@ -997,6 +1013,7 @@ impl Engine {
                 cfg,
                 pending: None,
                 state: WatchState::Ok,
+                trouble: None,
                 status,
                 retry: None,
                 retry_attempts: 0,
@@ -1700,6 +1717,7 @@ mod tests {
             cfg,
             pending: None,
             state: WatchState::Ok,
+            trouble: None,
             status: Arc::new(StdMutex::new(SharedStatus::new())),
             retry: None,
             retry_attempts: 0,
@@ -2682,9 +2700,15 @@ mod tests {
         assert_eq!(backend.safe_calls(), safes, "no re-poll after a panic");
 
         // ... and a later trigger snapshots immediately (retry was cleared, so
-        // run() was blocked on the input, not on the retry timer).
+        // run() was blocked on the input, not on the retry timer). The panic
+        // legitimately re-labels the standing Attention (snapshots-failing ->
+        // degraded), so a WatchStateChanged may precede the snapshot event —
+        // skip state transitions and assert the snapshot itself.
         tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
-        let ev = recv_no_advance(&mut events).await;
+        let mut ev = recv_no_advance(&mut events).await;
+        while matches!(ev, Some(Event::WatchStateChanged { .. })) {
+            ev = recv_no_advance(&mut events).await;
+        }
         assert!(
             matches!(ev, Some(Event::SnapshotCompleted { .. })),
             "a trigger after a panic-cleared retry must snapshot at once, got {ev:?}"
@@ -2886,6 +2910,51 @@ mod tests {
                 assert_eq!(trouble, Some(TroubleKind::SourceDied));
             }
             other => panic!("expected an attention transition, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_died_is_emitted_even_when_already_in_attention() {
+        // Regression: the change-only dedup must key on (state, trouble), not
+        // the state alone. A watch already parked in Attention by failing
+        // snapshots whose source THEN dies must still emit the SourceDied
+        // transition — the daemon's dead-source rebuild triggers on it.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Fail]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        // Drive a failing snapshot: the watch enters Attention/SnapshotsFailing.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        loop {
+            let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+            if let Event::WatchStateChanged { to, trouble, .. } = ev {
+                assert_eq!(to, WatchState::Attention);
+                assert_eq!(trouble, Some(TroubleKind::SnapshotsFailing));
+                break;
+            }
+        }
+
+        // The source dies while the watch is already in Attention.
+        tx.send(WatchInput::Trouble {
+            kind: TroubleKind::SourceDied,
+            detail: "watch task ended abnormally".into(),
+        })
+        .unwrap();
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match ev {
+            Event::WatchStateChanged {
+                from, to, trouble, ..
+            } => {
+                assert_eq!(from, WatchState::Attention);
+                assert_eq!(to, WatchState::Attention);
+                assert_eq!(
+                    trouble,
+                    Some(TroubleKind::SourceDied),
+                    "an Attention-to-Attention trouble change must emit"
+                );
+            }
+            other => panic!("expected the SourceDied transition, got {other:?}"),
         }
     }
 
