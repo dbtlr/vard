@@ -5,70 +5,10 @@
 //! The running-daemon health read path is covered by the shared `health::collect`
 //! and `notify` lifecycle test.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
 
-use tempfile::TempDir;
-
-/// A fully isolated environment: its own XDG dirs and HOME.
-struct Env {
-    root: TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-    home: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let root = TempDir::new().unwrap();
-        let base = root.path();
-        let env = Env {
-            config_home: base.join("config"),
-            state_home: base.join("state"),
-            home: base.join("home"),
-            root,
-        };
-        std::fs::create_dir_all(&env.home).unwrap();
-        env
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vard"));
-        cmd.args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", &self.state_home)
-            .env("HOME", &self.home)
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE");
-        cmd
-    }
-
-    fn vard(&self, args: &[&str]) -> Output {
-        self.command(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vard")
-    }
-
-    /// Writes `contents` as the config file, creating the config dir.
-    fn write_config(&self, contents: &str) {
-        let dir = self.config_home.join("vard");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), contents).unwrap();
-    }
-}
-
-fn code(out: &Output) -> i32 {
-    out.status.code().expect("process exited via a signal")
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+mod common;
+use common::{Env, code, stderr, stdout};
 
 #[test]
 fn no_config_no_daemon_reports_the_stopped_daemon() {

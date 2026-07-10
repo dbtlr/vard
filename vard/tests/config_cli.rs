@@ -3,105 +3,10 @@
 //! (including comment preservation and validation refusals), and `edit` with a
 //! scripted `$EDITOR` fixture (both a valid save and a rejected one).
 
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Stdio;
 
-use tempfile::TempDir;
-
-/// A fully isolated environment: its own XDG dirs, HOME, and a scriptable
-/// `$EDITOR` fixture path.
-struct Env {
-    root: TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-    home: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let root = TempDir::new().unwrap();
-        let base = root.path();
-        let env = Env {
-            config_home: base.join("config"),
-            state_home: base.join("state"),
-            home: base.join("home"),
-            root,
-        };
-        std::fs::create_dir_all(&env.home).unwrap();
-        env
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vard"));
-        cmd.args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", &self.state_home)
-            .env("HOME", &self.home)
-            .env_remove("EDITOR")
-            .env_remove("VISUAL")
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE");
-        cmd
-    }
-
-    fn vard(&self, args: &[&str]) -> Output {
-        self.command(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vard")
-    }
-
-    fn config_path(&self) -> PathBuf {
-        self.config_home.join("vard").join("config.toml")
-    }
-
-    fn write_config(&self, contents: &str) {
-        let dir = self.config_home.join("vard");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.toml"), contents).unwrap();
-    }
-
-    fn read_config(&self) -> String {
-        std::fs::read_to_string(self.config_path()).unwrap()
-    }
-
-    /// Installs an executable `$EDITOR` shell script that overwrites the file it
-    /// is given with `new_contents`, and returns its path.
-    fn editor_writing(&self, new_contents: &str) -> PathBuf {
-        // Name the script by a stable hash of its payload so two distinct
-        // editors (e.g. a $VISUAL and a $EDITOR) never collide on one file.
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        new_contents.hash(&mut hasher);
-        let script = self
-            .root
-            .path()
-            .join(format!("fake-editor-{:x}.sh", hasher.finish()));
-        // The editor is invoked as `script <file>`; write the payload to $1.
-        let body = format!("#!/bin/sh\ncat > \"$1\" <<'VARD_EOF'\n{new_contents}\nVARD_EOF\n");
-        std::fs::write(&script, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-        script
-    }
-}
-
-fn code(out: &Output) -> i32 {
-    out.status.code().expect("process exited via a signal")
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
+mod common;
+use common::{Env, code, stderr, stdout};
 
 const WITH_COMMENTS: &str = "\
 version = 1

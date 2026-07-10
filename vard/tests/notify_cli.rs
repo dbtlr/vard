@@ -9,80 +9,12 @@
 //!   maintains flip from healthy → problem → gone across the daemon's life, and
 //!   confirms the lock probe tracks the daemon start and clean stop.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
-
-/// A fully isolated environment: its own XDG dirs, HOME, and git global config.
-struct Env {
-    _root: TempDir,
-    config_home: PathBuf,
-    state_home: PathBuf,
-    home: PathBuf,
-    git_config: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let root = TempDir::new().unwrap();
-        let base = root.path();
-        let env = Env {
-            config_home: base.join("config"),
-            state_home: base.join("state"),
-            home: base.join("home"),
-            git_config: base.join("gitconfig"),
-            _root: root,
-        };
-        std::fs::create_dir_all(&env.home).unwrap();
-        git_config(&env.git_config, "user.email", "vard-test@example.com");
-        git_config(&env.git_config, "user.name", "Vard Test");
-        git_config(&env.git_config, "init.defaultBranch", "main");
-        env
-    }
-
-    fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vard"));
-        cmd.args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_STATE_HOME", &self.state_home)
-            .env("HOME", &self.home)
-            .env("GIT_CONFIG_GLOBAL", &self.git_config)
-            .env_remove("NO_COLOR")
-            .env_remove("CLICOLOR_FORCE");
-        cmd
-    }
-
-    /// Runs `vard <args>` to completion with stdin closed.
-    fn vard(&self, args: &[&str]) -> Output {
-        self.command(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn vard")
-    }
-
-    fn health_file(&self) -> PathBuf {
-        self.state_home.join("vard").join("health")
-    }
-}
-
-fn git_config(git_config: &Path, key: &str, value: &str) {
-    let out = Command::new("git")
-        .args(["config", "--file", git_config.to_str().unwrap(), key, value])
-        .env("GIT_CONFIG_GLOBAL", git_config)
-        .output()
-        .expect("spawn git");
-    assert!(out.status.success(), "git config failed");
-}
-
-fn code(out: &Output) -> i32 {
-    out.status.code().expect("process exited via a signal")
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
+mod common;
+use common::{Env, code, stdout};
 
 // --- no-daemon path (deterministic) ----------------------------------------
 
@@ -162,7 +94,7 @@ fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
 #[test]
 fn daemon_lifecycle_drives_notify_from_healthy_to_problem_to_stopped() {
     let env = Env::new();
-    let repo = env._root.path().join("repo");
+    let repo = env.root.path().join("repo");
     init_repo(&env, &repo);
 
     // An interval-only watch with a huge interval: the daemon starts, watches,
