@@ -84,6 +84,7 @@ use vard_core::{
 };
 
 use crate::config::{Config, ConfigError, LogLevel};
+use crate::health::{self, HealthTracker};
 use crate::instance::{InstanceLock, LockError, LockRole};
 use crate::journal::{Journal, RecoveryOpts, RecoveryReport};
 use crate::paths::{self, HomeNotFound};
@@ -127,6 +128,9 @@ pub(crate) struct DaemonPaths {
     pub request_dir: PathBuf,
     /// The directory holding per-watch operation journals.
     pub journal_dir: PathBuf,
+    /// The health file rewritten on every watch state change and cleared on
+    /// clean shutdown; `vard notify` reads it.
+    pub health_file: PathBuf,
 }
 
 impl DaemonPaths {
@@ -137,6 +141,7 @@ impl DaemonPaths {
             lock_file: paths::lock_file()?,
             request_dir: paths::request_dir()?,
             journal_dir: paths::journal_dir()?,
+            health_file: paths::health_file()?,
         })
     }
 }
@@ -587,6 +592,7 @@ async fn try_rebuild(
     old_handle: EngineHandle,
     mut old_events: EventReceiver,
     old_names: Vec<String>,
+    health: &mut HealthTracker,
 ) -> RebuildOutcome {
     match build_started_engine(paths, &old_names).await {
         Some((handle, mut events, names)) => {
@@ -607,7 +613,7 @@ async fn try_rebuild(
                         _ = &mut shutdown => break,
                         received = events.recv() => {
                             let closed = matches!(received, Err(RecvError::Closed));
-                            if matches!(handle_bus(received, paths), Action::EngineFailure) {
+                            if matches!(handle_bus(received, paths, health), Action::EngineFailure) {
                                 failure_seen = true;
                             }
                             if closed {
@@ -617,7 +623,7 @@ async fn try_rebuild(
                     }
                 }
             }
-            drain_remaining_events(paths, &mut old_events);
+            drain_remaining_events(paths, &mut old_events, health);
             RebuildOutcome {
                 handle,
                 events,
@@ -642,13 +648,18 @@ async fn try_rebuild(
 /// complete tail of the stream — draining it here guarantees each journal
 /// `begin` written earlier meets the outcome that completes it, instead of
 /// dangling because the supervisor stopped reading mid-bracket.
-fn drain_remaining_events(paths: &DaemonPaths, events: &mut EventReceiver) {
+fn drain_remaining_events(
+    paths: &DaemonPaths,
+    events: &mut EventReceiver,
+    health: &mut HealthTracker,
+) {
     use vard_core::TryRecvError;
     loop {
         match events.try_recv() {
             Ok(event) => {
                 log_event(&event);
                 journal_event(paths, &event);
+                apply_health(health, paths, &event);
             }
             Err(TryRecvError::Lagged(skipped)) => {
                 warn!(skipped, "event bus lagged during shutdown drain");
@@ -696,6 +707,11 @@ async fn supervise(
     // When set, a source-died rebuild is due at this deadline.
     let mut rebuild_at: Option<TokioInstant> = None;
 
+    // Write a fresh health file on startup: a clean, empty problem set that
+    // supersedes any stale file a previous crash may have left behind.
+    let mut health = HealthTracker::new();
+    write_health(&health, &paths);
+
     loop {
         let action = tokio::select! {
             _ = shutdown.notified() => Action::Shutdown,
@@ -717,14 +733,14 @@ async fn supervise(
             {
                 Action::BackoffRebuild
             }
-            received = events.recv() => handle_bus(received, &paths),
+            received = events.recv() => handle_bus(received, &paths, &mut health),
         };
 
         match action {
             Action::Continue => {}
             Action::Shutdown => break,
             Action::Reload => {
-                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
+                let outcome = try_rebuild(&paths, handle, events, watch_names, &mut health).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watch_names = outcome.watch_names;
@@ -738,7 +754,7 @@ async fn supervise(
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
-                let outcome = try_rebuild(&paths, handle, events, watch_names).await;
+                let outcome = try_rebuild(&paths, handle, events, watch_names, &mut health).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watch_names = outcome.watch_names;
@@ -764,7 +780,11 @@ async fn supervise(
     handle.shutdown().await;
     // The drain finishes any in-flight pass, so trailing events (including the
     // final DaemonStopped) are logged and their journal brackets closed.
-    drain_remaining_events(&paths, &mut events);
+    drain_remaining_events(&paths, &mut events, &mut health);
+    // Clean shutdown: remove the health file so `vard notify` reports the
+    // daemon-not-running line rather than treating a stale problem set as
+    // current.
+    health::clear(&paths.health_file);
 }
 
 /// Arms (or keeps) the source-died rebuild timer: advances the backoff and sets
@@ -784,13 +804,19 @@ fn schedule_rebuild(
 }
 
 /// Handles one item from the event bus: logs it, journals the commit window if
-/// applicable, and reports whether it signals engine failure (a dead signal
-/// source or a closed bus) that warrants a rebuild.
-fn handle_bus(received: Result<Event, RecvError>, paths: &DaemonPaths) -> Action {
+/// applicable, updates the health file if the event changed a watch's state,
+/// and reports whether it signals engine failure (a dead signal source or a
+/// closed bus) that warrants a rebuild.
+fn handle_bus(
+    received: Result<Event, RecvError>,
+    paths: &DaemonPaths,
+    health: &mut HealthTracker,
+) -> Action {
     match received {
         Ok(event) => {
             log_event(&event);
             journal_event(paths, &event);
+            apply_health(health, paths, &event);
             if is_source_died(&event) {
                 Action::EngineFailure
             } else {
@@ -919,6 +945,28 @@ fn journal_event(paths: &DaemonPaths, event: &Event) {
             }
         }
         _ => {}
+    }
+}
+
+/// Folds one event into the health tracker and, when it changed the problem
+/// set (only [`Event::WatchStateChanged`] can), rewrites the health file so it
+/// always reflects *current* problem state — including a watch recovering to
+/// `Ok`, which clears its entry. A write failure is warned, never fatal: a
+/// health-file hiccup must not crash the daemon or interrupt snapshotting, and
+/// `vard notify` degrades to the daemon-not-running/stale path on its own.
+fn apply_health(health: &mut HealthTracker, paths: &DaemonPaths, event: &Event) {
+    if health.observe(event, health::now_secs()) {
+        write_health(health, paths);
+    }
+}
+
+/// Writes the tracker's current problem set to the health file (atomically),
+/// warning on failure. Shared by the per-event update and the startup
+/// fresh-write.
+fn write_health(health: &HealthTracker, paths: &DaemonPaths) {
+    let doc = health.doc(health::now_secs());
+    if let Err(err) = health::write(&paths.health_file, &doc) {
+        warn!(error = %err, "could not write health file");
     }
 }
 
@@ -1405,6 +1453,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
 
@@ -1516,6 +1565,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
 
@@ -1569,6 +1619,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
 
