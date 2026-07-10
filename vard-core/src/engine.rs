@@ -1225,7 +1225,12 @@ impl EngineBuilder {
 /// Opens the git backend for a [`watch`](EngineBuilder::watch) spec, applying
 /// the branch policy: use the configured branch, else adopt the repository's
 /// current branch.
-fn open_git_backend(spec: &WatchSpec) -> Result<GitBackend, VcsError> {
+///
+/// Public so a host (the `vard` binary's `snapshot`/`log`/`diff`/`restore`
+/// commands) opens a watch's backend through the *same* branch policy the
+/// engine uses, guaranteeing the CLI operates on exactly the branch the daemon
+/// commits to.
+pub fn open_git_backend(spec: &WatchSpec) -> Result<GitBackend, VcsError> {
     let branch = match spec.branch() {
         Some(branch) => branch.to_string(),
         None => GitBackend::detect(spec.path())?
