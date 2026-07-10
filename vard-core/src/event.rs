@@ -334,9 +334,18 @@ pub enum TroubleKind {
     /// or exited unexpectedly) and is no longer producing signals for this
     /// watch.
     SourceDied,
-    /// Any other condition needing attention: a backend error, a channel
-    /// overflow, a panicked backend call, and so on. The signal source
-    /// itself is still alive.
+    /// Snapshots are failing for this watch: a hard [`snapshot`](crate::VcsBackend::snapshot)
+    /// error, or a failed [`is_safe_state`](crate::VcsBackend::is_safe_state)
+    /// probe, is preventing the pending change from being committed. Unlike
+    /// [`SourceDied`] the signal source is alive; the engine preserves the
+    /// pending change and retries it on a bounded timer, and the next successful
+    /// (or skip-to-clean) snapshot clears the condition. Surfacing this as a
+    /// state — not merely a one-off [`Event::SnapshotFailed`] — is what lets
+    /// health/status projections see the product's core silent-data-loss case:
+    /// a repository whose snapshots are quietly not landing.
+    SnapshotsFailing,
+    /// Any other condition needing attention: a channel overflow, a panicked
+    /// backend call, and so on. The signal source itself is still alive.
     Degraded,
 }
 
@@ -344,6 +353,7 @@ impl fmt::Display for TroubleKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             TroubleKind::SourceDied => "source-died",
+            TroubleKind::SnapshotsFailing => "snapshots-failing",
             TroubleKind::Degraded => "degraded",
         };
         f.write_str(s)
@@ -650,6 +660,13 @@ mod tests {
 
         assert_eq!(Resolver::Human.to_string(), "human");
         assert_eq!(Resolver::Ai.to_string(), "ai");
+
+        assert_eq!(TroubleKind::SourceDied.to_string(), "source-died");
+        assert_eq!(
+            TroubleKind::SnapshotsFailing.to_string(),
+            "snapshots-failing"
+        );
+        assert_eq!(TroubleKind::Degraded.to_string(), "degraded");
 
         assert_eq!(SkipReason::Clean.to_string(), "clean");
         assert_eq!(SkipReason::LockContended.to_string(), "lock-contended");
