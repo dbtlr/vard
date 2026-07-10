@@ -26,6 +26,38 @@ fn path_prints_the_config_location() {
 }
 
 #[test]
+fn path_piped_defaults_to_the_bare_path() {
+    // A single-value surface: absent an explicit `--format`, `config path` emits
+    // the bare absolute path even when piped (not a TTY), so `$(vard config
+    // path)` yields the path alone. No JSON braces.
+    let env = Env::new();
+    let out = env.vard(&["config", "path"]);
+    assert_eq!(code(&out), 0);
+    let printed = stdout(&out);
+    assert_eq!(printed.trim(), env.config_path().to_str().unwrap());
+    assert!(
+        !printed.contains('{') && !printed.contains('}'),
+        "piped path must be bare, not the JSON object, got: {printed}"
+    );
+    assert!(
+        printed.trim().starts_with('/'),
+        "expected a bare absolute path, got: {printed}"
+    );
+}
+
+#[test]
+fn path_explicit_json_still_emits_the_object() {
+    let env = Env::new();
+    let out = env.vard(&["--format", "json", "config", "path"]);
+    assert_eq!(code(&out), 0);
+    assert!(
+        stdout(&out).contains(r#""path":"#) && stdout(&out).contains('{'),
+        "explicit --format json must emit the {{path}} object, got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn set_get_unset_round_trip_preserves_comments() {
     let env = Env::new();
     env.write_config(WITH_COMMENTS);
@@ -45,10 +77,16 @@ fn set_get_unset_round_trip_preserves_comments() {
         "sibling inline comment lost: {written}"
     );
 
-    // get: the bare value in records/human mode (scripting ergonomics).
-    let get = env.vard(&["--format", "records", "config", "get", "defaults.interval"]);
+    // get: a single-value surface, so the piped default (no `--format`) is the
+    // bare value, not a JSON object — the scripting ergonomics.
+    let get = env.vard(&["config", "get", "defaults.interval"]);
     assert_eq!(code(&get), 0);
     assert_eq!(stdout(&get).trim(), "30m");
+    assert!(
+        !stdout(&get).contains('{'),
+        "piped get must be bare, got: {}",
+        stdout(&get)
+    );
 
     // get JSON: the {key, value} object.
     let get_json = env.vard(&["--format", "json", "config", "get", "defaults.interval"]);

@@ -59,7 +59,7 @@ pub struct Cli {
         value_enum,
         value_name = "FORMAT",
         help_heading = "Global options",
-        help = "Output shape: records, json, or jsonl. Defaults to records on a TTY, json when piped"
+        help = "Output shape: records, json, or jsonl. Defaults to records on a TTY, json when piped; single-value commands (config get/path) default to the bare value"
     )]
     pub format: Option<OutputFormat>,
 
@@ -432,10 +432,9 @@ The key is a dotted name in the `[daemon]`, `[defaults]`, `[ai]`, or `[update]` 
 section (`daemon.log_level`, `defaults.interval`). Only what the file actually \
 sets is printed — an inherited default is not materialized here — so a key the \
 config does not set prints nothing and exits 1, the way `git config` reports an \
-unset key. The bare value is printed in records format (the TTY default) for easy \
-scripting. Piped output defaults to json — a `{key, value}` object — so in a \
-script that captures the value pass `--format records` to get the bare value \
-back.")]
+unset key. By default the bare value is printed — the TEXT form — whether on a \
+terminal or piped, so `$(vard config get defaults.interval)` yields the value \
+alone. Pass `--format json` for the `{key, value}` object.")]
     Get(ConfigKeyArgs),
 
     /// Set a config key to a value.
@@ -484,9 +483,10 @@ Print the path to vard's config file.
 
 Resolves the same `$XDG_CONFIG_HOME/vard/config.toml` location the daemon and \
 the other commands use, whether or not the file exists yet, so it can seed a \
-script or an editor invocation. The bare path prints in records format (the TTY \
-default); piped output defaults to json (a `{path}` object), so pass `--format \
-records` to capture the bare path in a script.")]
+script or an editor invocation. By default the bare path prints — the TEXT form \
+— whether on a terminal or piped, so `$(vard config path)` and `$EDITOR \"$(vard \
+config path)\"` yield the path alone. Pass `--format json` for the `{path}` \
+object.")]
     Path,
 }
 

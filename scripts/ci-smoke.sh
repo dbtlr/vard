@@ -110,12 +110,24 @@ printf '%s\n' "$status_out" | grep -q 'smoke: unknown' \
   || fail "vard status did not project the unmonitored smoke watch as unknown"
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
-"$VARD" config path | grep -q 'config.toml' || fail "vard config path did not print the location"
+# config path/get are single-value surfaces (VRD-36): piped (as here) they emit
+# the bare value — the TEXT form — not the JSON envelope, so `$(vard config
+# path)` is directly usable. Assert the bare shape: a line ending in
+# config.toml with no JSON braces.
+config_path_out="$("$VARD" config path)"
+case "$config_path_out" in
+  *'{'*|*'}'*) fail "vard config path must emit the bare path, not JSON: $config_path_out" ;;
+esac
+case "$config_path_out" in
+  */config.toml) : ;;
+  *) fail "vard config path did not print a bare path ending in config.toml: $config_path_out" ;;
+esac
 "$VARD" config set defaults.interval 30m >/dev/null || fail "vard config set failed"
 grep -q 'interval = "30m"' "$XDG_CONFIG_HOME/vard/config.toml" \
   || fail "vard config set did not persist defaults.interval"
-test "$("$VARD" --format records config get defaults.interval)" = "30m" \
-  || fail "vard config get did not read the value back"
+# Piped get defaults to the bare value too — no --format needed.
+test "$("$VARD" config get defaults.interval)" = "30m" \
+  || fail "vard config get did not read the bare value back"
 "$VARD" config unset defaults.interval >/dev/null || fail "vard config unset failed"
 if "$VARD" config get defaults.interval >/dev/null; then
   fail "vard config get of an unset key must exit non-zero"

@@ -72,13 +72,35 @@ pub(crate) struct OutCtx {
 }
 
 impl OutCtx {
+    /// Resolve for a standard command: records on a TTY, JSON when piped, absent
+    /// an explicit `--format`.
     pub(crate) fn resolve(color: ColorWhen, format_flag: Option<OutputFormat>) -> OutCtx {
+        Self::build(color, format_flag, format::resolve(format_flag, is_tty()))
+    }
+
+    /// Resolve for a single-value surface (`config get`, `config path`): the bare
+    /// value regardless of destination, absent an explicit `--format`. See
+    /// [`format::resolve_single_value`].
+    pub(crate) fn resolve_single_value(
+        color: ColorWhen,
+        format_flag: Option<OutputFormat>,
+    ) -> OutCtx {
+        Self::build(
+            color,
+            format_flag,
+            format::resolve_single_value(format_flag),
+        )
+    }
+
+    /// Shared construction: the resolved `format` is decided by the caller; the
+    /// rest (destination, palette, terminal geometry) is identical.
+    fn build(color: ColorWhen, format_flag: Option<OutputFormat>, format: OutputFormat) -> OutCtx {
         let is_tty = io::stdout().is_terminal();
         let (term_width, term_height) = terminal_size::terminal_size()
             .map(|(w, h)| (w.0 as usize, h.0 as usize))
             .unwrap_or((80, 24));
         OutCtx {
-            format: format::resolve(format_flag, is_tty),
+            format,
             raw_format: format_flag,
             palette: palette::resolve_with_tty(color, is_tty),
             term_width,
@@ -86,6 +108,11 @@ impl OutCtx {
             is_tty,
         }
     }
+}
+
+/// Whether stdout is a terminal, sampled once for format resolution.
+fn is_tty() -> bool {
+    io::stdout().is_terminal()
 }
 
 /// Emits a list of records in the resolved format under a collective noun.
