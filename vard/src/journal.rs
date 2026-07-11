@@ -14,11 +14,17 @@
 //! ([`OpLock`]) keyed identically to the journal (same segment+hash prefix, a
 //! `.lock` suffix instead of `.journal`) — across its whole
 //! `begin`→mutate→`complete` bracket. That lock, not a clock, is what proves "no
-//! writer is mid-operation": recovery **try-acquires it first**, and a
+//! *vard* writer is mid-operation": recovery **try-acquires it first**, and a
 //! `WOULDBLOCK` means a live holder is mutating the watch *right now*, so
-//! recovery defers ([`RecoveryReport::HolderActive`]) and touches nothing. This
-//! is why the old fresh-lock age gate is gone — the op lock discriminates
-//! in-flight from abandoned structurally, where the age gate only guessed.
+//! recovery defers ([`RecoveryReport::HolderActive`]) and touches nothing.
+//!
+//! The op lock replaced the old age gate's *vard-writer* purpose, but not its
+//! *foreign-live* backstop: the op lock says nothing about a **foreign** process
+//! (a user's own `git commit` owns no op lock), which can create `index.lock`
+//! inside our recorded operation window right after a vard crash. So a freshness
+//! floor survives as [`FOREIGN_LOCK_GRACE`] — recovery removes a believed-stale
+//! lock only once it has aged past that floor, so a live foreign lock created in
+//! the window is never yanked (see the removal gates below).
 //!
 //! # What recovery does — and does not — do
 //!
@@ -43,13 +49,20 @@
 //!   nothing about a *foreign* process — a user's own `git rebase` can hold
 //!   `index.lock` while owning no op lock at all. A lock created before our
 //!   operation began, or materially after it, belongs to such a process (a long
-//!   `git gc`, an interactive rebase) and is never touched.
+//!   `git gc`, an interactive rebase) and is never touched, **and**
+//! - the lock file has aged past [`FOREIGN_LOCK_GRACE`]. A foreign process can
+//!   create `index.lock` *inside* our window in the moments after a vard crash;
+//!   its lock is brand new. Refusing to remove a lock younger than the floor
+//!   keeps recovery from yanking such a live foreign lock. A lock genuinely
+//!   abandoned by our crashed op ages past the floor and is removed on a later
+//!   sweep; a too-fresh lock is reported ([`RecoveryReport::LockTooFresh`]),
+//!   retained, and reconsidered next sweep.
 //!
 //! If the journal has no dangling record, the lock is foreign and is left
 //! untouched. If the op lock is held, or the owning PID is still alive, the lock
-//! is left for a later start to reconsider. A lock outside the operation window
-//! is reported as foreign and left in place. Corrupt or unreadable journals are
-//! treated conservatively: nothing is removed.
+//! is left for a later start to reconsider. A lock outside the operation window,
+//! or younger than the freshness floor, is left in place. Corrupt or unreadable
+//! journals are treated conservatively: nothing is removed.
 //!
 //! # File format
 //!
@@ -111,11 +124,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
 use tracing::{info, warn};
 
+use crate::flock;
 use crate::paths;
 
 /// Clock slack when matching a git lock's mtime against the journaled
@@ -132,10 +145,25 @@ pub(crate) const STALE_LOCK_TS_SLACK: Duration = Duration::from_secs(60);
 /// Fifteen minutes comfortably exceeds any single snapshot or sync.
 pub(crate) const MAX_OP_WINDOW: Duration = Duration::from_secs(15 * 60);
 
-/// How long a *blocking* op-lock acquirer (the synchronous CLI path only) sleeps
-/// between non-blocking retries while a peer holds the lock. Short enough to feel
-/// responsive, long enough not to spin.
-const OP_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// Freshness floor on *removing* a git lock we otherwise believe stale: a lock
+/// whose mtime is younger than this is never removed, even when every other gate
+/// (dead owner, mtime inside our operation window) says it is ours.
+///
+/// This is ours-vs-**foreign-live** protection, and it is orthogonal to the op
+/// lock. The op lock proves no *vard* writer is mid-operation — but a *foreign*
+/// process (a user's own `git commit`) owns no op lock at all and can create
+/// `index.lock` *inside* our recorded operation's window in the moments right
+/// after a vard crash: its lock's mtime then falls in the window and its
+/// (foreign) PID is not the dead one we recorded, so the window + liveness gates
+/// alone would delete a live foreign lock. Requiring the lock to have aged past
+/// this floor before removal closes that gap: a lock genuinely abandoned by our
+/// crashed operation ages past the floor and is cleaned on a later sweep, while a
+/// freshly-created foreign lock is left untouched and reconsidered once it ages
+/// (or vanishes when the foreign operation finishes). The cost is that a lock
+/// stranded by a *very recent* vard crash waits out the floor before cleanup —
+/// the deliberate trade of tidiness for never yanking a foreign process's live
+/// lock.
+pub(crate) const FOREIGN_LOCK_GRACE: Duration = Duration::from_secs(15 * 60);
 
 /// The per-watch operation journal: a single line-oriented file recording the
 /// in-flight daemon operation for one watch.
@@ -283,19 +311,23 @@ impl Journal {
     /// returned [`RecoveryReport`] so startup is never blocked.
     pub(crate) fn recover(&self, repo_path: &Path) -> RecoveryReport {
         match OpLock::try_acquire(&self.lock_path) {
-            Ok(Some(_guard)) => self.recover_locked(repo_path),
+            Ok(Some(guard)) => self.recover_locked(repo_path, &guard),
             Ok(None) => RecoveryReport::HolderActive,
             Err(detail) => RecoveryReport::Failed { detail },
         }
     }
 
-    /// The recovery core, run **while the caller holds this watch's [`OpLock`]**
+    /// The recovery core, run **while the caller holds this watch's [`OpLock`]**.
+    /// The held lock is passed as `_witness` so the precondition is structural,
+    /// not merely documented: a caller must already hold the op lock to call this
     /// (either [`recover`](Self::recover) just acquired it, or the orphan sweep
-    /// holds it across read + recover). Holding the lock is what proves no vard
-    /// writer is mid-operation, so the removed fresh-lock age gate is unneeded;
-    /// the surviving gates (PID liveness, the ours-vs-foreign op window) are the
-    /// ones the op lock cannot supplant (see the [module docs](self)).
-    fn recover_locked(&self, repo_path: &Path) -> RecoveryReport {
+    /// holds it across read + recover, or [`JournalOpGate::admit`] holds it across
+    /// its recover-then-`begin`). Holding the lock proves no vard writer is
+    /// mid-operation; the surviving gates — PID liveness, the ours-vs-foreign op
+    /// window, and the [`FOREIGN_LOCK_GRACE`] freshness floor that backstops a
+    /// live *foreign* lock — are the ones the op lock cannot supplant (see the
+    /// [module docs](self)).
+    fn recover_locked(&self, repo_path: &Path, _witness: &OpLock) -> RecoveryReport {
         let dangling = match self.read_dangling() {
             Ok(Some(record)) => record,
             Ok(None) => return RecoveryReport::Clean,
@@ -347,12 +379,24 @@ impl Journal {
             };
         }
 
-        // Provably ours and provably stale (no writer holds the op lock, the
-        // owner is dead, the lock is within our op window): remove it, then
-        // compact. The informational age is measured for the log line.
+        // Provably ours by every gate the op lock can back — but the op lock says
+        // nothing about a FOREIGN process, and a user's own `git commit` can
+        // create index.lock inside our window in the moments after our crash. Its
+        // lock is brand new. So a final freshness floor: only remove a lock that
+        // has aged past [`FOREIGN_LOCK_GRACE`]. A too-fresh lock is left in place
+        // and the record RETAINED (not compacted) so a later sweep reconsiders it
+        // once it ages — a lock genuinely ours ages past the floor and is cleaned
+        // then, while a live foreign lock is never yanked.
         let age = SystemTime::now()
             .duration_since(mtime)
             .unwrap_or(Duration::ZERO);
+        if age < FOREIGN_LOCK_GRACE {
+            return RecoveryReport::LockTooFresh {
+                op: dangling.op,
+                pid: dangling.pid,
+                age,
+            };
+        }
         match fs::remove_file(&lock_path) {
             Ok(()) => {
                 let _ = self.compact();
@@ -532,6 +576,21 @@ pub(crate) enum RecoveryReport {
         /// The dead PID that had recorded it.
         pid: u32,
     },
+    /// A dangling operation's owner is dead and its git lock sits inside the
+    /// operation window, but the lock is younger than [`FOREIGN_LOCK_GRACE`], so
+    /// it cannot yet be *proven* ours rather than a foreign process's freshly
+    /// created lock. Nothing was removed and the dangling record was **retained**
+    /// (not compacted): a later sweep reconsiders it once the lock ages past the
+    /// floor (removing it if still present) or the foreign operation finishes
+    /// (leaving no lock to clean).
+    LockTooFresh {
+        /// The dangling operation's kind.
+        op: String,
+        /// The dead PID that had recorded it.
+        pid: u32,
+        /// The lock's mtime age at the too-fresh decision (informational).
+        age: Duration,
+    },
     /// The journal existed but could not be read or parsed, or lock handling
     /// hit an I/O error. Conservative: nothing was removed.
     Corrupt {
@@ -544,6 +603,28 @@ pub(crate) enum RecoveryReport {
         /// A human-readable description of the trouble.
         detail: String,
     },
+}
+
+impl RecoveryReport {
+    /// Whether recovery reached a **settled** outcome that authorizes deleting
+    /// the journal's recovery evidence: the record was compacted clean, a stale
+    /// lock was removed, there was no lock, or the lock was proven foreign
+    /// (outside the operation window). A still-live holder
+    /// ([`HolderActive`](Self::HolderActive)/[`HolderAlive`](Self::HolderAlive)),
+    /// a too-fresh lock ([`LockTooFresh`](Self::LockTooFresh)), or an unresolved
+    /// outcome ([`Corrupt`](Self::Corrupt)/[`Failed`](Self::Failed)) is **not**
+    /// settled — its dangling record must be preserved, so a caller (the CLI
+    /// `remove` drain) falls back to the [`is_clean`](Journal::is_clean) guard
+    /// before deleting anything.
+    pub(crate) fn settled(&self) -> bool {
+        matches!(
+            self,
+            RecoveryReport::Clean
+                | RecoveryReport::LockRemoved { .. }
+                | RecoveryReport::NoLockPresent { .. }
+                | RecoveryReport::LockNotOurs { .. }
+        )
+    }
 }
 
 impl fmt::Display for RecoveryReport {
@@ -569,6 +650,12 @@ impl fmt::Display for RecoveryReport {
                 f,
                 "dangling {op:?} owner (PID {pid}) is gone but the git lock's mtime is outside \
                  that operation's window; foreign lock left in place"
+            ),
+            RecoveryReport::LockTooFresh { op, pid, age } => write!(
+                f,
+                "dangling {op:?} owner (PID {pid}) is gone but the git lock is only {}s old \
+                 (younger than the freshness floor); left in place, reconsidered next sweep",
+                age.as_secs()
             ),
             RecoveryReport::Corrupt { detail } => {
                 write!(f, "journal unreadable, left in place: {detail}")
@@ -824,14 +911,20 @@ fn lock_path_for_journal(journal_path: &Path) -> PathBuf {
 }
 
 /// A held per-watch **operation lock**: an exclusive advisory `flock` on the
-/// sibling `<prefix>.lock` file, taken on a FRESH open each time. `flock` is
-/// per-open-file-description, so a fresh fd is exactly what serializes the
-/// daemon's own concurrent workers against each other and against recovery — even
-/// same-process, a second open+flock of the same path contends — without a holder
-/// ever self-deadlocking against its own earlier fd. The kernel releases it when
-/// the fd closes (drop, clean exit, or crash alike), so an abandoned operation
-/// leaves no stale lock behind, only its dangling journal `begin` as recovery
-/// evidence.
+/// sibling `<prefix>.lock` file, taken on a FRESH open each time (the shared
+/// [`crate::flock`] primitive). `flock` is per-open-file-description, so a fresh
+/// fd is exactly what serializes the daemon's own concurrent workers against each
+/// other and against recovery — even same-process, a second open+flock of the
+/// same path contends — without a holder ever self-deadlocking against its own
+/// earlier fd.
+///
+/// The struct holds only the locked [`File`]: closing that descriptor (on drop,
+/// clean exit, or crash alike) is what releases the `flock`, so an abandoned
+/// operation leaves no stale lock behind, only its dangling journal `begin` as
+/// recovery evidence. The `.lock` FILE is left on disk deliberately — a
+/// concurrent acquirer may already hold it open, and the orphan sweep removes a
+/// GC'd watch's lock. No explicit `Drop` is needed: `File`'s own drop closes the
+/// fd and releases the lock.
 ///
 /// # Lock ordering (load-bearing)
 ///
@@ -841,10 +934,8 @@ fn lock_path_for_journal(journal_path: &Path) -> PathBuf {
 /// holding an op lock, so the two can never deadlock (see the [module docs](self)).
 pub(crate) struct OpLock {
     /// The locked file; closing it (on drop) releases the flock.
-    file: File,
-    /// Retained for diagnostics.
     #[allow(dead_code)]
-    path: PathBuf,
+    file: File,
 }
 
 impl OpLock {
@@ -854,63 +945,26 @@ impl OpLock {
     /// (`WOULDBLOCK`), and `Err(detail)` on any other I/O trouble. Creates parent
     /// directories and the lock file as needed.
     pub(crate) fn try_acquire(path: &Path) -> Result<Option<OpLock>, String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
-        }
-        // Read+write, non-truncating: the file's contents are irrelevant (the
-        // flock is the whole mechanism), but opening rw+create matches the
-        // instance lock and leaves room for future diagnostics.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| format!("opening op lock {}: {e}", path.display()))?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Some(OpLock {
-                file,
-                path: path.to_path_buf(),
-            })),
-            // `EWOULDBLOCK` is `EAGAIN` everywhere rustix targets, so one match
-            // covers contention: a live holder owns the lock.
-            Err(Errno::WOULDBLOCK) => Ok(None),
-            Err(errno) => Err(format!("locking op lock {}: {errno}", path.display())),
+        match flock::open_and_lock_exclusive(path) {
+            Ok(Some(file)) => Ok(Some(OpLock { file })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("op lock {}: {e}", path.display())),
         }
     }
 
     /// Blocking acquire with a bounded budget, for **synchronous CLI callers**
     /// only (the async daemon/engine path uses [`try_acquire`](Self::try_acquire)).
-    /// Retries the non-blocking lock on [`OP_LOCK_RETRY_INTERVAL`] until `budget`
-    /// elapses; returns `Ok(None)` if a holder never yields in time.
+    /// Retries the non-blocking lock on [`flock::LOCK_RETRY_INTERVAL`] until
+    /// `budget` elapses; returns `Ok(None)` if a holder never yields in time.
     pub(crate) fn acquire_blocking(
         path: &Path,
         budget: Duration,
     ) -> Result<Option<OpLock>, String> {
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            match Self::try_acquire(path)? {
-                Some(guard) => return Ok(Some(guard)),
-                None => {
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(OP_LOCK_RETRY_INTERVAL);
-                }
-            }
+        match flock::acquire_blocking(path, budget) {
+            Ok(Some(file)) => Ok(Some(OpLock { file })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("op lock {}: {e}", path.display())),
         }
-    }
-}
-
-impl Drop for OpLock {
-    fn drop(&mut self) {
-        // Closing the descriptor releases the flock; the kernel does this as
-        // `self.file` drops. Referencing the field documents the release contract
-        // and keeps it live. The lock file is left on disk deliberately — a
-        // concurrent acquirer may already hold it open, and the orphan sweep
-        // removes a GC'd watch's lock.
-        let _ = &self.file;
     }
 }
 
@@ -964,30 +1018,48 @@ impl JournalOpGate {
     }
 
     /// Writes the `begin` record under an already-held op `lock` and packages the
-    /// guard. Journal-begin trouble is logged but not fatal (matching the
-    /// pre-VRD-37 daemon): the op lock — already held — is the safety mechanism,
-    /// not the record write, and a journaling hiccup must not block an operation.
-    fn admit(&self, op: &str, lock: OpLock) -> JournalOpGuard {
+    /// guard. Two subtleties:
+    ///
+    /// * **Recover before overwriting (F6).** [`Journal::begin`] truncates the
+    ///   file, which would silently destroy a *prior* dangling `begin` a crashed
+    ///   operation left as recovery evidence. We already hold `lock` (the op
+    ///   lock), so we run recovery in-place first ([`recover_locked`](Journal::recover_locked),
+    ///   not [`recover`](Journal::recover), which would re-acquire the lock and
+    ///   `WOULDBLOCK` against our own hold): a dead-owner stale lock is cleaned
+    ///   and its record compacted before we overwrite. A still-live or too-fresh
+    ///   case leaves the lock in place, and the fresh record below names the same
+    ///   repo, so a later recovery can still act on it.
+    /// * **Fail closed on a begin-write failure (F8).** A journaling hiccup is
+    ///   surfaced as `Err`, not swallowed: without the `begin` record a crash
+    ///   mid-operation would strand an unrecoverable git lock, so we release the
+    ///   op lock (drop `lock`) and let the caller decide (the engine requeues via
+    ///   the gate `Err` path; the CLI fails closed when a daemon coexists).
+    fn admit(&self, op: &str, lock: OpLock) -> Result<JournalOpGuard, String> {
         let journal = self.journal();
-        if let Err(err) = journal.begin(op) {
-            warn!(error = %err, "op gate: journal begin failed (proceeding under the op lock)");
+        // Don't let begin's truncate destroy a prior crash's dangling record: we
+        // hold the op lock, so recover in-place first. Only bother when a record
+        // is actually present (the common clean case reads once and proceeds).
+        if !matches!(journal.read_dangling(), Ok(None)) {
+            journal.recover_locked(&self.identity, &lock);
         }
-        JournalOpGuard {
+        journal.begin(op).map_err(|e| e.to_string())?;
+        Ok(JournalOpGuard {
             journal,
             _lock: lock,
-        }
+        })
     }
 
     /// Blocking admission for the **synchronous CLI paths**: bounded-wait for the
     /// op lock, then write `begin`. `Ok(None)` = busy past `budget` (report
-    /// "another operation holds the lock; retry"); `Err` = op-lock I/O trouble.
+    /// "another operation holds the lock; retry"); `Err` = op-lock I/O trouble or
+    /// a `begin`-write failure (fail closed — see [`admit`](Self::admit)).
     pub(crate) fn begin_blocking(
         &self,
         op: &str,
         budget: Duration,
     ) -> Result<Option<JournalOpGuard>, String> {
         match OpLock::acquire_blocking(&self.lock_path(), budget)? {
-            Some(lock) => Ok(Some(self.admit(op, lock))),
+            Some(lock) => Ok(Some(self.admit(op, lock)?)),
             None => Ok(None),
         }
     }
@@ -999,9 +1071,13 @@ impl vard_core::OpGate for JournalOpGate {
         op: &str,
     ) -> Result<Option<Box<dyn vard_core::OpGuard>>, vard_core::OpGateError> {
         // Non-blocking on the async engine path: a busy gate returns immediately
-        // so the worker requeues rather than parking the runtime on a lock.
+        // so the worker requeues rather than parking the runtime on a lock. A
+        // begin-write failure surfaces as `Err` (fail closed), which the engine
+        // maps to its bounded failure retry (see [`admit`](Self::admit)).
         match OpLock::try_acquire(&self.lock_path()).map_err(vard_core::OpGateError::new)? {
-            Some(lock) => Ok(Some(Box::new(self.admit(op, lock)))),
+            Some(lock) => Ok(Some(Box::new(
+                self.admit(op, lock).map_err(vard_core::OpGateError::new)?,
+            ))),
             None => Ok(None),
         }
     }
@@ -1041,6 +1117,18 @@ impl vard_core::OpGuard for JournalOpGuard {
 fn legacy_journal_file_name(watch_name: &str) -> String {
     format!(
         "{}-{:016x}.journal",
+        sanitize_segment(watch_name),
+        fnv1a(watch_name.as_bytes())
+    )
+}
+
+/// The op-lock sibling of a legacy name-keyed journal: the same `<name>-<hash>`
+/// prefix with a `.lock` suffix. Migration removes it once the journal is
+/// re-keyed by path (the path-keyed op lock is a different file), so a name-keyed
+/// `.lock` left by an earlier build does not linger.
+fn legacy_lock_file_name(watch_name: &str) -> String {
+    format!(
+        "{}-{:016x}.lock",
         sanitize_segment(watch_name),
         fnv1a(watch_name.as_bytes())
     )
@@ -1243,7 +1331,22 @@ fn try_migrate_legacy(dir: &Path, name: &str, path_key: &str, report: &mut Recon
     // becomes an orphan for the sweep.
     if legacy.exists() && !target.exists() {
         match fs::rename(&legacy, &target) {
-            Ok(()) => report.migrated.push((legacy, target)),
+            Ok(()) => {
+                report.migrated.push((legacy, target));
+                // The legacy op-lock sibling (same name key) is orphaned by the
+                // rename — the path-keyed lock is a different file. Remove it so a
+                // stale name-keyed `.lock` does not linger; a failed unlink is
+                // non-fatal trouble.
+                let legacy_lock = dir.join(legacy_lock_file_name(name));
+                if let Err(e) = fs::remove_file(&legacy_lock)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    report.trouble.push(format!(
+                        "removing legacy op lock {}: {e}",
+                        legacy_lock.display()
+                    ));
+                }
+            }
             Err(e) => report
                 .trouble
                 .push(format!("migrating {}: {e}", legacy.display())),
@@ -1258,11 +1361,13 @@ enum OrphanDisposition {
     /// Recovery settled the record (compacted it clean, or proved there was
     /// nothing to do): the orphan is clean and eligible for age-based GC.
     Settled,
-    /// A live holder explains the record — either its recorded PID is still alive
-    /// ([`HolderAlive`](RecoveryReport::HolderAlive)) or a writer holds the op
-    /// lock right now ([`HolderActive`](RecoveryReport::HolderActive)). The record
-    /// was left untouched and is expected to settle on the holder's own drain, so
-    /// it is a benign deferral.
+    /// A benign deferral: the record was left untouched and is expected to settle
+    /// on a later pass without operator action. Either a live holder explains it
+    /// — its recorded PID is still alive ([`HolderAlive`](RecoveryReport::HolderAlive))
+    /// or a writer holds the op lock right now ([`HolderActive`](RecoveryReport::HolderActive))
+    /// — or its git lock is still too fresh to prove ours
+    /// ([`LockTooFresh`](RecoveryReport::LockTooFresh)) and will be reconsidered
+    /// once it ages past the freshness floor.
     Deferred,
     /// Recovery could not settle the record and no live holder explains it (a
     /// corrupt record, an I/O failure): retained as live evidence for an operator.
@@ -1276,7 +1381,9 @@ impl OrphanDisposition {
             | RecoveryReport::LockRemoved { .. }
             | RecoveryReport::NoLockPresent { .. }
             | RecoveryReport::LockNotOurs { .. } => Self::Settled,
-            RecoveryReport::HolderAlive { .. } | RecoveryReport::HolderActive => Self::Deferred,
+            RecoveryReport::HolderAlive { .. }
+            | RecoveryReport::HolderActive
+            | RecoveryReport::LockTooFresh { .. } => Self::Deferred,
             RecoveryReport::Corrupt { .. } | RecoveryReport::Failed { .. } => Self::Retained,
         }
     }
@@ -1296,7 +1403,7 @@ fn reconcile_orphan(path: &Path, sweep: SweepOpts, report: &mut ReconcileReport)
     // Hold the op lock for the whole handling. A live holder (the daemon's own
     // in-flight op, say) makes this a benign deferral — the same class as a
     // still-live recorded PID — not a manual-cleanup retention.
-    let _guard = match OpLock::try_acquire(&journal.lock_path) {
+    let guard = match OpLock::try_acquire(&journal.lock_path) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             report
@@ -1337,7 +1444,7 @@ fn reconcile_orphan(path: &Path, sweep: SweepOpts, report: &mut ReconcileReport)
                 // op lock (so no double-acquire — `recover_locked`, not `recover`),
                 // then judge whether it settled the file, is merely deferred behind
                 // a live holder, or is genuinely retained.
-                let rep = journal.recover_locked(&repo);
+                let rep = journal.recover_locked(&repo, &guard);
                 let disposition = OrphanDisposition::of(&rep);
                 report.recovered.push((path.to_path_buf(), rep));
                 match disposition {
@@ -1443,6 +1550,22 @@ impl std::error::Error for JournalError {
 pub(crate) mod test_support {
     use super::*;
 
+    /// Retries `cond` up to ~1s (100 × 10ms), returning `true` as soon as it
+    /// holds, else `false`. One home for the sibling-fork/exec race the flock
+    /// tests ride out: a forked-but-not-yet-`exec`'d sibling transiently shares a
+    /// just-released lock fd, so a reacquire/probe can `WOULDBLOCK` for a
+    /// microsecond. Production never reacquires its own lock like this; the window
+    /// is a pure cross-test artifact.
+    pub(crate) fn retry_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
     /// A dead PID: spawn `true` and reap it, so the PID is known to have exited.
     /// Small reuse risk, acceptable for a test.
     pub(crate) fn dead_pid() -> u32 {
@@ -1501,7 +1624,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{dead_pid, plant_crashed};
+    use super::test_support::{age_far_past, dead_pid, plant_crashed, retry_until};
     use super::*;
 
     /// A `repo_path` whose `.git` directory exists, plus a pre-written
@@ -1571,11 +1694,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
         let journal = Journal::for_repo_in_dir(dir.path(), &repo);
-        // ts coherent with the lock's mtime: the lock is inside the op window.
-        // No age gate any more — holding the op lock (which this test does not,
-        // so recovery acquires it) is the proof no writer is mid-op — so a
-        // dead-owner, in-window lock is removed regardless of freshness.
-        let ts = mtime_secs(&lock_path(&repo));
+        // Age the lock far past the freshness floor and take `ts` from the aged
+        // mtime, so the lock is inside the op window AND provably ours-and-stale
+        // (a *fresh* in-window lock is instead retained as too-fresh — see
+        // `dangling_dead_pid_fresh_lock_is_retained_as_too_fresh`). Holding the op
+        // lock proves no *vard* writer is mid-op; the freshness floor backstops a
+        // live *foreign* lock.
+        let ts = age_far_past(&lock_path(&repo));
         write_dangling(&journal, "snapshot", dead_pid(), ts);
 
         let report = journal.recover(&repo);
@@ -1586,6 +1711,41 @@ mod tests {
         assert!(!lock_path(&repo).exists(), "stale lock should be removed");
         // Journal compacted afterwards.
         assert_eq!(fs::metadata(journal.path()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dangling_dead_pid_fresh_lock_is_retained_as_too_fresh() {
+        // F1: a dead-owner lock whose mtime sits inside the operation window but is
+        // younger than the freshness floor cannot be *proven* ours rather than a
+        // foreign process's freshly created lock (a user's own `git commit` in the
+        // window after a vard crash). It is left in place and the record RETAINED
+        // (not compacted), for a later sweep to reconsider once it ages.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_lock(dir.path());
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
+        // Fresh lock (current mtime), ts coherent with it: in-window but brand new.
+        let ts = mtime_secs(&lock_path(&repo));
+        write_dangling(&journal, "snapshot", dead_pid(), ts);
+        let before = fs::read(journal.path()).unwrap();
+
+        let report = journal.recover(&repo);
+        assert!(
+            matches!(report, RecoveryReport::LockTooFresh { .. }),
+            "a too-fresh in-window lock must be retained, got: {report}"
+        );
+        assert!(
+            lock_path(&repo).exists(),
+            "a too-fresh lock must never be removed (it may be a live foreign lock)"
+        );
+        assert_eq!(
+            fs::read(journal.path()).unwrap(),
+            before,
+            "the dangling record must be retained so a later sweep reconsiders it"
+        );
+        assert!(
+            !report.settled(),
+            "a too-fresh outcome is not settled — it must not authorize evidence deletion"
+        );
     }
 
     #[test]
@@ -1930,9 +2090,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("notes");
         fs::create_dir_all(&repo).unwrap();
-        // A pre-VRD-34 file named by the watch name.
+        // A pre-VRD-34 file named by the watch name, plus a stale name-keyed
+        // op-lock sibling (Q7): both should be superseded by the migration.
         let legacy = legacy_journal_file_name("notes");
         fs::write(dir.path().join(&legacy), b"begin snapshot pid=1 ts=1\n").unwrap();
+        let legacy_lock = legacy_lock_file_name("notes");
+        fs::write(dir.path().join(&legacy_lock), b"").unwrap();
 
         let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
         assert_eq!(report.migrated.len(), 1, "one file migrated: {report:?}");
@@ -1942,6 +2105,11 @@ mod tests {
         );
         // The legacy name is gone; the path-keyed file now holds the record.
         assert!(!dir.path().join(&legacy).exists());
+        // The orphaned legacy op-lock sibling is removed with the migration (Q7).
+        assert!(
+            !dir.path().join(&legacy_lock).exists(),
+            "the legacy name-keyed op lock must be removed by the migration"
+        );
         let path_key = journal_file_name(&repo);
         assert_eq!(
             fs::read_to_string(dir.path().join(&path_key)).unwrap(),
@@ -2036,7 +2204,8 @@ mod tests {
         // it there and cleans the stale lock — the wedge the migration prevents.
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
-        let ts = mtime_secs(&lock_path(&repo));
+        // Age the lock past the freshness floor so recovery can prove it stale.
+        let ts = age_far_past(&lock_path(&repo));
         let legacy = legacy_journal_file_name("notes");
         fs::write(
             dir.path().join(&legacy),
@@ -2114,15 +2283,11 @@ mod tests {
             now: mtime + ORPHAN_JOURNAL_MAX_AGE + Duration::from_secs(1),
             max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
         };
-        for _ in 0..100 {
-            reconcile_journals(&journal_dir, &[], opts);
-            if !journal_dir.join(&key).exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            !journal_dir.join(&key).exists(),
+            retry_until(|| {
+                reconcile_journals(&journal_dir, &[], opts);
+                !journal_dir.join(&key).exists()
+            }),
             "the clean orphan is ultimately swept once the op lock is free"
         );
     }
@@ -2244,17 +2409,12 @@ mod tests {
         // hold the just-released op-lock fd (see the note in
         // `recovery_defers_while_the_op_lock_is_held_by_a_live_writer`).
         drop(held);
-        for _ in 0..100 {
-            let report = reconcile_journals(&journal_dir, &[], SweepOpts::new());
-            if report
+        retry_until(|| {
+            reconcile_journals(&journal_dir, &[], SweepOpts::new())
                 .recovered
                 .iter()
                 .any(|(_, r)| matches!(r, RecoveryReport::LockRemoved { .. }))
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        });
         assert!(
             !lock.exists(),
             "the stale lock is now cleaned once the op lock frees"
@@ -2309,10 +2469,7 @@ mod tests {
             .begin_blocking("snapshot", short)
             .unwrap()
             .expect("acquires the free op lock");
-        assert!(
-            journal.path().metadata().unwrap().len() > 0,
-            "begin must record a dangling `begin`"
-        );
+        assert!(!journal.is_clean(), "begin must record a dangling `begin`");
         assert!(
             gate.begin_blocking("snapshot", short).unwrap().is_none(),
             "a second acquire is busy while the guard holds the op lock"
@@ -2320,21 +2477,17 @@ mod tests {
 
         // complete compacts and releases.
         guard.complete();
-        assert_eq!(
-            journal.path().metadata().unwrap().len(),
-            0,
-            "complete must compact the journal"
-        );
+        assert!(journal.is_clean(), "complete must compact the journal");
 
         // A fresh begin, then a plain DROP (no complete): release-only.
         let guard = gate
             .begin_blocking("snapshot", short)
             .unwrap()
             .expect("reacquires after complete released the lock");
-        assert!(journal.path().metadata().unwrap().len() > 0);
+        assert!(!journal.is_clean());
         drop(guard); // release-only — must NOT compact
         assert!(
-            journal.path().metadata().unwrap().len() > 0,
+            !journal.is_clean(),
             "drop without complete must leave the dangling begin as recovery evidence"
         );
         // ...but the op lock IS released, so recovery can proceed (or a re-acquire).
@@ -2342,6 +2495,38 @@ mod tests {
             .unwrap()
             .expect("drop released the op lock")
             .complete();
+    }
+
+    #[test]
+    fn admit_recovers_a_stranded_lock_before_overwriting_the_record() {
+        // F6: a prior operation that crashed left a dangling `begin` plus a stale
+        // git lock. The next admission must not let begin's truncate silently
+        // destroy that evidence — holding the op lock, `admit` runs recovery first
+        // (cleaning the dead-owner stale lock), THEN writes its own fresh record.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed(&journal_dir, &repo);
+        assert!(lock.exists(), "precondition: the stranded lock is present");
+
+        let gate = JournalOpGate::for_repo_in_dir(&journal_dir, &repo);
+        let guard = gate
+            .begin_blocking("snapshot", Duration::from_millis(500))
+            .unwrap()
+            .expect("acquires the free op lock");
+
+        assert!(
+            !lock.exists(),
+            "admit must recover the stranded stale lock before overwriting the record, \
+             not silently truncate the evidence away"
+        );
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        assert!(
+            !journal.is_clean(),
+            "admit writes its own fresh begin record after recovering"
+        );
+        guard.complete();
+        assert!(journal.is_clean(), "complete compacts the fresh record");
     }
 
     #[test]
@@ -2368,17 +2553,13 @@ mod tests {
         } // dropped: released
 
         // The reacquire is retried briefly to ride out the sibling-fork/exec window
-        // that can transiently share the just-released fd (see the note in
-        // `instance.rs::releasing_the_lock_allows_reacquire`; the crash-release
-        // guarantee it depends on is the same kernel behavior documented on
-        // [`OpLock`], so no separate child-process test is carried here).
-        for _ in 0..100 {
-            if let Some(guard) = OpLock::try_acquire(&path).unwrap() {
-                drop(guard);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("a released op lock never became reacquirable");
+        // that can transiently share the just-released fd (see [`retry_until`]; the
+        // crash-release guarantee it depends on is the same kernel behavior
+        // documented on [`OpLock`], so no separate child-process test is carried
+        // here).
+        assert!(
+            retry_until(|| OpLock::try_acquire(&path).unwrap().is_some()),
+            "a released op lock never became reacquirable"
+        );
     }
 }
