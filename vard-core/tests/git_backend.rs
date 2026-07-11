@@ -1030,24 +1030,33 @@ fn fetch_before_first_push_is_a_normal_state() {
 }
 
 #[test]
-fn ahead_of_upstream_counts_commits_since_the_last_fetch() {
-    // The at-push-time count: local-only (no network), reading against the
-    // tracking ref the last fetch left. Commits landing AFTER a fetch are
-    // included — the number a push right now would send.
+fn upstream_status_counts_commits_since_the_last_fetch() {
+    // The local-only (ahead, behind) read against the tracking ref the last
+    // fetch left. Commits landing AFTER a fetch are included — the number a
+    // push right now would send.
     let fx = remote_fixture(); // base commit pushed; clone `b` tracks it
     assert_eq!(
-        fx.b.ahead_of_upstream().unwrap(),
-        Some(0),
-        "freshly cloned: nothing to send"
+        fx.b.upstream_status().unwrap(),
+        Some((0, 0)),
+        "freshly cloned: nothing to send, nothing to integrate"
     );
     write(&fx.b_path, "a", "1\n");
     snap_id(&fx.b, Trigger::Manual);
     write(&fx.b_path, "b", "2\n");
     snap_id(&fx.b, Trigger::Manual);
     assert_eq!(
-        fx.b.ahead_of_upstream().unwrap(),
-        Some(2),
+        fx.b.upstream_status().unwrap(),
+        Some((2, 0)),
         "two commits since the clone's implicit fetch"
+    );
+
+    // A manual `git push` updates the tracking ref, so the local-only read
+    // detects a hand-resolved watch without any fetch.
+    assert_eq!(fx.b.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
+    assert_eq!(
+        fx.b.upstream_status().unwrap(),
+        Some((0, 0)),
+        "a manual push reads as resolved, locally"
     );
 
     // A never-pushed branch (no tracking ref): ahead by its whole history.
@@ -1059,7 +1068,44 @@ fn ahead_of_upstream_counts_commits_since_the_last_fetch() {
     );
     write(tmp2.path(), "f", "x\n");
     snap_id(&backend2, Trigger::Manual);
-    assert_eq!(backend2.ahead_of_upstream().unwrap(), Some(1));
+    assert_eq!(backend2.upstream_status().unwrap(), Some((1, 0)));
+}
+
+#[test]
+fn a_deleted_remote_branch_prunes_the_stale_tracking_ref_and_counts_full_history() {
+    // The remote branch is deleted after a normal synced state: the next fetch
+    // reports the missing remote ref AND prunes the stale tracking ref a prior
+    // fetch left, so the fetch-time count (ahead = full history, what the next
+    // push recreates) and every local-only read against the tracking ref agree.
+    let fx = remote_fixture();
+    // `b` synced at the base commit, tracking ref present. Add one local commit.
+    write(&fx.b_path, "extra.txt", "x\n");
+    snap_id(&fx.b, Trigger::Manual);
+
+    // Delete the branch on the remote out from under `b` (directly on the bare
+    // repository — a push deletion of the current branch is denied by default).
+    git_ok(fx._origin.path(), &["update-ref", "-d", "refs/heads/main"]);
+
+    let state = fx.b.fetch(TEST_TIMEOUT).unwrap();
+    assert_eq!(
+        (state.ahead, state.behind),
+        (2, 0),
+        "ahead is the FULL history the next push recreates (base + extra)"
+    );
+    // The stale tracking ref is gone, so the local-only read agrees.
+    assert_eq!(
+        fx.b.upstream_status().unwrap(),
+        Some((2, 0)),
+        "the pruned tracking ref makes the push-time count match full history"
+    );
+    let out = git(
+        &fx.b_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/main"],
+    );
+    assert!(
+        !out.status.success(),
+        "the stale tracking ref was pruned by the fetch"
+    );
 }
 
 #[test]

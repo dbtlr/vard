@@ -128,7 +128,7 @@ pub enum Event {
         new_ref: String,
         /// How many commits the remote received in this push. On the push-only
         /// path this is resolved **at push time** (via
-        /// [`ahead_of_upstream`](crate::VcsBackend::ahead_of_upstream)), so
+        /// [`upstream_status`](crate::VcsBackend::upstream_status)), so
         /// commits landing after the cycle's fetch are counted; on the
         /// integrate path it is the fetch-time count plus the pre-sync
         /// snapshot's commit.

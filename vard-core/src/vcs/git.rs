@@ -629,8 +629,27 @@ impl VcsBackend for GitBackend {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains("couldn't find remote ref") {
-                // The branch has never been pushed: a normal first-push state.
-                // Everything local is "ahead"; there is nothing to be behind.
+                // The branch does not exist on the remote: a normal state — it
+                // was never pushed, or it was deleted remotely. Everything
+                // local is "ahead" (the next push [re]creates it); there is
+                // nothing to be behind.
+                //
+                // Prune any STALE tracking ref a prior fetch left (the
+                // deleted-remote-branch case): git does not remove it for a
+                // single-refspec fetch, and leaving it would make every
+                // local-only read against the tracking ref
+                // ([`upstream_status`](VcsBackend::upstream_status), and the
+                // push-time commit count built on it) disagree with the truth
+                // the remote just reported. Best-effort: a ref that is already
+                // absent (the common first-push case) is a no-op.
+                if before.is_some() {
+                    let _ = git_output(
+                        &self.path,
+                        &[],
+                        ["update-ref", "-d", tracking.as_str()],
+                        false,
+                    );
+                }
                 let ahead = self.commit_count(&format!("refs/heads/{}", self.branch))?;
                 return Ok(RemoteState {
                     remote_moved: false,
@@ -781,22 +800,23 @@ impl VcsBackend for GitBackend {
         Err(classify_failure("checkout", &out))
     }
 
-    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
-        // Local-only reads: the tracking ref is whatever the last fetch left.
-        // A never-pushed branch (no tracking ref) is ahead by its whole
-        // history; an unborn local branch is ahead by nothing.
+    fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
+        // Local-only reads: the tracking ref is whatever the last fetch (or a
+        // manual push, which also updates it) left. A never-pushed branch (no
+        // tracking ref) is ahead by its whole history and behind by nothing;
+        // an unborn local branch is behind by everything upstream.
         let tracking = format!("refs/remotes/{}/{}", self.remote, self.branch);
         if self.rev_of(&tracking)?.is_none() {
             let branch_ref = format!("refs/heads/{}", self.branch);
-            return Ok(Some(self.commit_count(&branch_ref)?));
+            return Ok(Some((self.commit_count(&branch_ref)?, 0)));
         }
         if self
             .rev_of(&format!("refs/heads/{}", self.branch))?
             .is_none()
         {
-            return Ok(Some(0));
+            return Ok(Some((0, self.commit_count(&tracking)?)));
         }
-        Ok(Some(self.ahead_behind(&tracking)?.0))
+        Ok(Some(self.ahead_behind(&tracking)?))
     }
 
     fn has_remote(&self) -> Result<bool, VcsError> {

@@ -121,9 +121,12 @@
 //! watch, and a clean ahead-only push, never touch the gate — a foreign op-lock
 //! holder cannot fail work that needs no lock. A busy gate defers on a short
 //! cadence with the pre-flight cached: while the holder wedges, the paced
-//! retries probe only the gate (zero network I/O), and the cache's freshness is
-//! judged once, at gate acquisition — still fresh proceeds on it, stale costs
-//! exactly one fresh pre-flight. A stale rebase target is never a correctness
+//! retries stay LOCAL-ONLY (zero network I/O) — each re-derives whether the
+//! locked work still exists (a watch hand-resolved mid-wait terminates
+//! up-to-date without ever taking the gate) and otherwise probes only the
+//! gate. The cache's freshness is judged once, at gate acquisition — still
+//! fresh proceeds on it, stale costs exactly one fresh pre-flight. A stale
+//! rebase target is never a correctness
 //! problem: a remote that moved past the cache surfaces as a non-fast-forward
 //! push, which re-runs the cycle with a fresh fetch.
 //! The op guard is coupled to that blocking
@@ -1779,7 +1782,9 @@ impl Worker {
     ///   with the gate never probed: a foreign/peer op-lock holder cannot fail
     ///   work that needs no lock.
     /// - **Waiting on a busy gate costs zero network I/O.** A retry arriving
-    ///   with a `cached` pre-flight probes the gate FIRST and, while it stays
+    ///   with a `cached` pre-flight re-derives, from LOCAL state only, whether
+    ///   the locked work still exists (a hand-resolved watch terminates
+    ///   up-to-date without the gate), then probes the gate and, while it stays
     ///   busy, returns the cache untouched. The freshness TTL is consulted only
     ///   at gate ACQUISITION: still fresh → the cycle proceeds on the cache;
     ///   stale → exactly one fresh pre-flight, then proceed.
@@ -1793,14 +1798,31 @@ impl Worker {
         cached: Option<CachedFetch>,
     ) -> SyncStep {
         // 0. Waiting phase: a retry carrying a cached pre-flight exists only
-        //    because locked work was needed and the gate was busy. Probe the
-        //    gate BEFORE anything else — while it stays busy the retry is pure
-        //    lock-probing, zero I/O, no matter how long the holder wedges. Only
-        //    once the gate looks free is the cache's freshness judged: a fresh
-        //    cache short-circuits the pre-flight below; a stale one is dropped
-        //    and replaced by exactly one fresh pre-flight.
+        //    because locked work was needed and the gate was busy. Everything
+        //    here is LOCAL-ONLY (zero network), no matter how long the holder
+        //    wedges:
+        //
+        //    a. Re-derive whether locked work is STILL needed. A user may have
+        //       hand-resolved mid-wait (committed and pushed manually — .git-only
+        //       changes fire no watcher trigger, and a manual push updates the
+        //       tracking ref), in which case the request must terminate
+        //       up-to-date instead of waiting on a lock it no longer needs.
+        //       Best-effort: a backend that cannot answer keeps waiting.
+        //    b. Otherwise probe the gate; while busy, return the cache
+        //       untouched — pure lock-probing.
+        //    c. Once the gate looks free, judge the cache's freshness (only
+        //       now): fresh short-circuits the pre-flight; stale is dropped and
+        //       replaced by exactly one fresh pre-flight.
         let cached = match cached {
             Some(c) => {
+                if let (Ok(false), Some((0, 0))) = (
+                    sync_is_dirty(Arc::clone(&self.backend)).await,
+                    sync_upstream_status(Arc::clone(&self.backend)).await,
+                ) {
+                    // Clean tree, no local divergence from the tracking ref:
+                    // the work this request was waiting to do no longer exists.
+                    return SyncStep::NothingToDo;
+                }
                 if !self.gate.available() {
                     return SyncStep::GateBusy(c);
                 }
@@ -1810,15 +1832,22 @@ impl Worker {
             None => None,
         };
 
-        // 1. Pre-flight — LOCK-FREE (neither reads under the op lock): the
-        //    timeout-bounded fetch FIRST, then the dirty check. The order is
-        //    load-bearing: the early exits below trust `!dirty`, so the dirty
-        //    answer must postdate the fetch — an edit saved while the fetch was
-        //    in flight is then seen, never skipped as a false "up to date".
+        // 1. Pre-flight — LOCK-FREE (neither reads under the op lock). First a
+        //    fast-fail dirty probe: a repository whose status cannot even be
+        //    read (a corrupt index) must fail BEFORE the network fetch, not
+        //    after paying for one on every backoff retry. Then the
+        //    timeout-bounded fetch, then the AUTHORITATIVE dirty check — that
+        //    order is load-bearing: the early exits below trust `!dirty`, so
+        //    the deciding answer must postdate the fetch, and an edit saved
+        //    while the fetch was in flight is seen, never skipped as a false
+        //    "up to date".
         let (dirty, remote, fetched_at) =
             match cached {
                 Some(c) => (c.dirty, c.remote, c.at),
                 None => {
+                    if let Err(error) = sync_is_dirty(Arc::clone(&self.backend)).await {
+                        return SyncStep::Failed(error);
+                    }
                     let remote =
                         match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout)
                             .await
@@ -1847,9 +1876,9 @@ impl Worker {
             // Count what this push actually sends at PUSH time when the backend
             // can (commits may have landed since the fetch); fall back to the
             // fetch-time count.
-            let pushed = sync_ahead_of_upstream(Arc::clone(&self.backend))
+            let pushed = sync_upstream_status(Arc::clone(&self.backend))
                 .await
-                .unwrap_or(remote.ahead);
+                .map_or(remote.ahead, |(ahead, _)| ahead);
             let tip = sync_current_tip(Arc::clone(&self.backend)).await;
             return self.push_step(tip, pushed, false).await;
         }
@@ -2131,13 +2160,14 @@ async fn sync_current_tip(backend: SharedBackend) -> String {
         .unwrap_or_default()
 }
 
-/// Runs [`ahead_of_upstream`](VcsBackend::ahead_of_upstream) off the async
-/// runtime, for the gate-free push's at-push-time commit count. **Best-effort**:
-/// a backend that cannot count (the default `None`), an error, or a panic all
-/// yield `None`, and the caller falls back to the fetch-time count — the count
-/// is event/row accuracy, never a correctness gate.
-async fn sync_ahead_of_upstream(backend: SharedBackend) -> Option<usize> {
-    tokio::task::spawn_blocking(move || backend.ahead_of_upstream().ok().flatten())
+/// Runs [`upstream_status`](VcsBackend::upstream_status) off the async runtime
+/// — the local-only `(ahead, behind)` read behind the gate-free push's
+/// at-push-time commit count and the gate-busy wait's hand-resolution check.
+/// **Best-effort**: a backend without the notion (the default `None`), an
+/// error, or a panic all yield `None`, and callers fall back to their
+/// fetch-time knowledge — the values are advisory, never a correctness gate.
+async fn sync_upstream_status(backend: SharedBackend) -> Option<(usize, usize)> {
+    tokio::task::spawn_blocking(move || backend.upstream_status().ok().flatten())
         .await
         .ok()
         .flatten()
@@ -3202,6 +3232,9 @@ mod tests {
         /// Whether the work tree reports dirty ([`is_dirty`]); drives the sync
         /// short-circuit's "clean tree is the only nothing-to-do" check.
         dirty: bool,
+        /// When set, [`is_dirty`](VcsBackend::is_dirty) errors — models a
+        /// repository whose status cannot be read (a corrupt index).
+        fail_is_dirty: bool,
         /// What [`has_remote`](VcsBackend::has_remote) reports; drives the sync
         /// cycle's live remote gate. Defaults to `true` (a usable remote).
         has_remote: bool,
@@ -3213,10 +3246,10 @@ mod tests {
         /// a side effect — models an edit saved WHILE the fetch was in flight,
         /// for pinning the pre-flight's fetch-then-dirty ordering (P4).
         dirty_after_fetch: Option<bool>,
-        /// What [`ahead_of_upstream`](VcsBackend::ahead_of_upstream) reports
-        /// (`None` = the trait default: the backend cannot count, callers fall
-        /// back to the fetch-time count).
-        ahead_now: Option<usize>,
+        /// What [`upstream_status`](VcsBackend::upstream_status) reports
+        /// (`None` = the trait default: the backend has no such notion, callers
+        /// fall back to their fetch-time knowledge).
+        upstream_now: Option<(usize, usize)>,
         snapshots: VecDeque<Scripted>,
         /// When set, every snapshot commits — models a backend that never
         /// reports a clean tree (used to prove the post-op re-check is bounded).
@@ -3249,10 +3282,11 @@ mod tests {
                     safe: SafeState::Safe,
                     safe_results: VecDeque::new(),
                     dirty: false,
+                    fail_is_dirty: false,
                     has_remote: true,
                     fail_has_remote: false,
                     dirty_after_fetch: None,
-                    ahead_now: None,
+                    upstream_now: None,
                     snapshots: VecDeque::new(),
                     always_commit: false,
                     always_fail: false,
@@ -3332,6 +3366,11 @@ mod tests {
             self.inner.lock().unwrap().has_remote = has_remote;
         }
 
+        /// Makes the dirty probe error (an unreadable repository status).
+        fn fail_is_dirty(&self) {
+            self.inner.lock().unwrap().fail_is_dirty = true;
+        }
+
         /// Makes the remote probe error (an unreadable repository config).
         fn fail_has_remote(&self) {
             self.inner.lock().unwrap().fail_has_remote = true;
@@ -3344,10 +3383,11 @@ mod tests {
             self.inner.lock().unwrap().dirty_after_fetch = Some(dirty);
         }
 
-        /// Scripts the at-push-time ahead count
-        /// ([`ahead_of_upstream`](VcsBackend::ahead_of_upstream)).
-        fn set_ahead_now(&self, ahead: usize) {
-            self.inner.lock().unwrap().ahead_now = Some(ahead);
+        /// Scripts the local-only `(ahead, behind)` read
+        /// ([`upstream_status`](VcsBackend::upstream_status)) — the at-push-time
+        /// count and the gate-busy wait's hand-resolution check.
+        fn set_upstream_now(&self, ahead: usize, behind: usize) {
+            self.inner.lock().unwrap().upstream_now = Some((ahead, behind));
         }
 
         /// Makes every snapshot commit, so the post-op re-check never converges
@@ -3392,11 +3432,19 @@ mod tests {
         }
 
         fn is_dirty(&self) -> Result<bool, VcsError> {
-            Ok(self.inner.lock().unwrap().dirty)
+            let inner = self.inner.lock().unwrap();
+            if inner.fail_is_dirty {
+                return Err(VcsError::CommandFailed {
+                    op: "status".into(),
+                    status: Some(128),
+                    stderr: "fatal: index file corrupt".into(),
+                });
+            }
+            Ok(inner.dirty)
         }
 
-        fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
-            Ok(self.inner.lock().unwrap().ahead_now)
+        fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
+            Ok(self.inner.lock().unwrap().upstream_now)
         }
 
         fn has_remote(&self) -> Result<bool, VcsError> {
@@ -4693,6 +4741,82 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_hand_resolved_watch_terminates_up_to_date_without_the_gate() {
+        // Finding 1 (round 6): a user hand-resolves during a wedged-gate wait
+        // (commits + pushes manually — .git-only changes fire no trigger, and
+        // the manual push updates the tracking ref). The next paced retry
+        // re-derives work-needed from LOCAL state only and terminates UpToDate:
+        // no further fetch, and the gate is never acquired.
+        let backend = FakeBackend::new();
+        backend.set_dirty(true);
+        let gate = FakeGate::busy();
+        let (tx, _events) = spawn_sync_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        // First attempt: fetch once, locked work needed, gate busy, defer.
+        settle_until("the first attempt probed the gate", || gate.probes() >= 1).await;
+        assert_eq!(backend.fetch_calls(), 1);
+
+        // The user hand-resolves: clean tree, local branch == tracking ref.
+        backend.set_dirty(false);
+        backend.set_upstream_now(0, 0);
+
+        // The next paced retry detects the resolution locally and terminates.
+        tokio::time::advance(Duration::from_millis(600)).await;
+        let outcome = timeout(Duration::from_secs(30), ack_rx)
+            .await
+            .expect("the retry terminates the request")
+            .expect("the request resolves");
+        assert_eq!(
+            outcome,
+            SyncOutcome::UpToDate,
+            "a hand-resolved wait ends up-to-date, not did-not-run"
+        );
+        assert_eq!(
+            backend.fetch_calls(),
+            1,
+            "resolution detection is local-only"
+        );
+        assert_eq!(gate.begins(), 0, "the gate was never acquired");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_dirty_probe_fails_before_any_network_fetch() {
+        // Finding 4 (round 6): a repository whose status cannot be read (a
+        // corrupt index) must fail pre-network — never a full fetch on every
+        // backoff retry before erroring.
+        let backend = FakeBackend::new();
+        backend.fail_is_dirty();
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        advance_until_matching(&mut events, Duration::from_millis(200), |e| {
+            matches!(e, Event::SyncFailed { .. })
+        })
+        .await;
+        assert!(matches!(ack_rx.await, Ok(SyncOutcome::Failed(_))));
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "a status that cannot be read fails before the network"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_edit_saved_during_the_fetch_is_not_missed_by_the_early_exit() {
         // P4: the pre-flight checks dirtiness AFTER the fetch returns. An edit
         // that lands while the fetch is in flight must be seen — a cycle that
@@ -4735,10 +4859,10 @@ mod tests {
     async fn the_gate_free_push_counts_commits_at_push_time() {
         // Finding 3: commits landing between the fetch and the push are pushed —
         // the reported count must include them when the backend can count at
-        // push time (ahead_of_upstream), not the stale fetch-time `ahead`.
+        // push time (upstream_status), not the stale fetch-time `ahead`.
         let backend = FakeBackend::new();
         backend.script_fetch([remote(2, 0)]);
-        backend.set_ahead_now(3); // one more commit landed after the fetch
+        backend.set_upstream_now(3, 0); // one more commit landed after the fetch
         backend.script_push([Ok(PushOutcome::Pushed)]);
         let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
 
@@ -5243,15 +5367,19 @@ mod tests {
     /// Settles (WITHOUT advancing the paused clock) until `cond` holds, so a
     /// test can prove an event happened at the current clock reading — however
     /// slowly the blocking pool runs under parallel test load — before it moves
-    /// time again. Panics if the condition never settles.
+    /// time again. The budget is generous REAL time (not an iteration count):
+    /// a saturated runner that starves the blocking pool for hundreds of
+    /// milliseconds must not flake the exact-count assertions built on this
+    /// (the same deflaking posture as the instance-probe tests). Panics only if
+    /// the condition never settles within the wall-clock budget.
     async fn settle_until(what: &str, cond: impl Fn() -> bool) {
-        for _ in 0..2000 {
-            if cond() {
-                return;
+        let start = std::time::Instant::now();
+        while !cond() {
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!("never settled within 30s of real time: {what}");
             }
             settle().await;
         }
-        panic!("never settled: {what}");
     }
 
     /// Settles until the backend has seen at least `n` snapshot calls, so a

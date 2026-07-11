@@ -244,18 +244,22 @@ pub trait VcsBackend {
         Ok(true)
     }
 
-    /// Counts how many commits the local branch is ahead of its remote-tracking
-    /// ref **right now** — a cheap, local-only read (no network; the tracking
-    /// ref reflects the last fetch). The sync engine's gate-free push resolves
-    /// this at push time so the reported commit count includes commits that
-    /// landed after the cycle's fetch, instead of the (possibly stale)
-    /// fetch-time count.
+    /// How the local branch relates to its remote-tracking ref **right now** —
+    /// `(ahead, behind)` as a cheap, local-only read (no network; the tracking
+    /// ref reflects the last fetch, and a manual `git push` updates it too).
     ///
-    /// Returns `Ok(None)` when the backend has no way to count (the default,
-    /// for backends without a tracking-ref notion); callers must then fall back
-    /// to their fetch-time count. The count is informational (events/rows) —
-    /// never a correctness gate.
-    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
+    /// The sync engine uses it twice: the gate-free push resolves its commit
+    /// count at push time (so commits landing after the cycle's fetch are
+    /// counted), and a gate-busy wait re-derives whether locked work is still
+    /// needed without any network — a user who hand-resolved mid-wait
+    /// (committed and pushed manually) reads as clean and `(0, 0)` here, so
+    /// the request terminates up-to-date instead of waiting on a lock it no
+    /// longer needs.
+    ///
+    /// Returns `Ok(None)` when the backend has no such notion (the default);
+    /// callers must then fall back to their fetch-time knowledge. The values
+    /// are advisory (counts, wait short-circuits) — never a correctness gate.
+    fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
         Ok(None)
     }
 
