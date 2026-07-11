@@ -73,6 +73,7 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
     let rw = select_one(&config, &args.target)?;
     let backend = open_backend(&rw.spec)?;
     let name = rw.spec.name();
+    let repo_path = rw.spec.path();
 
     let rev = resolve_rev(&backend, &args, name)?;
     // Validate the revision BEFORE any protective snapshot, so a typo'd --ref
@@ -97,16 +98,32 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
     // single-writer invariant). Branch on who holds it.
     match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
-            let result = real_restore(&paths, &out, &backend, &rev, file.as_deref(), name, true);
+            let result = real_restore(
+                &paths,
+                &out,
+                &backend,
+                repo_path,
+                &rev,
+                file.as_deref(),
+                name,
+                true,
+            );
             // Hold the lock across the whole restore; drop it only now.
             drop(lock);
             result
         }
         // A daemon owns the repo; git's index.lock serializes us against it, so
         // restore WITHOUT journaling (we are not the journal's writer).
-        Ok(CliLock::DaemonHeld) => {
-            real_restore(&paths, &out, &backend, &rev, file.as_deref(), name, false)
-        }
+        Ok(CliLock::DaemonHeld) => real_restore(
+            &paths,
+            &out,
+            &backend,
+            repo_path,
+            &rev,
+            file.as_deref(),
+            name,
+            false,
+        ),
         Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
             "another vard command is running; retry in a moment",
         )),
@@ -123,6 +140,7 @@ fn real_restore(
     paths: &CmdPaths,
     out: &OutCtx,
     backend: &impl VcsBackend,
+    repo_path: &Path,
     rev: &VcsRef,
     file: Option<&Path>,
     name: &str,
@@ -185,7 +203,7 @@ fn real_restore(
     };
 
     let protective = if journaled {
-        super::journaled(&paths.journal_dir, name, "restore", flow)
+        super::journaled(&paths.journal_dir, repo_path, name, "restore", flow)
     } else {
         flow()
     }?;

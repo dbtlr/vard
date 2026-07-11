@@ -212,6 +212,63 @@ fn remove_unknown_watch_is_an_error() {
     assert!(stderr(&out).contains("ghost"), "stderr: {}", stderr(&out));
 }
 
+/// Number of `*.journal` files under the isolated state's journal dir.
+fn journal_count(env: &Env) -> usize {
+    std::fs::read_dir(env.journal_dir())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".journal"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn remove_purge_deletes_the_watchs_journal() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    // An in-process snapshot (no daemon) brackets the operation in the journal,
+    // leaving a path-keyed file behind.
+    std::fs::write(path.join("a.txt"), "hi").unwrap();
+    let snap = env.vard(&["snapshot", "notes"]);
+    assert!(snap.status.success(), "snapshot failed: {}", stderr(&snap));
+    assert_eq!(journal_count(&env), 1, "the snapshot must leave a journal");
+
+    let out = env.vard(&["watch", "remove", "notes", "--purge"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("\"purged\":true"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert_eq!(journal_count(&env), 0, "purge must delete the journal");
+}
+
+#[test]
+fn remove_without_purge_keeps_the_watchs_journal() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    std::fs::write(path.join("a.txt"), "hi").unwrap();
+    env.vard(&["snapshot", "notes"]);
+    assert_eq!(journal_count(&env), 1);
+
+    let out = env.vard(&["watch", "remove", "notes"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // Metadata is kept so re-adding the same path resumes cleanly.
+    assert_eq!(
+        journal_count(&env),
+        1,
+        "a plain remove keeps the watch's journal"
+    );
+}
+
 #[test]
 fn list_with_no_config_is_empty() {
     let env = Env::new();
