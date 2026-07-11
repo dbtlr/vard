@@ -54,6 +54,7 @@ vard commands share a three-value exit convention:
 |---|---|
 | [`watch`](commands/watch.md) | Manage the set of watched directories: `add`, `remove`, `list`, `pause`, `resume`. |
 | [`snapshot`](commands/snapshot.md) | Take a manual snapshot now — sweep a watch and commit its current state. |
+| [`sync`](commands/sync.md) | Sync a watch with its remote now — fetch, reconcile out of tree, and push. |
 
 ## Inspect and restore
 
