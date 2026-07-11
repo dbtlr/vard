@@ -1030,6 +1030,39 @@ fn fetch_before_first_push_is_a_normal_state() {
 }
 
 #[test]
+fn ahead_of_upstream_counts_commits_since_the_last_fetch() {
+    // The at-push-time count: local-only (no network), reading against the
+    // tracking ref the last fetch left. Commits landing AFTER a fetch are
+    // included — the number a push right now would send.
+    let fx = remote_fixture(); // base commit pushed; clone `b` tracks it
+    assert_eq!(
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(0),
+        "freshly cloned: nothing to send"
+    );
+    write(&fx.b_path, "a", "1\n");
+    snap_id(&fx.b, Trigger::Manual);
+    write(&fx.b_path, "b", "2\n");
+    snap_id(&fx.b, Trigger::Manual);
+    assert_eq!(
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(2),
+        "two commits since the clone's implicit fetch"
+    );
+
+    // A never-pushed branch (no tracking ref): ahead by its whole history.
+    let origin2 = bare_origin();
+    let (tmp2, backend2) = new_repo();
+    git_ok(
+        tmp2.path(),
+        &["remote", "add", "origin", origin2.path().to_str().unwrap()],
+    );
+    write(tmp2.path(), "f", "x\n");
+    snap_id(&backend2, Trigger::Manual);
+    assert_eq!(backend2.ahead_of_upstream().unwrap(), Some(1));
+}
+
+#[test]
 fn fetch_reports_remote_movement_and_behind_count() {
     let fx = remote_fixture();
     // Before any remote movement.

@@ -82,13 +82,19 @@ pub trait OpGate: Send + Sync {
     /// issued right now would likely be admitted (`false` means a live holder
     /// owns the watch). **Advisory only** — a holder can arrive between the probe
     /// and the real `begin`, which then simply reports busy; callers must never
-    /// treat `true` as a held lock. The engine's sync cycle probes this *before*
-    /// its network fetch so a busy gate defers pre-network instead of paying for
-    /// a fetch it cannot use. Implementations should try-acquire and immediately
-    /// release their lock **without** recording anything (no journal write). The
-    /// default is optimistic (`true`), correct for gates with no contention
-    /// concept ([`NoOpGate`]); a probe that cannot be evaluated should also
-    /// return `true` and let `begin` surface the real error.
+    /// treat `true` as a held lock.
+    ///
+    /// The engine's sync cycle uses this to gate its **locked window** (the
+    /// pre-sync snapshot / reconcile / advance), not its pre-flight: the fetch
+    /// and dirty check are lock-free and run regardless, and while a busy gate
+    /// keeps deferring, the paced retries probe *only* this — the pre-flight
+    /// result is cached, so waiting on a wedged holder costs zero network I/O.
+    ///
+    /// Implementations should try-acquire and immediately release their lock
+    /// **without** recording anything (no journal write). The default is
+    /// optimistic (`true`), correct for gates with no contention concept
+    /// ([`NoOpGate`]); a probe that cannot be evaluated should also return
+    /// `true` and let `begin` surface the real error.
     fn available(&self) -> bool {
         true
     }

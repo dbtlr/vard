@@ -126,7 +126,12 @@ pub enum Event {
         watch: String,
         /// The reference (tip) that was pushed to the remote.
         new_ref: String,
-        /// How many commits the remote received in this push.
+        /// How many commits the remote received in this push. On the push-only
+        /// path this is resolved **at push time** (via
+        /// [`ahead_of_upstream`](crate::VcsBackend::ahead_of_upstream)), so
+        /// commits landing after the cycle's fetch are counted; on the
+        /// integrate path it is the fetch-time count plus the pre-sync
+        /// snapshot's commit.
         commits: usize,
     },
     /// Remote changes were pulled into the local repository.

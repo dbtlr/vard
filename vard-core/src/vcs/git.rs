@@ -781,6 +781,24 @@ impl VcsBackend for GitBackend {
         Err(classify_failure("checkout", &out))
     }
 
+    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
+        // Local-only reads: the tracking ref is whatever the last fetch left.
+        // A never-pushed branch (no tracking ref) is ahead by its whole
+        // history; an unborn local branch is ahead by nothing.
+        let tracking = format!("refs/remotes/{}/{}", self.remote, self.branch);
+        if self.rev_of(&tracking)?.is_none() {
+            let branch_ref = format!("refs/heads/{}", self.branch);
+            return Ok(Some(self.commit_count(&branch_ref)?));
+        }
+        if self
+            .rev_of(&format!("refs/heads/{}", self.branch))?
+            .is_none()
+        {
+            return Ok(Some(0));
+        }
+        Ok(Some(self.ahead_behind(&tracking)?.0))
+    }
+
     fn has_remote(&self) -> Result<bool, VcsError> {
         // A cheap, non-network config lookup: `git config remote.<name>.url`
         // exits 0 with the URL when the remote is defined and exit 1 (no output)

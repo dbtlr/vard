@@ -244,6 +244,21 @@ pub trait VcsBackend {
         Ok(true)
     }
 
+    /// Counts how many commits the local branch is ahead of its remote-tracking
+    /// ref **right now** — a cheap, local-only read (no network; the tracking
+    /// ref reflects the last fetch). The sync engine's gate-free push resolves
+    /// this at push time so the reported commit count includes commits that
+    /// landed after the cycle's fetch, instead of the (possibly stale)
+    /// fetch-time count.
+    ///
+    /// Returns `Ok(None)` when the backend has no way to count (the default,
+    /// for backends without a tracking-ref notion); callers must then fall back
+    /// to their fetch-time count. The count is informational (events/rows) —
+    /// never a correctness gate.
+    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
+        Ok(None)
+    }
+
     /// Force-removes a leftover scratch worktree at `scratch` and prunes stale
     /// worktree metadata (`git worktree remove --force` then
     /// `git worktree prune`).
