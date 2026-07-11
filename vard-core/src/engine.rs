@@ -763,14 +763,43 @@ impl Worker {
         self.retry_exhausted = false;
     }
 
-    /// Enters (or stays in) the unsafe-paused retry, arming the bounded timer.
-    /// Never resets the budget: the attempt count belongs to the whole stuck
-    /// episode and is reset only by fresh activity ([`apply`](Self::apply)) or by
-    /// [`clear_retry`](Self::clear_retry) when the change resolves. `set_state`
-    /// is idempotent, so a re-poll that still finds the repo unsafe does not
-    /// re-emit `Paused`.
+    /// Arms (or keeps) the bounded retry for `kind`, the single seam every
+    /// `enter_*` retry entry point flows through.
+    ///
+    /// The attempt budget is measured in *ticks*, and the two retry cadences
+    /// count time very differently — the short [`GateBusy`](RetryKind::GateBusy)
+    /// cadence ([`gate_busy_retry_interval`](EngineConfig::gate_busy_retry_interval))
+    /// versus the long unsafe/failure cadence
+    /// ([`unsafe_repoll_interval`](EngineConfig::unsafe_repoll_interval)). So a
+    /// change of *cadence class* (GateBusy ↔ the unsafe/failure kinds) invalidates
+    /// the accumulated count and starts a **fresh** budget: a spent Failure/Unsafe
+    /// episode must not starve a following GateBusy window (R2), and — the mirror
+    /// case that makes evidence-pending converge — a short GateBusy episode's tiny
+    /// budget must not starve a following long-cadence retry. A transition *within*
+    /// a class (unsafe ↔ failure, both long-cadence) keeps the count, so one
+    /// flapping episode stays bounded on a single budget rather than refilling on
+    /// every edge. The count is otherwise reset only by fresh activity
+    /// ([`apply`](Self::apply)) or by [`clear_retry`](Self::clear_retry) when the
+    /// change resolves.
+    fn arm_retry(&mut self, kind: RetryKind) {
+        let was_gate_busy = self.retry == Some(RetryKind::GateBusy);
+        let now_gate_busy = kind == RetryKind::GateBusy;
+        if was_gate_busy != now_gate_busy {
+            self.retry_attempts = 0;
+            self.retry_exhausted = false;
+        }
+        self.retry = Some(kind);
+    }
+
+    /// Enters (or stays in) the unsafe-paused retry, arming the bounded timer via
+    /// [`arm_retry`](Self::arm_retry): the budget carries across the whole stuck
+    /// episode (including an unsafe ↔ failure flap, same cadence class) and is
+    /// reset only on a cadence-class change, by fresh activity
+    /// ([`apply`](Self::apply)), or by [`clear_retry`](Self::clear_retry).
+    /// `set_state` is idempotent, so a re-poll that still finds the repo unsafe
+    /// does not re-emit `Paused`.
     fn enter_unsafe(&mut self, reason: UnsafeReason) {
-        self.retry = Some(RetryKind::UnsafePause);
+        self.arm_retry(RetryKind::UnsafePause);
         self.set_state(WatchState::Paused, None, Some(reason.to_string()));
     }
 
@@ -780,17 +809,22 @@ impl Worker {
     /// contention is transient (a peer's commit window on our own op lock), not a
     /// fault, so the watch stays whatever it was. It only arms the retry timer so
     /// the preserved change converges once the lock frees, without a fresh
-    /// trigger. Never resets the budget — the attempt count belongs to the whole
-    /// stuck episode and is reset only by fresh activity ([`apply`](Self::apply)).
+    /// trigger. Arms through [`arm_retry`](Self::arm_retry), which starts a FRESH
+    /// budget because GateBusy is a different cadence class from the unsafe/failure
+    /// kinds: a spent Failure/Unsafe episode must not starve this short-cadence
+    /// window (R2). Within a GateBusy episode the count carries as usual (reset
+    /// only by fresh activity in [`apply`](Self::apply) or [`clear_retry`](Self::clear_retry)).
     fn enter_gate_busy(&mut self) {
-        self.retry = Some(RetryKind::GateBusy);
+        self.arm_retry(RetryKind::GateBusy);
     }
 
     /// Enters (or stays in) the failure retry after a probe or snapshot failed.
     /// Emits [`Event::SnapshotFailed`] on any transition into the failure retry
     /// — including from an unsafe pause — but not while already in it, so a
     /// genuine new failure is surfaced once and per-tick retries do not storm.
-    /// Never resets the budget (see [`enter_unsafe`](Self::enter_unsafe)).
+    /// Arms through [`arm_retry`](Self::arm_retry) (same cadence class as
+    /// [`enter_unsafe`](Self::enter_unsafe), so an unsafe ↔ failure flap keeps one
+    /// budget; a GateBusy → failure transition starts a fresh one).
     ///
     /// It also moves the watch to [`WatchState::Attention`] with
     /// [`TroubleKind::SnapshotsFailing`], carrying the error as the reason, so
@@ -811,7 +845,7 @@ impl Worker {
         if self.retry != Some(RetryKind::Failure) {
             self.emit_failed_error(trigger, msg.clone());
         }
-        self.retry = Some(RetryKind::Failure);
+        self.arm_retry(RetryKind::Failure);
         self.set_state(
             WatchState::Attention,
             Some(TroubleKind::SnapshotsFailing),
@@ -1901,6 +1935,13 @@ mod tests {
             self.admit.store(true, Ordering::SeqCst);
         }
 
+        /// Flips the error mode: `true` returns `Err` from `begin`, `false`
+        /// returns busy/admit per [`admit`](Self::admit). Lets a test drive a
+        /// Failure episode and then a GateBusy one on one gate.
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, Ordering::SeqCst);
+        }
+
         fn begins(&self) -> usize {
             self.begins.load(Ordering::SeqCst)
         }
@@ -2684,6 +2725,75 @@ mod tests {
             backend.snapshot_calls(),
             0,
             "a gate that never admits must never let the backend mutate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_busy_window_gets_a_fresh_budget_after_a_spent_failure_episode() {
+        // R2: a Failure/Unsafe episode that spends its bounded budget must NOT
+        // carry that count into a following GateBusy window — a different cadence
+        // class. With the bug, `enter_gate_busy` inherited the spent budget, the
+        // short self-retry timer never fired again, and the preserved change
+        // stranded until a fresh trigger. The cadence-class transition now starts a
+        // fresh budget, so the change still converges on the self-retry alone.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let gate = FakeGate::failing();
+        let mut cfg = test_cfg();
+        // One tick spends the (long-cadence) Failure budget: at the Failure→GateBusy
+        // transition the buggy code would carry attempts==max and mark GateBusy
+        // exhausted at once.
+        cfg.unsafe_repoll_max_attempts = 1;
+        let (tx, mut events, _counter) =
+            spawn_worker_with_gate(Arc::clone(&backend), cfg, Arc::clone(&gate) as SharedGate);
+
+        // Trigger: the failing gate arms the Failure retry (attempts still 0). The
+        // failure is emitted synchronously on this first pass, so no clock advance
+        // is needed — keeping the budget un-ticked before the transition.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = recv_no_advance(&mut events)
+            .await
+            .expect("the failing gate surfaces one failure");
+        assert!(
+            matches!(ev, Event::SnapshotFailed { .. }),
+            "the failing gate arms the Failure retry, got {ev:?}"
+        );
+        // `enter_failure` also emits the snapshots-failing state change; drain it so
+        // the convergence assertion below cannot mistake it for progress.
+        let ev = recv_no_advance(&mut events).await;
+        assert!(
+            matches!(
+                ev,
+                Some(Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    ..
+                })
+            ),
+            "the failure surfaces snapshots-failing, got {ev:?}"
+        );
+
+        // The failure clears but the op lock is now held by a peer: flip the gate
+        // to busy, then let one 30 s Failure tick fire — its pass sees a BUSY gate
+        // and transitions Failure → GateBusy. No fresh trigger is sent.
+        gate.set_fail(false); // begin now returns Ok(None) = busy
+        settle().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        settle().await;
+        assert_eq!(
+            backend.snapshot_calls(),
+            0,
+            "still no commit: the gate is busy"
+        );
+
+        // The gate frees. WITHOUT any fresh trigger, only the short GateBusy
+        // self-retry can drive convergence — which it can only do if that
+        // transition gave it a fresh budget rather than the spent Failure one.
+        gate.admit();
+        let ev = advance_until_event(&mut events, Duration::from_millis(500)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the gate-busy self-retry must converge on a fresh budget after a spent \
+             failure episode, with no new trigger, got {ev:?}"
         );
     }
 
