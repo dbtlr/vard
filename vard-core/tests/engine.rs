@@ -25,9 +25,9 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 use vard_core::{
-    ChangeSummary, Engine, Event, EventReceiver, LogFilter, PushOutcome, ReconcileOutcome,
-    RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest,
-    TriggerMode, VcsBackend, VcsError, VcsRef, WatchSpec,
+    AdvanceOutcome, ChangeSummary, Engine, Event, EventReceiver, LogFilter, PushOutcome,
+    ReconcileOutcome, RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome,
+    SnapshotRequest, TriggerMode, VcsBackend, VcsError, VcsRef, WatchSpec,
 };
 
 /// A short quiescence window: long enough to absorb event-delivery latency,
@@ -125,7 +125,11 @@ impl VcsBackend for FakeBackend {
         unimplemented!("reconcile is out of scope for the snapshot engine")
     }
 
-    fn advance(&self, _target: &SnapshotId) -> Result<(), VcsError> {
+    fn advance(
+        &self,
+        _target: &SnapshotId,
+        _expected_tip: &SnapshotId,
+    ) -> Result<AdvanceOutcome, VcsError> {
         unimplemented!("advance is out of scope for the snapshot engine")
     }
 
@@ -334,7 +338,11 @@ impl VcsBackend for GatedBackend {
         unimplemented!("reconcile is out of scope for the snapshot engine")
     }
 
-    fn advance(&self, _target: &SnapshotId) -> Result<(), VcsError> {
+    fn advance(
+        &self,
+        _target: &SnapshotId,
+        _expected_tip: &SnapshotId,
+    ) -> Result<AdvanceOutcome, VcsError> {
         unimplemented!("advance is out of scope for the snapshot engine")
     }
 
