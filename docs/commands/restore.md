@@ -69,6 +69,8 @@ If the [daemon](run.md) is running it keeps ownership of the repository; the res
 
 The recoverable journal record is guaranteed on every real restore **except** one case: if the operation lock itself cannot be taken (an op-lock or journal I/O failure) *while a daemon is running*, the restore fails closed — it cannot prove exclusion against the daemon's worker, so it changes nothing and reports that it could not take the watch's operation lock (retry). With no daemon running the CLI is the sole writer, so the same I/O trouble is non-fatal: the restore proceeds under git's own index lock and only the recovery record is missing.
 
+One more deferral protects a prior crash's recovery evidence: if an earlier operation on the watch left a dangling journal record plus a git lock that is not yet provably stale — its owner is gone but the lock is still within the freshness window a live foreign process could have created it in — the restore declines rather than overwrite that record, and reports that a prior operation's lock is still being verified (retry in a few minutes). It clears on its own once the lock ages past the window and the next attempt proves it stale.
+
 ## Exit codes
 
 | Code | Meaning |
