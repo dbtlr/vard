@@ -257,7 +257,8 @@ impl DaemonPaths {
     /// `repo_path`: `<reconcile_dir>/<journal-key>`, keyed by the same repository
     /// identity as the watch's journal so recovery can address it.
     fn scratch_for(&self, repo_path: &Path) -> PathBuf {
-        self.reconcile_dir.join(journal::journal_file_name(repo_path))
+        self.reconcile_dir
+            .join(journal::journal_file_name(repo_path))
     }
 }
 
@@ -1541,6 +1542,84 @@ impl SourceDiedBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- GitSyncSettler (crash-recovery settlement) ---------------------------
+
+    /// Opens a `GitSyncSettler` over `repo` on `main`, scratch under a subdir.
+    fn settler_for(repo: &Path) -> GitSyncSettler {
+        GitSyncSettler {
+            backend: vard_core::GitBackend::open(repo, "main", "origin").unwrap(),
+            scratch: repo.join(".vard-scratch"),
+        }
+    }
+
+    #[test]
+    fn git_sync_settler_reapplies_the_advance_on_a_clean_tree() {
+        use journal::SyncSettler;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        // Two commits; leave HEAD one behind the target (as a crash between
+        // reconcile and advance would).
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "one"]);
+        let target = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        git_ok(&repo, &["reset", "--hard", "HEAD~1"]);
+        assert_eq!(commit_count(&repo), 1, "HEAD is one behind the target");
+
+        settler_for(&repo).settle(Some(&target)).unwrap();
+
+        assert_eq!(commit_count(&repo), 2, "the advance target was re-applied");
+        assert!(repo.join("a.txt").exists());
+    }
+
+    #[test]
+    fn git_sync_settler_skips_the_advance_on_a_dirty_tree() {
+        use journal::SyncSettler;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "base"]);
+        std::fs::write(repo.join("base.txt"), "target\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "target"]);
+        let target = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        git_ok(&repo, &["reset", "--hard", "HEAD~1"]);
+        assert_eq!(commit_count(&repo), 2, "HEAD is one behind the target");
+        // An uncommitted edit to a TRACKED file: re-advancing (reset --hard)
+        // would destroy it, so the settler must skip the advance.
+        std::fs::write(repo.join("base.txt"), "unsaved local work\n").unwrap();
+
+        settler_for(&repo).settle(Some(&target)).unwrap();
+
+        assert_eq!(commit_count(&repo), 2, "a dirty tree is not advanced");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            "unsaved local work\n",
+            "the uncommitted edit must survive"
+        );
+    }
 
     // --- request-file staleness ----------------------------------------------
 

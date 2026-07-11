@@ -315,7 +315,8 @@ impl Journal {
             .create(true)
             .open(&self.path)
             .map_err(|source| self.io_err(source))?;
-        writeln!(file, "advance {}", sanitize_token(target)).map_err(|source| self.io_err(source))?;
+        writeln!(file, "advance {}", sanitize_token(target))
+            .map_err(|source| self.io_err(source))?;
         file.flush().map_err(|source| self.io_err(source))
     }
 
@@ -1880,6 +1881,33 @@ pub(crate) mod test_support {
         (repo.to_path_buf(), lock)
     }
 
+    /// Like [`plant_crashed`] but for a crashed **sync**: the dangling record is
+    /// `begin sync …` followed by an `advance <target>` line, so recovery has an
+    /// advance target to re-apply once it proves the record ours and stale.
+    /// Returns `(repo, lock)`.
+    pub(crate) fn plant_crashed_sync(
+        journal_dir: &Path,
+        repo: &Path,
+        target: &str,
+    ) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let journal = Journal::for_repo_in_dir(journal_dir, repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\nadvance {target}\n",
+                dead_pid(),
+                hex_encode(identity_path(repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+        (repo.to_path_buf(), lock)
+    }
+
     /// Like [`plant_crashed`] but leaves the git lock at its FRESH (current)
     /// mtime, so recovery sees an in-window lock younger than
     /// [`FOREIGN_LOCK_GRACE`] and retains it as
@@ -1915,9 +1943,32 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        age_far_past, dead_pid, live_pid, plant_crashed, plant_crashed_fresh, retry_until,
+        age_far_past, dead_pid, live_pid, plant_crashed, plant_crashed_fresh, plant_crashed_sync,
+        retry_until,
     };
     use super::*;
+
+    /// A [`SyncSettler`] that records every call for assertions and never fails.
+    #[derive(Default)]
+    struct RecordingSettler {
+        calls: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl RecordingSettler {
+        fn targets(&self) -> Vec<Option<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SyncSettler for RecordingSettler {
+        fn settle(&self, advance_target: Option<&str>) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(advance_target.map(str::to_string));
+            Ok(())
+        }
+    }
 
     /// A `repo_path` whose `.git` directory exists, plus a pre-written
     /// `index.lock` with the current wall-clock mtime.
@@ -3053,6 +3104,133 @@ mod tests {
         assert!(
             retry_until(|| OpLock::try_acquire(&path).unwrap().is_some()),
             "a released op lock never became reacquirable"
+        );
+    }
+
+    // --- sync recovery -------------------------------------------------------
+
+    #[test]
+    fn dangling_sync_record_settled_removes_lock_and_reapplies_the_advance() {
+        // A provably-ours-and-stale crashed sync (dead owner, aged in-window
+        // lock) is settled: the git lock is removed, the recorded advance target
+        // is handed to the settler, and the journal is compacted.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo, "deadbeefcafe");
+
+        let settler = RecordingSettler::default();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockRemoved { .. }),
+            "expected LockRemoved, got {report:?}"
+        );
+        assert!(!lock.exists(), "the stale git lock must be removed");
+        assert_eq!(
+            settler.targets(),
+            vec![Some("deadbeefcafe".to_string())],
+            "the recorded advance target must be re-applied"
+        );
+        assert!(journal.is_clean(), "the settled journal is compacted");
+    }
+
+    #[test]
+    fn dangling_sync_record_with_no_lock_still_settles_the_advance() {
+        // Dead owner, no git lock present (the reset completed but the record
+        // never closed): recovery still prunes/re-advances via the settler.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo, "abc123");
+        fs::remove_file(&lock).unwrap();
+
+        let settler = RecordingSettler::default();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::NoLockPresent { .. }),
+            "expected NoLockPresent, got {report:?}"
+        );
+        assert_eq!(settler.targets(), vec![Some("abc123".to_string())]);
+    }
+
+    #[test]
+    fn a_live_owner_defers_sync_settlement_gate_respected() {
+        // A dangling sync record whose recorded PID is still alive is HolderAlive:
+        // the tree is NOT touched (the settler is never called), exactly as the
+        // liveness gate protects the git lock.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let live = live_pid();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\nadvance feedface\n",
+                live.pid(),
+                hex_encode(identity_path(&repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::HolderAlive { .. }),
+            "expected HolderAlive, got {report:?}"
+        );
+        assert!(lock.exists(), "a live holder's lock is never removed");
+        assert!(
+            settler.targets().is_empty(),
+            "a live holder must not have its tree settled"
+        );
+    }
+
+    #[test]
+    fn a_too_fresh_lock_defers_sync_settlement_foreign_grace_respected() {
+        // Dead owner, in-window lock but younger than FOREIGN_LOCK_GRACE: it
+        // cannot yet be proven ours rather than a live foreign lock, so recovery
+        // retains it (LockTooFresh) and does NOT settle the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = mtime_secs(&lock); // fresh, in-window
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\nadvance c0ffee\n",
+                dead_pid(),
+                hex_encode(identity_path(&repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockTooFresh { .. }),
+            "expected LockTooFresh, got {report:?}"
+        );
+        assert!(lock.exists(), "a too-fresh lock is retained");
+        assert!(
+            settler.targets().is_empty(),
+            "the foreign-lock grace must gate sync settlement too"
         );
     }
 }

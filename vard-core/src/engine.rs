@@ -104,7 +104,7 @@
 //!
 //! **Lock/network separation.** The network-facing steps — [`fetch`](VcsBackend::fetch)
 //! and [`push`](VcsBackend::push) — run **outside** the per-watch op lock, each
-//! timeout-bounded ([`EngineConfig::sync_network_timeout`]), so a hung endpoint
+//! timeout-bounded ([`DEFAULT_SYNC_NETWORK_TIMEOUT`]), so a hung endpoint
 //! can never block a worker while holding the lock. Between them, one **locked
 //! window** holds the op lock and one journal bracket (`begin("sync")` →
 //! `complete`) with **zero network I/O** inside: a pre-sync snapshot
@@ -1237,8 +1237,7 @@ impl Worker {
                     // the short gate-busy cadence, no state change — contention is
                     // transient, not a sync fault.
                     self.sync_pending = Some(manual);
-                    self.sync_retry_at =
-                        Some(Instant::now() + self.cfg.gate_busy_retry_interval);
+                    self.sync_retry_at = Some(Instant::now() + self.cfg.gate_busy_retry_interval);
                     return;
                 }
                 SyncStep::Failed(error) => {
@@ -1255,12 +1254,11 @@ impl Worker {
     async fn sync_once(&mut self, scratch: &std::path::Path) -> SyncStep {
         // 1. Fetch — OUTSIDE the op lock, timeout-bounded. Nothing to pull and
         //    nothing to push is the whole job done.
-        let remote = match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout)
-            .await
-        {
-            Ok(remote) => remote,
-            Err(error) => return SyncStep::Failed(error),
-        };
+        let remote =
+            match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout).await {
+                Ok(remote) => remote,
+                Err(error) => return SyncStep::Failed(error),
+            };
         if remote.ahead == 0 && remote.behind == 0 {
             return SyncStep::NothingToDo;
         }
@@ -1419,7 +1417,10 @@ enum LockedResult {
 /// Takes the backend by value (a cheap [`Arc`] clone) so the future stays
 /// `Send`. A backend panic is surfaced as an error message rather than aborting
 /// the worker task.
-async fn sync_fetch(backend: SharedBackend, timeout: Duration) -> Result<crate::vcs::RemoteState, String> {
+async fn sync_fetch(
+    backend: SharedBackend,
+    timeout: Duration,
+) -> Result<crate::vcs::RemoteState, String> {
     match tokio::task::spawn_blocking(move || backend.fetch(timeout)).await {
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(err)) => Err(format!("fetch: {err}")),
@@ -2365,6 +2366,18 @@ mod tests {
         /// The 1-based snapshot call that should block on `gate_rx`.
         gate_on_call: Option<usize>,
         gate_rx: Option<std::sync::mpsc::Receiver<()>>,
+        /// Scripted sync-primitive results, consumed in order; each falls back
+        /// to a benign default when its script runs dry.
+        fetch_results: VecDeque<Result<crate::vcs::RemoteState, VcsError>>,
+        reconcile_results: VecDeque<Result<ReconcileOutcome, VcsError>>,
+        push_results: VecDeque<Result<PushOutcome, VcsError>>,
+        fetch_calls: usize,
+        /// Incremented for symmetry with the other counters; not asserted on.
+        #[allow(dead_code)]
+        reconcile_calls: usize,
+        advance_calls: usize,
+        prune_calls: usize,
+        push_calls: usize,
     }
 
     impl FakeBackend {
@@ -2380,8 +2393,43 @@ mod tests {
                     safe_calls: 0,
                     gate_on_call: None,
                     gate_rx: None,
+                    fetch_results: VecDeque::new(),
+                    reconcile_results: VecDeque::new(),
+                    push_results: VecDeque::new(),
+                    fetch_calls: 0,
+                    reconcile_calls: 0,
+                    advance_calls: 0,
+                    prune_calls: 0,
+                    push_calls: 0,
                 }),
             })
+        }
+
+        /// Scripts the sync primitives' results, consumed in order (falling back
+        /// to benign defaults once drained).
+        fn script_fetch(
+            &self,
+            r: impl IntoIterator<Item = Result<crate::vcs::RemoteState, VcsError>>,
+        ) {
+            self.inner.lock().unwrap().fetch_results.extend(r);
+        }
+        fn script_reconcile(
+            &self,
+            r: impl IntoIterator<Item = Result<ReconcileOutcome, VcsError>>,
+        ) {
+            self.inner.lock().unwrap().reconcile_results.extend(r);
+        }
+        fn script_push(&self, r: impl IntoIterator<Item = Result<PushOutcome, VcsError>>) {
+            self.inner.lock().unwrap().push_results.extend(r);
+        }
+        fn fetch_calls(&self) -> usize {
+            self.inner.lock().unwrap().fetch_calls
+        }
+        fn advance_calls(&self) -> usize {
+            self.inner.lock().unwrap().advance_calls
+        }
+        fn push_calls(&self) -> usize {
+            self.inner.lock().unwrap().push_calls
         }
 
         fn script(&self, results: impl IntoIterator<Item = Scripted>) {
@@ -2521,26 +2569,47 @@ mod tests {
             &self,
             _timeout: std::time::Duration,
         ) -> Result<crate::vcs::RemoteState, VcsError> {
-            unimplemented!("fetch is out of scope for the snapshot engine")
+            let mut inner = self.inner.lock().unwrap();
+            inner.fetch_calls += 1;
+            inner
+                .fetch_results
+                .pop_front()
+                .unwrap_or(Ok(crate::vcs::RemoteState {
+                    remote_moved: false,
+                    ahead: 0,
+                    behind: 0,
+                }))
         }
 
         fn reconcile(
             &self,
             _scratch: &std::path::Path,
         ) -> Result<crate::vcs::ReconcileOutcome, VcsError> {
-            unimplemented!("reconcile is out of scope for the snapshot engine")
+            let mut inner = self.inner.lock().unwrap();
+            inner.reconcile_calls += 1;
+            inner
+                .reconcile_results
+                .pop_front()
+                .unwrap_or(Ok(ReconcileOutcome::AlreadyUpToDate))
         }
 
         fn advance(&self, _target: &crate::vcs::SnapshotId) -> Result<(), VcsError> {
-            unimplemented!("advance is out of scope for the snapshot engine")
+            self.inner.lock().unwrap().advance_calls += 1;
+            Ok(())
         }
 
         fn prune_scratch(&self, _scratch: &std::path::Path) -> Result<(), VcsError> {
-            unimplemented!("prune_scratch is out of scope for the snapshot engine")
+            self.inner.lock().unwrap().prune_calls += 1;
+            Ok(())
         }
 
         fn push(&self, _timeout: std::time::Duration) -> Result<crate::vcs::PushOutcome, VcsError> {
-            unimplemented!("push is out of scope for the snapshot engine")
+            let mut inner = self.inner.lock().unwrap();
+            inner.push_calls += 1;
+            inner
+                .push_results
+                .pop_front()
+                .unwrap_or(Ok(PushOutcome::UpToDate))
         }
     }
 
@@ -2663,6 +2732,258 @@ mod tests {
         };
         tokio::spawn(worker.run(rx));
         (tx, events, counter)
+    }
+
+    /// Spawns a **sync-enabled** worker (an injected scratch dir; the no-op gate
+    /// admits) for driving the sync cycle deterministically under paused time.
+    fn spawn_sync_worker(
+        backend: Arc<FakeBackend>,
+        cfg: EngineConfig,
+    ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
+        let bus = EventBus::default();
+        let events = bus.subscribe();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker {
+            name: "w".to_string(),
+            backend: backend as SharedBackend,
+            gate: default_gate(),
+            mute: MuteSource::Silent,
+            _schedule: None,
+            bus,
+            cfg,
+            pending: None,
+            state: WatchState::Ok,
+            trouble: None,
+            status: Arc::new(StdMutex::new(SharedStatus::new())),
+            retry: None,
+            retry_attempts: 0,
+            retry_exhausted: false,
+            sync_enabled: true,
+            scratch_dir: Some(PathBuf::from("/tmp/vard-test-scratch")),
+            sync_pending: None,
+            sync_failures: 0,
+            sync_retry_at: None,
+        };
+        tokio::spawn(worker.run(rx));
+        (tx, events)
+    }
+
+    /// A scripted [`fetch`](VcsBackend::fetch) result. `remote_moved` follows
+    /// `behind > 0` (a remote we are behind has moved).
+    fn remote(ahead: usize, behind: usize) -> Result<crate::vcs::RemoteState, VcsError> {
+        Ok(crate::vcs::RemoteState {
+            remote_moved: behind > 0,
+            ahead,
+            behind,
+        })
+    }
+
+    // --- sync cycle (paused time, scripted backend) --------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_disabled_watch_never_talks_to_the_remote() {
+        // sync = false (or an unset scratch dir) => spawn_worker is sync-disabled:
+        // a request is dropped silently with no fetch and no event.
+        let backend = FakeBackend::new();
+        let (tx, mut events, _c) = spawn_worker(Arc::clone(&backend), test_cfg());
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        for _ in 0..10 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        assert_eq!(backend.fetch_calls(), 0, "a disabled watch never fetches");
+        assert!(no_more_outcomes(&mut events), "and emits nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_push_only_reports_pushed_with_commit_count() {
+        // Local ahead, remote not moved (first push / local-ahead): reconcile is
+        // AlreadyUpToDate (no advance), then push reports Pushed.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(2, 0)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::AlreadyUpToDate)]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPushed { commits, .. } => assert_eq!(commits, 2),
+            other => panic!("expected SyncPushed, got {other:?}"),
+        }
+        assert_eq!(
+            backend.advance_calls(),
+            0,
+            "AlreadyUpToDate advances nothing"
+        );
+        assert_eq!(backend.push_calls(), 1);
+        assert!(no_more_outcomes(&mut events), "state stays Ok throughout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_pull_then_push_emits_pulled_before_pushed() {
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::Rebased {
+            new_head: SnapshotId::new("newtip"),
+        })]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPulled { new_ref, .. } => assert_eq!(new_ref, "newtip"),
+            other => panic!("expected SyncPulled first, got {other:?}"),
+        }
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPushed {
+                new_ref, commits, ..
+            } => {
+                assert_eq!(new_ref, "newtip");
+                assert_eq!(commits, 1);
+            }
+            other => panic!("expected SyncPushed second, got {other:?}"),
+        }
+        assert_eq!(
+            backend.advance_calls(),
+            1,
+            "a rebase is made live by advance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_conflict_latches_suppresses_auto_sync_and_a_manual_clears_it() {
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::Conflict)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SyncConflict { .. }
+        ));
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::WatchStateChanged { to, .. } => assert_eq!(to, WatchState::Conflicted),
+            other => panic!("expected a transition to Conflicted, got {other:?}"),
+        }
+
+        // Auto-sync is suppressed while Conflicted: an automatic request never
+        // reaches the network.
+        let fetches = backend.fetch_calls();
+        tx.send(WatchInput::RequestSync { manual: false }).unwrap();
+        for _ in 0..10 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            backend.fetch_calls(),
+            fetches,
+            "an auto-sync must not run while a conflict latches"
+        );
+
+        // Snapshots STILL work while latched (local snapshotting continues).
+        backend.script([Scripted::Commit(1)]);
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SnapshotCompleted { .. }
+        ));
+
+        // After the user resolves, a manual cycle that finds nothing to do
+        // clears the conflict back to Ok.
+        backend.script_fetch([remote(0, 0)]);
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::WatchStateChanged { to, .. } => assert_eq!(to, WatchState::Ok),
+            other => panic!("expected a transition back to Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_network_failure_enters_sync_error_then_backoff_success_clears_it() {
+        let cfg = EngineConfig {
+            sync_backoff_base: Duration::from_secs(1),
+            ..test_cfg()
+        };
+        let backend = FakeBackend::new();
+        backend.script_fetch([Err(VcsError::CommandFailed {
+            op: "fetch".into(),
+            status: Some(1),
+            stderr: "could not read from remote".into(),
+        })]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), cfg);
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_millis(200)).await,
+            Event::SyncFailed { .. }
+        ));
+        match advance_until_event(&mut events, Duration::from_millis(200)).await {
+            Event::WatchStateChanged { to, .. } => assert_eq!(to, WatchState::SyncError),
+            other => panic!("expected SyncError, got {other:?}"),
+        }
+
+        // The backoff timer re-attempts without any fresh trigger; a success
+        // clears the watch back to Ok.
+        backend.script_fetch([remote(0, 0)]);
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::WatchStateChanged { to, .. } => assert_eq!(to, WatchState::Ok),
+            other => panic!("expected a self-driven recovery to Ok, got {other:?}"),
+        }
+        assert_eq!(backend.fetch_calls(), 2, "the backoff drove a second fetch");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_nonfastforward_reloops_in_cycle_and_converges() {
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 0), remote(1, 0)]);
+        backend.script_reconcile([
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+        ]);
+        // First push loses the race; the re-fetch+re-push converges.
+        backend.script_push([Ok(PushOutcome::NonFastForward), Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SyncPushed { .. }
+        ));
+        assert_eq!(
+            backend.push_calls(),
+            2,
+            "the race re-looped once and converged"
+        );
+        assert_eq!(backend.fetch_calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_nonfastforward_past_the_cap_degrades_to_sync_error() {
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 0), remote(1, 0), remote(1, 0)]);
+        backend.script_reconcile([
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+        ]);
+        backend.script_push([
+            Ok(PushOutcome::NonFastForward),
+            Ok(PushOutcome::NonFastForward),
+            Ok(PushOutcome::NonFastForward),
+        ]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SyncFailed { .. }
+        ));
+        assert_eq!(
+            backend.push_calls(),
+            SYNC_MAX_ATTEMPTS as usize,
+            "the in-cycle race re-loop is capped"
+        );
     }
 
     fn test_cfg() -> EngineConfig {

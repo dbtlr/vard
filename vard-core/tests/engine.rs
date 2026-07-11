@@ -16,7 +16,7 @@
 //! wired-up behavior rather than isolating the mute. Generous timeouts keep
 //! them robust, in the style of `tests/watcher.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -642,4 +642,310 @@ async fn vards_own_commit_does_not_retrigger_a_snapshot() {
         log.contains("Vard-Trigger: event"),
         "expected trailer: {log}"
     );
+}
+
+// --- sync cycle (real git + a bare file remote) ----------------------------
+
+/// Captures git stdout in `dir`, asserting success.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("failed to spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Deterministic, signer-free commit identity so commits succeed in CI.
+fn configure(dir: &Path) {
+    git_ok(dir, &["config", "user.email", "vard-test@example.com"]);
+    git_ok(dir, &["config", "user.name", "Vard Test"]);
+    git_ok(dir, &["config", "commit.gpgsign", "false"]);
+}
+
+/// A bare repository usable as a file remote (`origin`).
+fn bare_origin() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    let out = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(d.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    d
+}
+
+/// A working repo on `main` with `origin` set to `origin_path`, a base commit,
+/// and `main` pushed — so the remote exists and the two agree at the base.
+fn synced_repo(origin_path: &Path) -> (tempfile::TempDir, PathBuf) {
+    let d = tempfile::tempdir().unwrap();
+    git_ok(d.path(), &["init", "-b", "main"]);
+    configure(d.path());
+    git_ok(
+        d.path(),
+        &["remote", "add", "origin", origin_path.to_str().unwrap()],
+    );
+    std::fs::write(d.path().join("base.txt"), "base\n").unwrap();
+    git_ok(d.path(), &["add", "-A"]);
+    git_ok(d.path(), &["commit", "-m", "base"]);
+    git_ok(d.path(), &["push", "-u", "origin", "main"]);
+    let path = d.path().to_path_buf();
+    (d, path)
+}
+
+/// A second clone of `origin_path` that can move the remote out from under the
+/// watched repo.
+fn mover(origin_path: &Path) -> (tempfile::TempDir, PathBuf) {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("clone");
+    let out = Command::new("git")
+        .args(["clone", origin_path.to_str().unwrap()])
+        .arg(&dest)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "clone failed");
+    configure(&dest);
+    (d, dest)
+}
+
+/// Builds an interval-only (so no filesystem noise) sync-capable spec with a
+/// long interval that will not tick during the test.
+fn sync_spec(name: &str, path: &Path, scratch: Option<&Path>, sync: bool) -> WatchSpec {
+    let mut builder = WatchSpec::builder(name, path)
+        .trigger(TriggerMode::Interval)
+        .interval(Duration::from_secs(3600))
+        .branch("main")
+        .remote("origin")
+        .sync(sync);
+    if let Some(scratch) = scratch {
+        builder = builder.scratch_dir(scratch);
+    }
+    builder.build().unwrap()
+}
+
+/// Awaits the next event matching `pred`, failing on timeout.
+async fn recv_matching(events: &mut EventReceiver, mut pred: impl FnMut(&Event) -> bool) -> Event {
+    timeout(WAIT, async {
+        loop {
+            match events.recv().await {
+                Ok(ev) if pred(&ev) => break ev,
+                Ok(_) => continue,
+                Err(e) => panic!("event channel error: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("expected event within WAIT")
+}
+
+fn is_sync_event(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::SyncPushed { .. }
+            | Event::SyncPulled { .. }
+            | Event::SyncConflict { .. }
+            | Event::SyncFailed { .. }
+    )
+}
+
+/// Asserts no sync event arrives within `window` (success is a timeout).
+async fn assert_no_sync(events: &mut EventReceiver, window: Duration) {
+    let result = timeout(window, async {
+        loop {
+            match events.recv().await {
+                Ok(ev) if is_sync_event(&ev) => panic!("unexpected sync event: {ev:?}"),
+                Ok(_) => continue,
+                Err(e) => panic!("event channel error: {e:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(result.is_err(), "expected no sync event within {window:?}");
+}
+
+#[tokio::test]
+async fn sync_happy_path_pulls_the_remote_and_pushes_local() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+    let (_m_dir, m) = mover(origin.path());
+
+    // The remote advances with a non-conflicting file.
+    std::fs::write(m.join("b.txt"), "from-remote\n").unwrap();
+    git_ok(&m, &["add", "-A"]);
+    git_ok(&m, &["commit", "-m", "remote work"]);
+    git_ok(&m, &["push", "origin", "main"]);
+
+    // The watched repo has its own un-pushed commit: the cycle must integrate
+    // the remote (pull) and then send the local commit (push).
+    std::fs::write(a.join("a.txt"), "from-local\n").unwrap();
+    git_ok(&a, &["add", "-A"]);
+    git_ok(&a, &["commit", "-m", "local work"]);
+
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, Some(&scratch), true))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"));
+    assert!(matches!(
+        recv_matching(&mut events, |e| matches!(e, Event::SyncPulled { .. })).await,
+        Event::SyncPulled { .. }
+    ));
+    match recv_matching(&mut events, |e| matches!(e, Event::SyncPushed { .. })).await {
+        Event::SyncPushed { commits, .. } => assert_eq!(commits, 1, "one local commit pushed"),
+        other => panic!("expected SyncPushed, got {other:?}"),
+    }
+
+    // Both sides landed, the remote received the local commit, and the watch is
+    // healthy (Ok) throughout — no state-change events.
+    assert!(a.join("a.txt").exists() && a.join("b.txt").exists());
+    assert_eq!(
+        git_out(&a, &["rev-parse", "HEAD"]),
+        git_out(&a, &["rev-parse", "origin/main"]),
+        "the remote received the local tip"
+    );
+    let states = handle.watch_states();
+    assert_eq!(states[0].state, vard_core::WatchState::Ok);
+    assert!(!scratch.exists(), "the scratch worktree is cleaned up");
+}
+
+#[tokio::test]
+async fn sync_pull_only_advances_without_pushing() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+    let (_m_dir, m) = mover(origin.path());
+
+    std::fs::write(m.join("b.txt"), "from-remote\n").unwrap();
+    git_ok(&m, &["add", "-A"]);
+    git_ok(&m, &["commit", "-m", "remote work"]);
+    git_ok(&m, &["push", "origin", "main"]);
+
+    let prev = git_out(&a, &["rev-parse", "HEAD"]);
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, Some(&scratch), true))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"));
+    match recv_matching(&mut events, |e| matches!(e, Event::SyncPulled { .. })).await {
+        Event::SyncPulled {
+            prev_ref, new_ref, ..
+        } => {
+            assert_eq!(prev_ref, prev);
+            assert_ne!(new_ref, prev, "the advance moved the tree forward");
+        }
+        other => panic!("expected SyncPulled, got {other:?}"),
+    }
+    // Nothing to push (local was purely behind): no SyncPushed follows.
+    assert_no_sync(&mut events, Duration::from_millis(600)).await;
+    assert!(a.join("b.txt").exists(), "the remote change was pulled in");
+}
+
+#[tokio::test]
+async fn sync_conflict_latches_snapshots_still_work_and_a_manual_resolve_clears_it() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+    let (_m_dir, m) = mover(origin.path());
+
+    // Remote changes the shared file...
+    std::fs::write(m.join("base.txt"), "remote-change\n").unwrap();
+    git_ok(&m, &["add", "-A"]);
+    git_ok(&m, &["commit", "-m", "remote edit"]);
+    git_ok(&m, &["push", "origin", "main"]);
+    // ...and the watched repo changes the same line locally (committed) → conflict.
+    std::fs::write(a.join("base.txt"), "local-change\n").unwrap();
+    git_ok(&a, &["add", "-A"]);
+    git_ok(&a, &["commit", "-m", "local edit"]);
+
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, Some(&scratch), true))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"));
+    assert!(matches!(
+        recv_matching(&mut events, |e| matches!(e, Event::SyncConflict { .. })).await,
+        Event::SyncConflict { .. }
+    ));
+    wait_until(|| handle.watch_states()[0].state == vard_core::WatchState::Conflicted).await;
+
+    // Auto-sync is suppressed while the conflict latches: an automatic request
+    // triggers no cycle.
+    assert!(handle.request_auto_sync("proj"));
+    assert_no_sync(&mut events, Duration::from_millis(600)).await;
+    assert_eq!(
+        handle.watch_states()[0].state,
+        vard_core::WatchState::Conflicted,
+        "the conflict still latches"
+    );
+
+    // Snapshots STILL work while latched: a manual snapshot commits.
+    std::fs::write(a.join("new.txt"), "more local work\n").unwrap();
+    assert!(handle.trigger("proj"));
+    expect_completed(&mut events, "proj").await;
+    assert_eq!(
+        handle.watch_states()[0].state,
+        vard_core::WatchState::Conflicted,
+        "a snapshot does not clear the conflict"
+    );
+
+    // The user resolves (adopt the remote), and a manual cycle clears it.
+    git_ok(&a, &["reset", "--hard", "origin/main"]);
+    assert!(handle.request_sync("proj"));
+    wait_until(|| handle.watch_states()[0].state == vard_core::WatchState::Ok).await;
+}
+
+#[tokio::test]
+async fn sync_false_watch_never_syncs() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
+
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, Some(&scratch), false))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"), "the request is delivered");
+    // ...but a sync=false watch does nothing with it.
+    assert_no_sync(&mut events, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn sync_without_a_scratch_dir_is_disabled_even_when_sync_is_true() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+
+    // sync = true but NO scratch dir injected: sync is disabled (the chosen
+    // unset-scratch semantics).
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, None, true))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"));
+    assert_no_sync(&mut events, Duration::from_secs(1)).await;
 }
