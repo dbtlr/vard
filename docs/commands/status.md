@@ -52,6 +52,8 @@ Each **watch** shows one state:
 
 A problem state also reports how long the watch has been in it.
 
+`snapshots-failing` and an `attention` caused by a backend call that errored or panicked clear themselves the moment that watch proves itself healthy again — a snapshot commits, or the tree is found clean — without any action on your part; there is nothing to acknowledge. An `attention` caused by the watch's signal source dying is different: it clears only once the daemon finishes rebuilding it (automatic, but not instant — a watch may briefly still read `attention` right after the underlying problem is gone). A future `attention` cause that instead requires you to make a decision (for example, resolving a secret vard refuses to snapshot) would stay until you act, but no such cause exists yet. The path-alias case below is reported as `attention` too, but it clears differently again: it is recomputed fresh from your config on every run, so it disappears once the duplicate config entry is fixed.
+
 A watch whose path canonicalizes onto an earlier watch's — two config entries that resolve to the same repository, for example a path and a symlink to it — is reported as `attention` with the summary `path aliases watch '<other>'; not supervised`. The daemon supervises only the first of the pair, so the later one is flagged rather than shown as `ok`.
 
 ```bash
