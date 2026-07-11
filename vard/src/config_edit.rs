@@ -8,8 +8,9 @@
 //!
 //! # The atomic-write contract
 //!
-//! The running daemon watches `config.toml` for edits (mtime polling; see the
-//! [`daemon`](crate::daemon) module docs) and reloads on change. A half-written
+//! The running daemon watches `config.toml` for edits (content-fingerprint
+//! polling; see the [`daemon`](crate::daemon) module docs) and reloads on
+//! change. A half-written
 //! file must therefore never be observable. Every mutation is committed the same
 //! way the daemon's own request files are: serialize to a temporary file in the
 //! *same directory*, then [`rename(2)`] it into place — atomic on POSIX, so the
