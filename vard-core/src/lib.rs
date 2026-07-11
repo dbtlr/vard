@@ -33,8 +33,8 @@ pub use engine::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     DEFAULT_SYNC_NETWORK_TIMEOUT, DEFAULT_UNSAFE_REPOLL_INTERVAL,
     DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder, EngineError, EngineHandle,
-    SYNC_MAX_ATTEMPTS, SYNC_NO_REMOTE_REASON, SharedBackend, SyncOutcome, WatchStatus,
-    open_git_backend,
+    SYNC_MAX_ATTEMPTS, SharedBackend, SyncOutcome, WatchStatus, open_git_backend,
+    sync_no_remote_reason,
 };
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, SkipReason, Trigger,

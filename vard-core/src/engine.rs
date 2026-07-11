@@ -114,6 +114,11 @@
 //! that makes the reconciled tip live. With nothing new remotely (including a
 //! never-pushed branch, whose upstream ref does not exist yet) the window is
 //! just the pre-sync snapshot and the cycle proceeds straight to the push.
+//! The op gate is engaged **only when locked work is needed** (a dirty tree to
+//! snapshot, or remote commits to integrate): a clean up-to-date watch, and a
+//! clean ahead-only push, never touch it — so a foreign op-lock holder cannot
+//! fail work that needs no lock. A busy gate defers on a short cadence with the
+//! pre-flight fetch cached, so the paced retries cost no further network I/O.
 //! The op guard is coupled to that blocking
 //! git work (it moves into `spawn_blocking` and is closed there), so an async
 //! abort can never separate lock-release from git-completion — the same
@@ -236,6 +241,15 @@ pub const SYNC_MAX_ATTEMPTS: u32 = 3;
 /// than hang for the whole shutdown drain budget. Three paced tries cover the
 /// transient our-own-window case without stretching the stuck case past ~2 s.
 const DRAIN_GATE_BUSY_MAX_ATTEMPTS: u32 = 3;
+
+/// How long a [`CachedFetch`] stays fresh, as a multiple of the gate-busy
+/// cadence ([`EngineConfig::gate_busy_retry_interval`]): a gate-busy deferral's
+/// paced retries reuse the pre-flight dirty+fetch result instead of re-fetching
+/// on every attempt, and this bounds how stale that reuse can get (8 × the
+/// 500 ms default = 4 s). A cycle that proceeds on a cached fetch and turns out
+/// stale is still correct — a moved remote surfaces as a non-fast-forward push,
+/// which re-runs the cycle with a fresh fetch.
+const SYNC_FETCH_CACHE_TTL_CADENCES: u32 = 8;
 
 /// Tunable timing policy for a worker's retry and re-poll loops.
 ///
@@ -581,7 +595,7 @@ pub enum SyncOutcome {
     /// the live remote gate ([`VcsBackend::has_remote`]) skipped the cycle: an
     /// honest no-op with no state change, no [`SyncError`](WatchState::SyncError),
     /// and no backoff. A remote added later is picked up on the next request.
-    /// (The rendered reason is [`SYNC_NO_REMOTE_REASON`].)
+    /// (The rendered reason is [`sync_no_remote_reason`].)
     NoRemote,
     /// The request never ran: the op gate stayed busy through the shutdown
     /// drain's bounded retries (a foreign or peer holder that did not free in
@@ -591,11 +605,15 @@ pub enum SyncOutcome {
     NotRun(String),
 }
 
-/// The single wording for "sync-enabled, but the repository has no configured
-/// remote": the reason on the engine's [`Event::SyncSkipped`] and the detail a
-/// host renders for [`SyncOutcome::NoRemote`] rows. One constant so the
-/// engine's log line and every CLI row cannot drift apart.
-pub const SYNC_NO_REMOTE_REASON: &str = "the repository has no configured remote";
+/// The single wording for "sync-enabled, but the repository does not define the
+/// configured remote", naming the remote so the user knows exactly what to add
+/// (a repo with only `origin` but `remote = "backup"` configured must be told
+/// about `"backup"`). Used by the engine's [`Event::SyncSkipped`] reason and by
+/// every host row/refusal for [`SyncOutcome::NoRemote`], so the wording cannot
+/// drift between surfaces.
+pub fn sync_no_remote_reason(remote: &str) -> String {
+    format!("no remote {remote:?} in the repository; add it first")
+}
 
 /// What woke a worker's [`run`](Worker::run) loop for one turn. Every variant
 /// falls through to the same snapshot/sync dispatch afterwards.
@@ -633,6 +651,13 @@ struct PendingSync {
     /// terminates as a failure instead of looping on the short cadence forever
     /// (finding 6).
     clobber_attempts: u32,
+    /// The pre-flight (dirty check + fetch) result a gate-busy deferral cached,
+    /// so the Cadence retries reuse it instead of re-fetching on every paced
+    /// attempt. Invalidated by fresh local activity ([`Worker::apply`]'s
+    /// `Trigger` arm), consumed at most once per cycle attempt (a lost
+    /// fast-forward race re-fetches), and expired past
+    /// [`SYNC_FETCH_CACHE_TTL_CADENCES`] cadences.
+    cached_fetch: Option<CachedFetch>,
 }
 
 impl PendingSync {
@@ -643,8 +668,24 @@ impl PendingSync {
             manual: false,
             acks: Vec::new(),
             clobber_attempts: 0,
+            cached_fetch: None,
         }
     }
+}
+
+/// The lock-free pre-flight of one sync cycle — the [`is_dirty`](VcsBackend::is_dirty)
+/// answer and the [`fetch`](VcsBackend::fetch) result — cached across gate-busy
+/// [`Cadence`](SyncDeferral::Cadence) deferrals so a busy gate costs ONE fetch,
+/// not one per paced retry. `at` is the ORIGINAL fetch time (carried through
+/// re-arms), so the TTL measures true staleness.
+#[derive(Clone, Copy, Debug)]
+struct CachedFetch {
+    /// Whether the work tree was dirty at pre-flight.
+    dirty: bool,
+    /// The fetch's remote state at pre-flight.
+    remote: crate::vcs::RemoteState,
+    /// When the fetch actually ran.
+    at: Instant,
 }
 
 /// Why (and until when) the pending sync is deferred. The two variants carry
@@ -756,6 +797,10 @@ struct Worker {
     /// The out-of-tree reconcile directory for this watch's [`reconcile`](VcsBackend::reconcile).
     /// `None` disables sync (mirrored in [`sync_enabled`](Self::sync_enabled)).
     scratch_dir: Option<PathBuf>,
+    /// The watch's configured remote NAME ([`WatchSpec::remote`]), used to name
+    /// the missing remote in [`sync_no_remote_reason`] so the skip reason tells
+    /// the user exactly which remote to add.
+    remote: String,
     /// The per-watch pending sync request, if any (see [`PendingSync`]): its
     /// origin (manual vs auto), every outstanding waiter's ack, and the
     /// clobber-retry counter. `None` once the request terminates.
@@ -1009,6 +1054,11 @@ impl Worker {
                 if self.retry.is_some() {
                     self.retry_attempts = 0;
                     self.retry_exhausted = false;
+                }
+                // ...and invalidates a deferred sync's cached pre-flight: the
+                // activity changes the dirty answer the cache captured.
+                if let Some(pending) = &mut self.sync_pending {
+                    pending.cached_fetch = None;
                 }
                 self.pending = Some(coalesce(self.pending.take(), prov));
             }
@@ -1584,7 +1634,7 @@ impl Worker {
         match sync_has_remote(Arc::clone(&self.backend)).await {
             Ok(true) => {}
             Ok(false) => {
-                self.emit_sync_skipped(SYNC_NO_REMOTE_REASON);
+                self.emit_sync_skipped(&sync_no_remote_reason(&self.remote));
                 self.terminate_sync(pending.acks, SyncOutcome::NoRemote);
                 return;
             }
@@ -1609,10 +1659,19 @@ impl Worker {
             return;
         };
 
+        // The pre-flight cache from a prior gate-busy deferral, if still fresh:
+        // consumed by the FIRST attempt only (a lost fast-forward race must
+        // re-fetch against the moved remote), and expired past the TTL.
+        let ttl = self.cfg.gate_busy_retry_interval * SYNC_FETCH_CACHE_TTL_CADENCES;
+        let mut cached = pending
+            .cached_fetch
+            .take()
+            .filter(|c| c.at.elapsed() <= ttl);
+
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            match self.sync_once(&scratch).await {
+            match self.sync_once(&scratch, cached.take()).await {
                 SyncStep::NothingToDo => {
                     self.sync_succeeded();
                     self.terminate_sync(pending.acks, SyncOutcome::UpToDate);
@@ -1643,12 +1702,16 @@ impl Worker {
                     }
                     // Loop: re-fetch and reconcile against the newly-moved remote.
                 }
-                SyncStep::GateBusy => {
+                SyncStep::GateBusy(fetched) => {
                     // Another writer holds the op lock (a CLI restore, a second
                     // engine mid-reload). Preserve the request (with EVERY ack) and
                     // re-attempt on the short gate-busy cadence, no state change —
                     // contention is transient, not a sync fault, and NOT a clobber
                     // attempt (the cap counts only genuine WouldClobber refusals).
+                    // The pre-flight result is cached on the record so the paced
+                    // retries reuse it instead of re-fetching (its `at` carries the
+                    // original fetch time, so the TTL measures true staleness).
+                    pending.cached_fetch = Some(fetched);
                     self.sync_defer = Some(SyncDeferral::Cadence(
                         Instant::now() + self.cfg.gate_busy_retry_interval,
                     ));
@@ -1698,44 +1761,75 @@ impl Worker {
         }
     }
 
-    /// One `fetch → (locked) presync[+reconcile+advance] → push` pass. Emits
+    /// One `pre-flight → [locked window] → push` pass. Emits
     /// [`Event::SyncPulled`]/[`Event::SyncPushed`] for what actually moved and
     /// returns the [`SyncStep`] the caller folds into state and retry decisions.
-    /// Reconcile+advance run only when the fetch found remote commits to
-    /// integrate; otherwise the locked window is the pre-sync snapshot alone
-    /// (see [`run_locked_window`]'s push-only shape).
-    async fn sync_once(&mut self, scratch: &std::path::Path) -> SyncStep {
-        // 0. Cheap gate probe — BEFORE any network I/O. A busy op gate (a CLI
-        //    restore, a peer engine) defers the whole cycle on the short cadence
-        //    without paying for a fetch, so gate-busy retries are network-free
-        //    (they would otherwise storm the remote at the pacing interval). The
-        //    probe is advisory: a holder arriving between it and the locked
-        //    window's real `begin` simply surfaces as another GateBusy defer
-        //    there — the TOCTOU costs one fetch, never correctness.
-        if !self.gate.available() {
-            return SyncStep::GateBusy;
-        }
-
-        // 1. Fetch — OUTSIDE the op lock, timeout-bounded. Nothing to pull and
-        //    nothing to push is the whole job done.
-        let remote =
-            match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout).await {
-                Ok(remote) => remote,
-                Err(error) => return SyncStep::Failed(error),
+    ///
+    /// The **op gate is touched only when locked work is actually needed**
+    /// (a dirty tree to snapshot, or remote commits to integrate). The pre-flight
+    /// — the dirty check and the fetch — is lock-free, so a clean, up-to-date
+    /// watch reports `UpToDate` and a clean, ahead-only watch pushes, both with
+    /// the gate never probed: a foreign/peer op-lock holder cannot fail work
+    /// that needs no lock. When locked work IS needed and the gate is busy, the
+    /// pre-flight result travels in the returned
+    /// [`GateBusy`](SyncStep::GateBusy) so the paced retries reuse it instead of
+    /// re-fetching (`cached` hands it back in).
+    async fn sync_once(
+        &mut self,
+        scratch: &std::path::Path,
+        cached: Option<CachedFetch>,
+    ) -> SyncStep {
+        // 1. Pre-flight — LOCK-FREE (neither reads under the op lock): the dirty
+        //    check and the timeout-bounded fetch, or a prior gate-busy deferral's
+        //    still-fresh cached pair.
+        let (dirty, remote, fetched_at) =
+            match cached {
+                Some(c) => (c.dirty, c.remote, c.at),
+                None => {
+                    let dirty = match sync_is_dirty(Arc::clone(&self.backend)).await {
+                        Ok(dirty) => dirty,
+                        Err(error) => return SyncStep::Failed(error),
+                    };
+                    let remote =
+                        match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout)
+                            .await
+                        {
+                            Ok(remote) => remote,
+                            Err(error) => return SyncStep::Failed(error),
+                        };
+                    (dirty, remote, Instant::now())
+                }
             };
-        if remote.ahead == 0 && remote.behind == 0 {
-            // An unmoved remote is not the whole story: uncommitted LOCAL edits
-            // must still be captured and pushed. Only a clean tree is truly
-            // "nothing to do"; a dirty tree falls through into the locked window,
-            // where the pre-sync snapshot commits it and the cycle pushes.
-            match sync_is_dirty(Arc::clone(&self.backend)).await {
-                Ok(false) => return SyncStep::NothingToDo,
-                Ok(true) => {}
-                Err(error) => return SyncStep::Failed(error),
+
+        // 2. Gate-free fast paths: with a clean tree and nothing to integrate
+        //    there is no locked work at all. Nothing local and nothing remote is
+        //    the whole job done; local commits with an unmoved remote push
+        //    directly (the tree is untouched, so no lock and no journal bracket
+        //    are needed).
+        if !dirty && remote.behind == 0 {
+            if remote.ahead == 0 {
+                return SyncStep::NothingToDo;
             }
+            let tip = sync_current_tip(Arc::clone(&self.backend)).await;
+            return self.push_step(tip, remote.ahead, false).await;
         }
 
-        // 2. Locked window — op lock + one journal bracket, ZERO network I/O:
+        // 3. Locked work is needed (a dirty tree to snapshot, or remote commits
+        //    to integrate): NOW probe the gate. A busy gate defers the cycle on
+        //    the short cadence, carrying the pre-flight result so the retries
+        //    cost no further network I/O. The probe is advisory: a holder
+        //    arriving between it and the real `begin` below simply surfaces as
+        //    another GateBusy defer there.
+        let fetched = CachedFetch {
+            dirty,
+            remote,
+            at: fetched_at,
+        };
+        if !self.gate.available() {
+            return SyncStep::GateBusy(fetched);
+        }
+
+        // 4. Locked window — op lock + one journal bracket, ZERO network I/O:
         //    pre-sync snapshot → reconcile → advance, under the self-suppression
         //    mute so the advance's tree rewrite does not feed back as activity.
         //
@@ -1749,7 +1843,7 @@ impl Worker {
         //    onto the nonexistent ref would error out the whole cycle.
         let guard = match self.gate.begin("sync") {
             Ok(Some(guard)) => guard,
-            Ok(None) => return SyncStep::GateBusy,
+            Ok(None) => return SyncStep::GateBusy(fetched),
             Err(err) => return SyncStep::Failed(format!("operation gate failed: {err}")),
         };
         let locked = {
@@ -1775,12 +1869,18 @@ impl Worker {
             LockedResult::Failed(error) => return SyncStep::Failed(error),
         };
 
-        // 3. Push — OUTSIDE the op lock, timeout-bounded. What the remote
-        //    receives is the commits the fetch found us ahead by PLUS the
-        //    pre-sync snapshot commit this window just made (if any) — the
-        //    latter was uncounted when `commits` was captured as `ahead` at
+        // 5. Push. What the remote receives is the commits the fetch found us
+        //    ahead by PLUS the pre-sync snapshot commit this window just made
+        //    (if any) — the latter was uncounted when `ahead` was captured at
         //    fetch time (before the pre-sync snapshot existed).
         let pushed = remote.ahead + usize::from(presync_committed);
+        self.push_step(tip, pushed, pulled_moved).await
+    }
+
+    /// The push step shared by the gate-free fast path and the post-window path:
+    /// OUTSIDE the op lock, timeout-bounded, emitting [`Event::SyncPushed`] for
+    /// what the remote actually received.
+    async fn push_step(&mut self, tip: String, pushed: usize, pulled_moved: bool) -> SyncStep {
         match sync_push(Arc::clone(&self.backend), self.cfg.sync_network_timeout).await {
             Ok(PushOutcome::Pushed) => {
                 self.emit_sync_pushed(tip, pushed);
@@ -1915,8 +2015,10 @@ enum SyncStep {
     Conflict,
     /// The push lost a fast-forward race: re-run the cycle (capped).
     RaceLost,
-    /// The op gate was busy: re-attempt on the short gate-busy cadence.
-    GateBusy,
+    /// The op gate was busy while locked work was needed: re-attempt on the
+    /// short gate-busy cadence, carrying the pre-flight result so the paced
+    /// retries reuse it instead of re-fetching.
+    GateBusy(CachedFetch),
     /// The advance refused to overwrite uncommitted/unmerged work (or a raced
     /// branch commit): abandon this cycle and re-attempt, never a sync failure.
     Abandoned,
@@ -1982,6 +2084,15 @@ async fn sync_has_remote(backend: SharedBackend) -> Result<bool, String> {
 /// backend error (or panic) to a message the sync cycle surfaces as a failure.
 /// Takes the backend by value (a cheap [`Arc`] clone) so the future stays
 /// `Send`.
+/// Resolves the current branch tip off the async runtime (for the gate-free
+/// push path's [`Event::SyncPushed`] ref). Best-effort: an error or empty
+/// history yields an empty string, same as the locked window's fallback.
+async fn sync_current_tip(backend: SharedBackend) -> String {
+    tokio::task::spawn_blocking(move || current_tip(&backend).unwrap_or_default())
+        .await
+        .unwrap_or_default()
+}
+
 async fn sync_is_dirty(backend: SharedBackend) -> Result<bool, String> {
     match tokio::task::spawn_blocking(move || backend.is_dirty()).await {
         Ok(Ok(dirty)) => Ok(dirty),
@@ -2358,6 +2469,7 @@ impl Engine {
             // injected for the out-of-tree reconcile (vard-core resolves none).
             let scratch_dir = cw.spec.scratch_dir().map(|p| p.to_path_buf());
             let sync_enabled = cw.spec.sync() && scratch_dir.is_some();
+            let remote = cw.spec.remote().to_string();
 
             let worker = Worker {
                 name,
@@ -2380,6 +2492,7 @@ impl Engine {
                 retry_exhausted: false,
                 sync_enabled,
                 scratch_dir,
+                remote,
                 sync_pending: None,
                 sync_failures: 0,
                 sync_defer: None,
@@ -2778,6 +2891,25 @@ impl EngineBuilder {
         self.watches.push(PendingWatch {
             source: BackendSource::Backend(spec, backend),
             gate: default_gate(),
+        });
+        self
+    }
+
+    /// Adds a watch with BOTH a caller-supplied backend and an injected
+    /// operation gate — the combination a host uses when it has already opened
+    /// (and vetted) the repository itself and must not have
+    /// [`build`](Self::build) re-open it: `build` cannot then fail on an open
+    /// the host performed, so one broken repository never aborts a multi-watch
+    /// engine the host filtered per watch (the CLI's in-process sync path).
+    pub fn watch_with_backend_and_gate(
+        mut self,
+        spec: WatchSpec,
+        backend: SharedBackend,
+        gate: SharedGate,
+    ) -> Self {
+        self.watches.push(PendingWatch {
+            source: BackendSource::Backend(spec, backend),
+            gate,
         });
         self
     }
@@ -3339,6 +3471,9 @@ mod tests {
         admit: std::sync::atomic::AtomicBool,
         fail: std::sync::atomic::AtomicBool,
         begins: AtomicUsize,
+        /// How many times [`available`](crate::gate::OpGate::available) was
+        /// probed — lets a test assert a path never touched the gate at all.
+        probes: AtomicUsize,
     }
 
     impl FakeGate {
@@ -3348,6 +3483,7 @@ mod tests {
                 admit: std::sync::atomic::AtomicBool::new(false),
                 fail: std::sync::atomic::AtomicBool::new(false),
                 begins: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
             })
         }
 
@@ -3357,11 +3493,16 @@ mod tests {
                 admit: std::sync::atomic::AtomicBool::new(false),
                 fail: std::sync::atomic::AtomicBool::new(true),
                 begins: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
             })
         }
 
         fn admit(&self) {
             self.admit.store(true, Ordering::SeqCst);
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.load(Ordering::SeqCst)
         }
 
         /// Flips the error mode: `true` returns `Err` from `begin`, `false`
@@ -3396,6 +3537,7 @@ mod tests {
             // Honest probe: busy iff `begin` would report busy. A scripted
             // *failing* gate reports available (optimistic, per the trait docs)
             // so `begin` gets to surface its error.
+            self.probes.fetch_add(1, Ordering::SeqCst);
             self.fail.load(Ordering::SeqCst) || self.admit.load(Ordering::SeqCst)
         }
     }
@@ -3456,6 +3598,7 @@ mod tests {
             retry_exhausted: false,
             sync_enabled: false,
             scratch_dir: None,
+            remote: "origin".to_string(),
             sync_pending: None,
             sync_failures: 0,
             sync_defer: None,
@@ -3504,6 +3647,7 @@ mod tests {
             retry_exhausted: false,
             sync_enabled: true,
             scratch_dir: Some(PathBuf::from("/tmp/vard-test-scratch")),
+            remote: "origin".to_string(),
             sync_pending: None,
             sync_failures: 0,
             sync_defer: None,
@@ -4147,7 +4291,11 @@ mod tests {
         .unwrap();
 
         match advance_until_event(&mut events, Duration::from_secs(1)).await {
-            Event::SyncSkipped { reason, .. } => assert!(reason.contains("no configured remote")),
+            Event::SyncSkipped { reason, .. } => {
+                // The reason NAMES the missing remote (the worker's configured
+                // remote name), so the user knows exactly what to add.
+                assert!(reason.contains("no remote \"origin\""), "got: {reason}");
+            }
             other => panic!("expected SyncSkipped, got {other:?}"),
         }
         assert_eq!(ack_rx.await, Ok(SyncOutcome::NoRemote));
@@ -4285,11 +4433,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_busy_gate_defers_the_sync_before_any_network_fetch() {
-        // The cycle probes the op gate BEFORE its fetch: gate-busy deferrals are
-        // network-free, and no journal record is written by the probe (begins
-        // stays 0 too — the probe is not an admission).
-        let backend = FakeBackend::new();
+    async fn a_clean_up_to_date_watch_never_touches_a_busy_gate() {
+        // The gate is engaged only when locked work is needed. A clean,
+        // up-to-date watch under a (foreign) op-lock holder must terminate
+        // UpToDate — the dirty check and fetch need no lock — never NotRun.
+        let backend = FakeBackend::new(); // clean tree, fetch defaults to (0, 0)
         let gate = FakeGate::busy();
         let (tx, _events) = spawn_sync_worker_with_gate(
             Arc::clone(&backend),
@@ -4297,40 +4445,124 @@ mod tests {
             Arc::clone(&gate) as SharedGate,
         );
 
+        let (ack_tx, ack_rx) = oneshot::channel();
         tx.send(WatchInput::RequestSync {
             manual: true,
-            ack: None,
+            ack: Some(ack_tx),
         })
         .unwrap();
-        // Several paced attempts against the busy gate: zero fetches, zero begins.
-        for _ in 0..4 {
+        settle().await;
+
+        assert_eq!(ack_rx.await, Ok(SyncOutcome::UpToDate));
+        assert_eq!(gate.probes(), 0, "no locked work: the gate is never probed");
+        assert_eq!(gate.begins(), 0, "and never begun");
+        assert_eq!(backend.fetch_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_ahead_only_push_never_touches_the_gate() {
+        // Push-only (clean tree, local commits, unmoved remote) commits nothing
+        // and moves no tree, so it needs no lock: it must push even while a
+        // foreign holder owns the op gate.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(2, 0)]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let gate = FakeGate::busy();
+        let (tx, _events) = spawn_sync_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        settle().await;
+
+        assert_eq!(
+            ack_rx.await,
+            Ok(SyncOutcome::Moved {
+                pushed: Some(2),
+                pulled: false
+            })
+        );
+        assert_eq!(
+            gate.probes(),
+            0,
+            "the push-only path never touches the gate"
+        );
+        assert_eq!(gate.begins(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_busy_retries_reuse_one_cached_fetch() {
+        // Locked work needed (dirty tree) against a busy gate: the pre-flight
+        // fetch runs ONCE, is cached on the pending record, and the paced
+        // Cadence retries reuse it — no fetch-per-retry storm. Once the gate
+        // frees, the cycle completes still on that one fetch.
+        let backend = FakeBackend::new();
+        backend.set_dirty(true);
+        let gate = FakeGate::busy();
+        let (tx, _events) = spawn_sync_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        // Several paced attempts against the busy gate, inside the cache TTL
+        // (8 cadences): exactly one fetch, no admissions.
+        for _ in 0..3 {
             settle().await;
             tokio::time::advance(Duration::from_millis(600)).await;
         }
         assert_eq!(
             backend.fetch_calls(),
-            0,
-            "a busy gate must defer the cycle before the network fetch"
+            1,
+            "paced gate-busy retries reuse the cached pre-flight fetch"
         );
-        assert_eq!(gate.begins(), 0, "the probe never opens an admission");
+        assert!(
+            gate.probes() >= 2,
+            "the gate was probed on each paced retry"
+        );
+        assert_eq!(gate.begins(), 0, "a busy probe never opens an admission");
 
-        // The gate frees: the next paced attempt runs the whole cycle.
+        // The gate frees: the cycle completes on the cached fetch (dirty tree,
+        // nothing to integrate → pre-sync snapshot window, then push).
         gate.admit();
-        advance_until_fetch_calls(&backend, 1, Duration::from_millis(300)).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        settle().await;
+        assert_eq!(ack_rx.await, Ok(SyncOutcome::UpToDate));
         assert_eq!(
             backend.fetch_calls(),
             1,
-            "the freed gate lets the cycle run"
+            "completion itself reused the cached fetch"
+        );
+        assert_eq!(
+            gate.begins(),
+            1,
+            "the freed gate admitted the locked window"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_drain_bounds_gate_busy_attempts_and_reports_did_not_run() {
-        // Shutdown drain against a gate that NEVER frees (a foreign/peer holder):
-        // the drain services a small bounded number of paced attempts, then
-        // terminates the ack honestly as NotRun — it must not hang for the whole
-        // outer drain budget, and the attempts must cost no network fetches.
+        // Shutdown drain against a gate that NEVER frees (a foreign/peer holder)
+        // while locked work is genuinely needed (dirty tree): the drain services
+        // a small bounded number of paced attempts, then terminates the ack
+        // honestly as NotRun — it must not hang for the whole outer drain
+        // budget, and the retries reuse one cached fetch.
         let backend = FakeBackend::new();
+        backend.set_dirty(true);
         let gate = FakeGate::busy();
         let (tx, _events) = spawn_sync_worker_with_gate(
             Arc::clone(&backend),
@@ -4359,8 +4591,8 @@ mod tests {
         );
         assert_eq!(
             backend.fetch_calls(),
-            0,
-            "gate-busy attempts are network-free"
+            1,
+            "the drain's gate-busy retries reuse the one cached fetch"
         );
     }
 
