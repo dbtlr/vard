@@ -297,7 +297,8 @@ impl InstanceLock {
     }
 
     /// Acquires the lock for the daemon. A duplicate *daemon* holder fails
-    /// immediately (no point waiting on a peer that will not exit); a transient
+    /// without entering the `cli_wait` loop — only the brief probe-contention
+    /// retries run first (no point waiting on a peer that will not exit); a transient
     /// *CLI* holder is retried for up to `cli_wait` before failing, so a daemon
     /// starting a beat after a CLI `snapshot` took the lock in-process does not
     /// spuriously refuse to start. The returned [`LockError::Held`] carries the
