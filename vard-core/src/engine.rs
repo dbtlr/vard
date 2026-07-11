@@ -108,9 +108,13 @@
 //! can never block a worker while holding the lock. Between them, one **locked
 //! window** holds the op lock and one journal bracket (`begin("sync")` →
 //! `complete`) with **zero network I/O** inside: a pre-sync snapshot
-//! ([`Trigger::PreSync`], a no-op on a clean tree), then the out-of-tree
-//! [`reconcile`](VcsBackend::reconcile), then the single [`advance`](VcsBackend::advance)
-//! that makes the reconciled tip live. The op guard is coupled to that blocking
+//! ([`Trigger::PreSync`], a no-op on a clean tree), then — only when the fetch
+//! found remote commits to integrate — the out-of-tree
+//! [`reconcile`](VcsBackend::reconcile) and the single [`advance`](VcsBackend::advance)
+//! that makes the reconciled tip live. With nothing new remotely (including a
+//! never-pushed branch, whose upstream ref does not exist yet) the window is
+//! just the pre-sync snapshot and the cycle proceeds straight to the push.
+//! The op guard is coupled to that blocking
 //! git work (it moves into `spawn_blocking` and is closed there), so an async
 //! abort can never separate lock-release from git-completion — the same
 //! discipline as the snapshot path.
@@ -1578,9 +1582,12 @@ impl Worker {
         }
     }
 
-    /// One `fetch → (locked) reconcile+advance → push` pass. Emits
+    /// One `fetch → (locked) presync[+reconcile+advance] → push` pass. Emits
     /// [`Event::SyncPulled`]/[`Event::SyncPushed`] for what actually moved and
     /// returns the [`SyncStep`] the caller folds into state and retry decisions.
+    /// Reconcile+advance run only when the fetch found remote commits to
+    /// integrate; otherwise the locked window is the pre-sync snapshot alone
+    /// (see [`run_locked_presync_only`]).
     async fn sync_once(&mut self, scratch: &std::path::Path) -> SyncStep {
         // 1. Fetch — OUTSIDE the op lock, timeout-bounded. Nothing to pull and
         //    nothing to push is the whole job done.
@@ -1604,6 +1611,15 @@ impl Worker {
         // 2. Locked window — op lock + one journal bracket, ZERO network I/O:
         //    pre-sync snapshot → reconcile → advance, under the self-suppression
         //    mute so the advance's tree rewrite does not feed back as activity.
+        //
+        //    Reconcile+advance run ONLY when the fetch found remote commits to
+        //    integrate (`behind > 0`). With nothing new remotely there is nothing
+        //    to rebase onto or advance to, so the window is just the pre-sync
+        //    snapshot — this skips pointless scratch-worktree work on the common
+        //    push-only path AND makes the first push of a never-pushed branch
+        //    work at all: its upstream tracking ref does not exist yet (fetch
+        //    reports that as the normal not-moved/behind-0 state), and a rebase
+        //    onto the nonexistent ref would error out the whole cycle.
         let guard = match self.gate.begin("sync") {
             Ok(Some(guard)) => guard,
             Ok(None) => return SyncStep::GateBusy,
@@ -1611,7 +1627,11 @@ impl Worker {
         };
         let locked = {
             let _mute = self.mute.acquire();
-            run_locked_window(Arc::clone(&self.backend), scratch.to_path_buf(), guard).await
+            if remote.behind == 0 {
+                run_locked_presync_only(Arc::clone(&self.backend), guard).await
+            } else {
+                run_locked_window(Arc::clone(&self.backend), scratch.to_path_buf(), guard).await
+            }
         };
         let (tip, presync_committed, pulled_moved) = match locked {
             LockedResult::Reconciled {
@@ -1936,6 +1956,39 @@ async fn run_locked_window(
                 guard.complete();
                 LockedResult::Failed(format!("reconcile: {err}"))
             }
+        }
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        Err(join) => LockedResult::Failed(format!("sync task panicked: {join}")),
+    }
+}
+
+/// The push-only locked window: just the pre-sync snapshot, with the op `guard`
+/// coupled to the blocking git work exactly as in [`run_locked_window`]. Used
+/// when the fetch found nothing new remotely (`behind == 0`) — including the
+/// **never-pushed branch**, whose upstream tracking ref does not exist yet:
+/// there is nothing to rebase onto or advance to, and rebasing onto the
+/// nonexistent ref would error the whole cycle (breaking the first push of a
+/// fresh repository). Skipping reconcile also spares the scratch-worktree
+/// setup/teardown on the common push-only path. `pulled` is always `None` and
+/// `tip` is the branch tip after the snapshot (what the push sends).
+async fn run_locked_presync_only(backend: SharedBackend, guard: Box<dyn OpGuard>) -> LockedResult {
+    let joined = tokio::task::spawn_blocking(move || {
+        let presync_committed = match backend.snapshot(&pre_sync_request()) {
+            Ok(outcome) => outcome.is_some(),
+            Err(err) => {
+                guard.complete();
+                return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
+            }
+        };
+        let tip = current_tip(&backend).unwrap_or_default();
+        guard.complete();
+        LockedResult::Reconciled {
+            pulled: None,
+            tip,
+            presync_committed,
         }
     })
     .await;
@@ -2869,8 +2922,6 @@ mod tests {
         advance_results: VecDeque<AdvanceOutcome>,
         push_results: VecDeque<Result<PushOutcome, VcsError>>,
         fetch_calls: usize,
-        /// Incremented for symmetry with the other counters; not asserted on.
-        #[allow(dead_code)]
         reconcile_calls: usize,
         advance_calls: usize,
         prune_calls: usize,
@@ -2927,6 +2978,9 @@ mod tests {
         }
         fn fetch_calls(&self) -> usize {
             self.inner.lock().unwrap().fetch_calls
+        }
+        fn reconcile_calls(&self) -> usize {
+            self.inner.lock().unwrap().reconcile_calls
         }
         fn advance_calls(&self) -> usize {
             self.inner.lock().unwrap().advance_calls
@@ -3340,11 +3394,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sync_push_only_reports_pushed_with_commit_count() {
-        // Local ahead, remote not moved (first push / local-ahead): reconcile is
-        // AlreadyUpToDate (no advance), then push reports Pushed.
+        // Local ahead, remote not moved (first push / local-ahead): nothing to
+        // integrate, so reconcile+advance are skipped and the push reports Pushed.
         let backend = FakeBackend::new();
         backend.script_fetch([remote(2, 0)]);
-        backend.script_reconcile([Ok(ReconcileOutcome::AlreadyUpToDate)]);
         backend.script_push([Ok(PushOutcome::Pushed)]);
         let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
 
@@ -3358,12 +3411,57 @@ mod tests {
             other => panic!("expected SyncPushed, got {other:?}"),
         }
         assert_eq!(
-            backend.advance_calls(),
+            backend.reconcile_calls(),
             0,
-            "AlreadyUpToDate advances nothing"
+            "nothing to integrate: reconcile is skipped"
         );
+        assert_eq!(backend.advance_calls(), 0, "and nothing advances");
         assert_eq!(backend.push_calls(), 1);
         assert!(no_more_outcomes(&mut events), "state stays Ok throughout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_never_pushed_branch_pushes_without_reconciling() {
+        // The first-push onboarding path: the branch has never been pushed, so
+        // its upstream tracking ref does not exist — fetch reports the normal
+        // not-moved / behind-0 / ahead-N state. The cycle must SKIP
+        // reconcile+advance (a rebase onto the nonexistent upstream would error
+        // the whole cycle) and push directly, terminating Moved{pushed > 0}.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(3, 0)]);
+        // Poison the reconcile script: if the cycle reached reconcile it would
+        // fail loudly instead of silently passing.
+        backend.script_reconcile([Err(VcsError::CommandFailed {
+            op: "rebase".into(),
+            status: Some(128),
+            stderr: "fatal: invalid upstream 'origin/main'".into(),
+        })]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPushed { commits, .. } => assert_eq!(commits, 3),
+            other => panic!("expected SyncPushed, got {other:?}"),
+        }
+        assert_eq!(
+            ack_rx.await,
+            Ok(SyncOutcome::Moved {
+                pushed: Some(3),
+                pulled: false
+            })
+        );
+        assert_eq!(
+            backend.reconcile_calls(),
+            0,
+            "a never-pushed branch must not rebase onto its nonexistent upstream"
+        );
+        assert!(no_more_outcomes(&mut events), "no failure latches");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3708,7 +3806,9 @@ mod tests {
         // The advance refuses (WouldClobber); the cycle abandons — no SyncError —
         // and re-attempts, converging on the next cycle.
         let backend = FakeBackend::new();
-        backend.script_fetch([remote(1, 0), remote(1, 0)]);
+        // behind > 0 on both fetches: reconcile+advance only run when the fetch
+        // found remote commits to integrate.
+        backend.script_fetch([remote(1, 1), remote(1, 1)]);
         backend.script_reconcile([
             Ok(ReconcileOutcome::Rebased {
                 new_head: SnapshotId::new("cafef00d"),
@@ -3795,7 +3895,8 @@ mod tests {
         // It re-attempts up to SYNC_MAX_ATTEMPTS, then terminates as a SyncError.
         let backend = FakeBackend::new();
         let n = SYNC_MAX_ATTEMPTS as usize;
-        backend.script_fetch((0..n).map(|_| remote(1, 0)));
+        // behind > 0 so every attempt takes the reconcile+advance path.
+        backend.script_fetch((0..n).map(|_| remote(1, 1)));
         backend.script_reconcile((0..n).map(|_| {
             Ok(ReconcileOutcome::Rebased {
                 new_head: SnapshotId::new("cafef00d"),
@@ -5982,7 +6083,8 @@ mod tests {
         // pending sync to its real terminal outcome, so the ack reports success,
         // never a false "did not run". Real time (a real ~500ms drain sleep).
         let backend = FakeBackend::new();
-        backend.script_fetch([remote(1, 0), remote(1, 0)]);
+        // behind > 0 on both fetches so both cycles take the reconcile path.
+        backend.script_fetch([remote(1, 1), remote(1, 1)]);
         backend.script_reconcile([
             Ok(ReconcileOutcome::Rebased {
                 new_head: SnapshotId::new("cafef00d"),

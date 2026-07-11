@@ -124,6 +124,63 @@ fn assert_journals_clean(env: &Env) {
 }
 
 #[test]
+fn sync_first_push_to_an_empty_remote_succeeds_then_reports_up_to_date() {
+    // The dotfiles-first-push onboarding path: a fresh repo with commits and an
+    // origin that has NEVER received the branch (empty bare remote). The first
+    // `vard sync` must push the branch (not fail on a rebase onto the
+    // nonexistent upstream), and a second run must report up to date.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    // A repo with a base commit and origin configured, but NOTHING pushed.
+    let repo = env.root.path().join("dots");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_ok(&env, &repo, &["init", "-b", "main"]);
+    git_ok(
+        &env,
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    std::fs::write(repo.join("vimrc"), "set nocompatible\n").unwrap();
+    git_ok(&env, &repo, &["add", "-A"]);
+    git_ok(&env, &repo, &["commit", "-m", "base"]);
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    env.write_config(&config_for(&sync_watch("dots", &repo)));
+
+    // First sync: the branch reaches the remote and the command exits 0.
+    let out = env.vard(&["--format", "records", "sync", "dots"]);
+    assert!(
+        out.status.success(),
+        "first push to an empty remote failed: stdout: {} stderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("status   pushed"),
+        "got: {}",
+        stdout(&out)
+    );
+    let remote_head = git_in(&env, &origin, &["rev-parse", "refs/heads/main"]);
+    let local_head = git_in(&env, &repo, &["rev-parse", "HEAD"]);
+    assert!(
+        remote_head.status.success(),
+        "the remote never received the branch: {}",
+        stderr(&remote_head)
+    );
+    assert_eq!(stdout(&remote_head).trim(), stdout(&local_head).trim());
+
+    // Second sync: nothing to do.
+    let out = env.vard(&["--format", "records", "sync", "dots"]);
+    assert!(out.status.success(), "second sync failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("status   up to date"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert_journals_clean(&env);
+}
+
+#[test]
 fn sync_in_process_pushes_dirty_work_and_exits_zero() {
     let env = Env::new();
     no_sign(&env);
