@@ -664,10 +664,12 @@ pub enum VcsError {
         /// The root of the repository that actually contains it.
         root: PathBuf,
     },
-    /// A conflicted rebase could not be aborted: **the repository is left
-    /// mid-rebase with conflict markers on disk** and needs human (or
-    /// doctor-tool) attention before vard can operate on it again. The source
-    /// error describes why the abort failed.
+    /// A conflicted rebase could not be aborted and the repository is left
+    /// mid-rebase, needing human (or doctor-tool) attention. Dormant since
+    /// reconciliation moved out of the working tree ([`VcsBackend::reconcile`]
+    /// rebases in a scratch worktree, where a failed abort is absorbed by the
+    /// worktree's forced removal); no production path constructs it today.
+    /// Kept public for API stability while the trait is pre-1.0.
     RepoLeftInRebase {
         /// Why `rebase --abort` failed.
         source: Box<VcsError>,
