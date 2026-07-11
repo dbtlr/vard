@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vard_core::{Engine, Event, EventReceiver, SharedGate, WatchSpec};
+use vard_core::{Engine, SYNC_MAX_ATTEMPTS, SharedGate, SyncOutcome, VcsBackend, WatchSpec};
 
 use super::{
     CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_records, load_config, resolve_all,
@@ -46,10 +46,15 @@ const CLI_LOCK_BUDGET: Duration = Duration::from_secs(10);
 /// manual `vard sync` is an interactive command, so a generous bound is fine.
 const SYNC_NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long the engine drain waits for the in-flight sync cycle to finish
-/// before aborting. Must comfortably exceed the two network steps' combined
-/// budget so a genuinely slow (but progressing) fetch+push is never cut short.
-const SYNC_DRAIN_TIMEOUT: Duration = Duration::from_secs(SYNC_NETWORK_TIMEOUT.as_secs() * 2 + 30);
+/// How long the engine drain waits for the in-flight sync cycle to finish before
+/// aborting. Derived from the engine's own convergence bound — a cycle re-runs
+/// `fetch → … → push` up to [`SYNC_MAX_ATTEMPTS`] times, each with two
+/// network steps of [`SYNC_NETWORK_TIMEOUT`] — plus a margin, so a genuinely slow
+/// (but progressing) cycle is never cut short and misreported.
+const SYNC_DRAIN_MARGIN: Duration = Duration::from_secs(30);
+const SYNC_DRAIN_TIMEOUT: Duration = Duration::from_secs(
+    SYNC_MAX_ATTEMPTS as u64 * SYNC_NETWORK_TIMEOUT.as_secs() * 2 + SYNC_DRAIN_MARGIN.as_secs(),
+);
 
 /// Entry point for `vard sync`.
 pub(crate) fn run(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
@@ -84,32 +89,38 @@ fn run_inner(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> 
 fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     let config = load_config(&paths.config_file)?;
 
-    // Resolve targets. A named target that exists but has syncing disabled is
-    // reported as such (attention); with no selector we sync every sync-enabled
-    // watch and simply skip the rest.
+    // Resolve targets. A named target that exists but cannot sync — syncing
+    // disabled, or the repository has no configured remote — is reported as a
+    // disabled row (attention); with no selector we sync every sync-enabled watch
+    // whose repo has the remote and simply skip the rest.
     let (syncable, mut disabled_rows) = match &args.target {
         Some(t) => {
             let rw = select_one(&config, t)?;
-            if rw.spec.sync() {
-                (vec![rw], Vec::new())
-            } else {
+            if !rw.spec.sync() {
                 (Vec::new(), vec![disabled_record(rw.spec.name())])
+            } else if !spec_has_remote(&rw.spec) {
+                let row = no_remote_record(rw.spec.name(), rw.spec.remote());
+                (Vec::new(), vec![row])
+            } else {
+                (vec![rw], Vec::new())
             }
         }
         None => {
             let all = resolve_all(&config)?;
-            let syncable: Vec<ResolvedWatch> =
-                all.into_iter().filter(|rw| rw.spec.sync()).collect();
+            let syncable: Vec<ResolvedWatch> = all
+                .into_iter()
+                .filter(|rw| rw.spec.sync() && spec_has_remote(&rw.spec))
+                .collect();
             (syncable, Vec::new())
         }
     };
 
     if syncable.is_empty() {
-        // Nothing to sync: either the named watch has syncing off (its disabled
-        // row is shown), or no watch has syncing enabled at all.
+        // Nothing to sync: either the named watch cannot sync (its disabled row
+        // explains why), or no watch has syncing enabled at all.
         emit_records(out, &disabled_rows, "syncs")?;
         return Err(CmdError::attention(match &args.target {
-            Some(_) => "sync is not enabled for that watch",
+            Some(_) => "that watch is not syncing (see the row above)",
             None => "no sync-enabled watches configured",
         }));
     }
@@ -142,15 +153,27 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     }
 }
 
-/// Builds a minimal engine over `targets`, requests one sync per watch, drains
-/// the engine (running every queued cycle to completion), and folds the emitted
-/// sync events into a per-watch [`SyncOutcome`] in `targets` order. Runs the
-/// async work on a scoped runtime.
+/// The per-watch disposition the CLI reports: the engine's terminal
+/// [`SyncOutcome`] for a cycle that ran, or [`Outcome::NotRun`] when it did not
+/// (a request the worker could not complete before the engine stopped, or a
+/// watch the engine did not know). Inferred outcomes from event silence are gone
+/// — a busy or shut-down cycle reports honestly, never a false "up to date".
+enum Outcome {
+    /// The cycle ran to a terminal outcome.
+    Ran(SyncOutcome),
+    /// The cycle did not run to completion; the reason is ready to surface.
+    NotRun(String),
+}
+
+/// Builds a minimal engine over `targets`, requests one **acknowledged** sync per
+/// watch, drains the engine (running every queued cycle to completion), and reads
+/// each cycle's terminal outcome off its acknowledgement in `targets` order. Runs
+/// the async work on a scoped runtime.
 fn run_cycles(
     journal_dir: &Path,
     reconcile_dir: &Path,
     targets: &[ResolvedWatch],
-) -> Result<Vec<SyncOutcome>, String> {
+) -> Result<Vec<Outcome>, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -158,7 +181,6 @@ fn run_cycles(
 
     runtime.block_on(async move {
         let mut builder = Engine::builder()
-            // Room for every watch's sync events without a lagging subscriber.
             .event_capacity((targets.len() * 4).max(256))
             .sync_network_timeout(SYNC_NETWORK_TIMEOUT)
             .shutdown_drain_timeout(SYNC_DRAIN_TIMEOUT);
@@ -172,75 +194,48 @@ fn run_cycles(
         let engine = builder
             .build()
             .map_err(|e| format!("building engine: {e}"))?;
-        let mut events = engine.subscribe();
         let handle = engine
             .start()
             .await
             .map_err(|e| format!("starting engine: {e}"))?;
 
-        // Queue one sync per watch, then drain: the drain runs every queued
-        // cycle to completion before the workers exit, so once shutdown returns
-        // the absence of a sync event for a watch is a definitive "nothing to
-        // do", not a race.
-        for rw in targets {
-            handle.request_sync(rw.spec.name());
-        }
+        // Queue one acknowledged sync per watch, then drain: the drain runs every
+        // queued cycle to completion before the workers exit, so each cycle's
+        // acknowledgement carries its real terminal outcome. A watch the engine
+        // does not know yields `None`; a cycle that never completed (an unfreed op
+        // gate, a cut-short drain) drops its sender, and the receiver resolving to
+        // `Err` is reported as "did not run".
+        let acks: Vec<_> = targets
+            .iter()
+            .map(|rw| handle.request_sync_ack(rw.spec.name()))
+            .collect();
         handle.shutdown().await;
 
-        let emitted = drain_events(&mut events);
-        Ok(targets
-            .iter()
-            .map(|rw| fold_outcome(rw.spec.name(), &emitted))
-            .collect())
+        let mut outcomes = Vec::with_capacity(acks.len());
+        for ack in acks {
+            let outcome = match ack {
+                Some(rx) => match rx.await {
+                    Ok(outcome) => Outcome::Ran(outcome),
+                    Err(_) => Outcome::NotRun(
+                        "the sync did not run to completion before the engine stopped".to_string(),
+                    ),
+                },
+                None => Outcome::NotRun("the engine did not accept the sync request".to_string()),
+            };
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
     })
 }
 
-/// Collects every event currently buffered on the subscriber. Called after
-/// `shutdown` has joined every task, so the stream is complete and closed.
-fn drain_events(events: &mut EventReceiver) -> Vec<Event> {
-    let mut out = Vec::new();
-    while let Ok(ev) = events.try_recv() {
-        out.push(ev);
-    }
-    out
-}
-
-/// The per-watch disposition of one sync cycle, derived from the events emitted
-/// for that watch during the drained run.
-enum SyncOutcome {
-    /// The fetch found nothing to pull, the tree was clean, nothing to push.
-    UpToDate,
-    /// Local commits were pushed (with the count) and/or remote commits pulled.
-    Moved { pushed: Option<usize>, pulled: bool },
-    /// A reconcile conflict latched the watch `conflicted`.
-    Conflict,
-    /// A network/auth/reconcile step failed (message ready to surface).
-    Failed(String),
-}
-
-/// Folds every event for `watch` into one [`SyncOutcome`]. A failure or a
-/// conflict dominates a movement; movement dominates up-to-date.
-fn fold_outcome(watch: &str, events: &[Event]) -> SyncOutcome {
-    let mut pushed: Option<usize> = None;
-    let mut pulled = false;
-    for ev in events {
-        match ev {
-            Event::SyncFailed { watch: w, error } if w == watch => {
-                return SyncOutcome::Failed(error.clone());
-            }
-            Event::SyncConflict { watch: w } if w == watch => return SyncOutcome::Conflict,
-            Event::SyncPushed {
-                watch: w, commits, ..
-            } if w == watch => pushed = Some(*commits),
-            Event::SyncPulled { watch: w, .. } if w == watch => pulled = true,
-            _ => {}
-        }
-    }
-    if pushed.is_some() || pulled {
-        SyncOutcome::Moved { pushed, pulled }
-    } else {
-        SyncOutcome::UpToDate
-    }
+/// Whether `spec`'s repository defines its configured remote — a cheap,
+/// non-network probe. A repository that cannot be opened, or whose remote lookup
+/// errors, counts as "no remote".
+fn spec_has_remote(spec: &WatchSpec) -> bool {
+    vard_core::open_git_backend(spec)
+        .ok()
+        .and_then(|backend| backend.has_remote().ok())
+        .unwrap_or(false)
 }
 
 /// Request path (a daemon is running): hand the sync to the daemon via a request
@@ -248,8 +243,11 @@ fn fold_outcome(watch: &str, events: &[Event]) -> SyncOutcome {
 /// request was queued.
 fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     // Resolve a selector to the watch's *name* (the daemon routes by name) and
-    // refuse a watch with syncing disabled here: the daemon would accept the
-    // request and do nothing, which would look like success.
+    // pre-check eligibility here, mirroring `snapshot`: the daemon would accept a
+    // request for an ineligible watch and silently do nothing, which would look
+    // like success. A watch with syncing disabled, a paused watch (the daemon does
+    // not sync it), and a repository with no configured remote (the daemon left
+    // its sync disabled) are all refused up front.
     let watch_name = match &args.target {
         Some(t) => {
             let config = load_config(&paths.config_file)?;
@@ -258,6 +256,20 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                 return Err(CmdError::attention(format!(
                     "sync is not enabled for watch {}; enable it in the config first",
                     rw.spec.name()
+                )));
+            }
+            if rw.paused {
+                return Err(CmdError::attention(format!(
+                    "watch {} is paused; the daemon will not sync it — resume it first",
+                    rw.spec.name()
+                )));
+            }
+            if !spec_has_remote(&rw.spec) {
+                return Err(CmdError::attention(format!(
+                    "sync is enabled for watch {} but its repository has no remote {:?}; \
+                     add the remote first",
+                    rw.spec.name(),
+                    rw.spec.remote()
                 )));
             }
             Some(rw.spec.name().to_string())
@@ -281,11 +293,11 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     emit_action(out, &human, &record)
 }
 
-/// Builds the per-watch result record and its exit code from a [`SyncOutcome`].
-fn result_record(name: &str, outcome: &SyncOutcome) -> (Record, u8) {
+/// Builds the per-watch result record and its exit code from an [`Outcome`].
+fn result_record(name: &str, outcome: &Outcome) -> (Record, u8) {
     match outcome {
-        SyncOutcome::UpToDate => (record(name, "up to date", None, None, None), 0),
-        SyncOutcome::Moved { pushed, pulled } => {
+        Outcome::Ran(SyncOutcome::UpToDate) => (record(name, "up to date", None, None, None), 0),
+        Outcome::Ran(SyncOutcome::Moved { pushed, pulled }) => {
             let status = match (pushed.is_some(), pulled) {
                 (true, true) => "synced",
                 (true, false) => "pushed",
@@ -299,7 +311,7 @@ fn result_record(name: &str, outcome: &SyncOutcome) -> (Record, u8) {
                 0,
             )
         }
-        SyncOutcome::Conflict => (
+        Outcome::Ran(SyncOutcome::Conflict) => (
             record(
                 name,
                 "conflict",
@@ -309,7 +321,16 @@ fn result_record(name: &str, outcome: &SyncOutcome) -> (Record, u8) {
             ),
             1,
         ),
-        SyncOutcome::Failed(error) => (record(name, "failed", Some(error), None, None), 2),
+        Outcome::Ran(SyncOutcome::Failed(error)) => {
+            (record(name, "failed", Some(error), None, None), 2)
+        }
+        // A sync-disabled watch is filtered out before the cycle runs, so this is
+        // defensive; report it honestly rather than as success.
+        Outcome::Ran(SyncOutcome::Disabled) => (
+            record(name, "disabled", Some("sync is not enabled"), None, None),
+            1,
+        ),
+        Outcome::NotRun(reason) => (record(name, "did not run", Some(reason), None, None), 2),
     }
 }
 
@@ -319,6 +340,17 @@ fn disabled_record(name: &str) -> Record {
         name,
         "disabled",
         Some("sync is not enabled for this watch"),
+        None,
+        None,
+    )
+}
+
+/// The row for a sync-enabled watch whose repository has no configured remote.
+fn no_remote_record(name: &str, remote: &str) -> Record {
+    record(
+        name,
+        "disabled",
+        Some(&format!("no remote {remote:?} in the repository")),
         None,
         None,
     )
