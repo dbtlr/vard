@@ -11,7 +11,7 @@ The reconcile happens **out of tree**: local history is rebased onto the fetched
 
 Syncing must be enabled for the watch — its `sync` key (or `defaults.sync`) must be on, with a `branch` and `remote` configured — and its repository must actually have that remote. The remote is checked **live**, when the cycle runs (a cheap, non-network config lookup), not once at startup: a remote added after the daemon started is picked up on the next sync with no restart, and a request on a remote-less watch is answered honestly rather than silently dropped.
 
-With **no selector**, every non-paused sync-enabled watch is acted on and reported (paused watches are skipped, exactly as the daemon skips them): one whose repository has no configured remote appears as an informational `disabled` row (its `detail` says so) and does **not** by itself make the command fail. Asking for a watch **by name** that has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or whose repository has no such remote is reported and exits `1`.
+With **no selector**, every sync-enabled watch gets a row: non-paused ones are synced; a paused one appears as an informational `paused` row (it is not synced, exactly as the daemon does not supervise it — and does not by itself change the exit code); one whose repository lacks the configured remote appears as an informational `disabled` row whose `detail` names the missing remote. Neither informational row makes the command fail — if every sync-enabled watch is paused, the command reports the paused rows and exits `0`. Asking for a watch **by name** that has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or whose repository has no such remote is reported and exits `1`.
 
 ## Examples
 
@@ -53,7 +53,7 @@ A list surface (records/json/jsonl). One row per sync-enabled watch acted on, re
   ref      —
 ```
 
-Possible `status` values: `pushed` (with the `commits` count), `pulled`, `synced` (both pushed and pulled), `up to date` (nothing to do), `conflict`, `failed` (a broken step, or a repository that could not be opened at all — one broken repository never blocks the other watches from syncing), `disabled` (syncing is off for the watch, or its repository has no configured remote — the `detail` says which), `paused` (the watch is paused; resume it to sync), `did not run` (the request could not complete before the engine stopped, or another operation held the repository throughout), and `requested` (handed to a running daemon).
+Possible `status` values: `pushed` (with the `commits` count), `pulled`, `synced` (both pushed and pulled), `up to date` (nothing to do), `conflict`, `failed` (a broken step, or a repository that could not be opened at all — one broken repository never blocks the other watches from syncing), `disabled` (syncing is off for the watch, or its repository lacks the configured remote — the `detail` says which, naming the missing remote), `paused` (the watch is paused; resume it to sync), `did not run` (the request could not complete before the engine stopped, or another operation held the repository throughout), and `requested` (handed to a running daemon).
 
 ```bash
 vard sync notes --format json
@@ -67,7 +67,7 @@ vard sync notes --format json
 
 | Code | Meaning |
 |---|---|
-| `0` | Every acted-on watch was synced or queued (including `up to date`), or was an informational no-selector `disabled`/no-remote row. |
+| `0` | Every acted-on watch was synced or queued (including `up to date`), or was an informational no-selector row (`paused`, or `disabled` for a missing remote). |
 | `1` | Attention — a reconcile conflict latched a watch, or a watch asked for **by name** has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or its repository has no configured remote. |
 | `2` | Operational error — a network or authentication failure, a repository that could not be opened, a sync that could not complete before the engine stopped (including a repository held by another operation throughout), or a selector that resolves to no watch. |
 

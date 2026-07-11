@@ -302,7 +302,8 @@ fn sync_all_shows_a_remote_less_watch_as_a_row_and_still_exits_zero() {
     assert!(text.contains("name     solo"), "solo row missing: {text}");
     // The remote-less watch is shown disabled with a no-remote reason.
     assert!(
-        text.contains("status   disabled") && text.contains("no configured remote"),
+        text.contains("status   disabled")
+            && text.contains("no remote \"origin\" in the repository"),
         "solo should show a disabled/no-remote row: {text}"
     );
     // The remote-having watch actually synced (nothing to do here).
@@ -393,6 +394,126 @@ fn sync_named_paused_watch_refuses_with_a_daemon_running() {
     assert!(
         stderr(&out).contains("paused"),
         "the refusal names the paused state: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn sync_all_paused_reports_informational_paused_rows_and_exits_zero() {
+    // No selector with every sync-enabled watch paused: the outcome is accurate
+    // and informational — one `paused` row per watch, exit 0 (matching the
+    // daemon-present path's exit 0) — never the untrue "no sync-enabled watches
+    // configured".
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let a = synced_repo(&env, "alpha", &origin);
+    let origin_b = bare_origin(&env, "origin-b.git");
+    let b = synced_repo(&env, "beta", &origin_b);
+    let watches = format!(
+        "{}{}",
+        paused_sync_watch("alpha", &a),
+        paused_sync_watch("beta", &b)
+    );
+    env.write_config(&config_for(&watches));
+
+    let out = env.vard(&["--format", "records", "sync"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "all-paused is informational, not an error; stderr: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("name     alpha") && text.contains("name     beta"),
+        "every paused watch gets a row: {text}"
+    );
+    assert_eq!(
+        text.matches("status   paused").count(),
+        2,
+        "both rows report paused: {text}"
+    );
+}
+
+#[test]
+fn sync_named_unopenable_repo_fails_with_and_without_a_daemon() {
+    // Parity for an unopenable named repository: both dispatch paths report a
+    // real failure (exit 2, "cannot open repository"), never the misleading
+    // no-remote refusal.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let notes = synced_repo(&env, "notes", &origin);
+    // A sync-enabled watch whose path is not a git repository.
+    let broken = env.root.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    let broken = std::fs::canonicalize(&broken).unwrap();
+    env.write_config(&config_for(&format!(
+        "{}{}",
+        sync_watch("notes", &notes),
+        sync_watch("broken", &broken)
+    )));
+
+    // No daemon: the in-process path reports the failed row.
+    let out = env.vard(&["--format", "records", "sync", "broken"]);
+    assert_eq!(
+        code(&out),
+        2,
+        "in-process: exit 2; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("cannot open repository"),
+        "in-process names the real fault: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("no remote"),
+        "an unopenable repo is not a no-remote case: {}",
+        stdout(&out)
+    );
+
+    // Daemon present: the daemon was started BEFORE the broken watch entered
+    // the config (a daemon cannot supervise an unopenable repo), which is
+    // exactly how via_request meets one — the user edited the config after
+    // startup. The pre-check must classify it as the same real failure.
+    env.write_config(&config_for(&sync_watch("notes", &notes)));
+    let mut daemon = env
+        .command(&["run"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn vard run");
+    let health = env.health_file();
+    for _ in 0..100 {
+        if health.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(health.exists(), "the daemon never started");
+    // The broken watch appears in the config only now, after daemon start.
+    env.write_config(&config_for(&format!(
+        "{}{}",
+        sync_watch("notes", &notes),
+        sync_watch("broken", &broken)
+    )));
+
+    let out = env.vard(&["sync", "broken"]);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert_eq!(
+        code(&out),
+        2,
+        "daemon-present: same exit 2; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("cannot open repository"),
+        "daemon-present names the real fault: {}",
         stderr(&out)
     );
 }

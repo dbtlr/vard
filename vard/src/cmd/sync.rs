@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vard_core::{
-    Engine, SYNC_MAX_ATTEMPTS, SYNC_NO_REMOTE_REASON, SharedGate, SyncOutcome, VcsBackend,
-    WatchSpec,
+    Engine, GitBackend, SYNC_MAX_ATTEMPTS, SharedGate, SyncOutcome, VcsBackend, WatchSpec,
+    sync_no_remote_reason,
 };
 
 use super::{
@@ -58,6 +58,12 @@ const SYNC_DRAIN_MARGIN: Duration = Duration::from_secs(30);
 const SYNC_DRAIN_TIMEOUT: Duration = Duration::from_secs(
     SYNC_MAX_ATTEMPTS as u64 * SYNC_NETWORK_TIMEOUT.as_secs() * 2 + SYNC_DRAIN_MARGIN.as_secs(),
 );
+
+/// A runnable sync target: the resolved watch plus its **already-opened**
+/// backend. The open is the per-watch vetting AND the backend the engine gets
+/// injected (see [`run_cycles`]), so `Engine::build` never re-opens — one
+/// broken repository can only ever fail its own row.
+type Candidate = (ResolvedWatch, GitBackend);
 
 /// Entry point for `vard sync`.
 pub(crate) fn run(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
@@ -96,19 +102,21 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     // Resolve targets into cycle candidates plus pre-decided rows (each with its
     // exit-code contribution).
     //
-    // * A NAMED target that has syncing disabled, is **paused** (the same
+    // * A NAMED target that has syncing disabled or is **paused** (the same
     //   refusal the daemon path makes — pausing a watch suspends it everywhere,
-    //   not just under a daemon), or (as a fast-path UX check) has no configured
-    //   remote, is reported as an attention row and exits 1 — the user asked for
-    //   that one watch explicitly. A named repository that cannot be opened is a
-    //   failed row (exit 2).
-    // * With NO selector we run every non-paused sync-enabled watch and do NOT
-    //   pre-filter on the remote: the engine's live remote gate answers a
-    //   remote-less watch with a `NoRemote` outcome, an informational disabled
-    //   row that does not force a non-zero exit. Paused watches are skipped
-    //   silently, exactly as the daemon (which does not supervise them) skips
-    //   them on a request for all watches.
-    let (candidates, mut pre_rows): (Vec<ResolvedWatch>, Vec<(Record, u8)>) = match &args.target {
+    //   not just under a daemon) is an attention row, exit 1; one whose
+    //   repository cannot be opened is a failed row, exit 2; the no-remote
+    //   fast-path check refuses with an attention row, exit 1.
+    // * With NO selector every sync-enabled watch gets a row: a paused one is an
+    //   informational `paused` row (exit 0 — accurate, and matching the
+    //   daemon-present path's exit 0), a remote-less one is answered by the
+    //   engine's live gate as an informational `disabled` row, and an
+    //   unopenable one is a failed row (exit 2) that never blocks the rest.
+    //
+    // Each runnable candidate keeps its already-opened backend: that ONE open is
+    // both the vetting and THE backend the engine uses (`run_cycles` injects it),
+    // so `Engine::build` cannot re-fail on an open the CLI performed.
+    let (candidates, pre_rows): (Vec<Candidate>, Vec<(Record, u8)>) = match &args.target {
         Some(t) => {
             let rw = select_one(&config, t)?;
             let name = rw.spec.name().to_string();
@@ -120,55 +128,72 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                 match vard_core::open_git_backend(&rw.spec) {
                     Err(e) => (Vec::new(), vec![(open_failed_record(&name, &e), 2)]),
                     // A definite "no remote" refuses up front; a probe error
-                    // falls through to the cycle, whose own live gate reports it
-                    // as a real failure rather than masking it as "no remote".
+                    // falls through to the cycle, whose own live gate reports
+                    // it as a real failure rather than masking it as
+                    // "no remote".
                     Ok(backend) if matches!(backend.has_remote(), Ok(false)) => {
-                        (Vec::new(), vec![(no_remote_record(&name), 1)])
+                        let row = no_remote_record(&name, rw.spec.remote());
+                        (Vec::new(), vec![(row, 1)])
                     }
-                    Ok(_) => (vec![rw], Vec::new()),
+                    Ok(backend) => (vec![(rw, backend)], Vec::new()),
                 }
             }
         }
         None => {
             let all = resolve_all(&config)?;
-            let candidates: Vec<ResolvedWatch> = all
-                .into_iter()
-                .filter(|rw| rw.spec.sync() && !rw.paused)
-                .collect();
-            (candidates, Vec::new())
+            let mut candidates = Vec::new();
+            let mut pre_rows = Vec::new();
+            let mut any_sync_enabled = false;
+            for rw in all.into_iter().filter(|rw| rw.spec.sync()) {
+                any_sync_enabled = true;
+                if rw.paused {
+                    // Informational: the watch exists and syncs, it is just
+                    // paused right now — never an error on the everything
+                    // path (and never a silently missing row).
+                    pre_rows.push((paused_record(rw.spec.name()), 0));
+                    continue;
+                }
+                // Per-watch isolation: one unopenable repository becomes an
+                // honest failed row while every other watch still syncs —
+                // Engine::build gets the vetted backends injected, so it
+                // cannot re-fail on opens.
+                match vard_core::open_git_backend(&rw.spec) {
+                    Ok(backend) => candidates.push((rw, backend)),
+                    Err(e) => {
+                        pre_rows.push((open_failed_record(rw.spec.name(), &e), 2));
+                    }
+                }
+            }
+            if !any_sync_enabled {
+                emit_records(out, &[], "syncs")?;
+                return Err(CmdError::attention("no sync-enabled watches configured"));
+            }
+            (candidates, pre_rows)
         }
     };
 
-    // Per-watch isolation: a watch whose repository cannot be opened must not
-    // block the rest (`Engine::build` opens every backend and fails as a whole).
-    // Openability is validated per watch here; a broken one becomes an honest
-    // failed row (exit 2) and every other watch still syncs.
-    let mut syncable = Vec::new();
-    for rw in candidates {
-        match vard_core::open_git_backend(&rw.spec) {
-            Ok(_) => syncable.push(rw),
-            Err(e) => pre_rows.push((open_failed_record(rw.spec.name(), &e), 2)),
-        }
-    }
-
-    if syncable.is_empty() && pre_rows.is_empty() {
-        // No selector and nothing sync-enabled at all.
-        emit_records(out, &[], "syncs")?;
-        return Err(CmdError::attention("no sync-enabled watches configured"));
-    }
-
-    let results = if syncable.is_empty() {
+    let results = if candidates.is_empty() {
         Vec::new()
     } else {
         let reconcile_dir =
             paths::reconcile_dir().map_err(|e: HomeNotFound| CmdError::err(e.to_string()))?;
-        run_cycles(&paths.journal_dir, &reconcile_dir, &syncable).map_err(CmdError::err)?
+        match run_cycles(&paths.journal_dir, &reconcile_dir, &candidates) {
+            Ok(results) => results,
+            Err(e) => {
+                // The engine could not run at all (a runtime/start failure):
+                // the rows already decided are still the truth — emit them
+                // before propagating, never silently discard them.
+                let records: Vec<Record> = pre_rows.into_iter().map(|(r, _)| r).collect();
+                emit_records(out, &records, "syncs")?;
+                return Err(CmdError::err(e));
+            }
+        }
     };
 
     let mut records = Vec::with_capacity(results.len() + pre_rows.len());
     let mut worst = 0u8;
-    for (rw, outcome) in syncable.iter().zip(results) {
-        let (record, code) = result_record(rw.spec.name(), &outcome, named);
+    for ((rw, _backend), outcome) in candidates.iter().zip(results) {
+        let (record, code) = result_record(rw.spec.name(), rw.spec.remote(), &outcome, named);
         worst = CmdError::worse(worst, code);
         records.push(record);
     }
@@ -187,27 +212,20 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     }
 }
 
-/// The per-watch disposition the CLI reports: the engine's terminal
-/// [`SyncOutcome`] for a cycle that ran, or [`Outcome::NotRun`] when it did not
-/// (a request the worker could not complete before the engine stopped, or a
-/// watch the engine did not know). Inferred outcomes from event silence are gone
-/// — a busy or shut-down cycle reports honestly, never a false "up to date".
-enum Outcome {
-    /// The cycle ran to a terminal outcome.
-    Ran(SyncOutcome),
-    /// The cycle did not run to completion; the reason is ready to surface.
-    NotRun(String),
-}
-
-/// Builds a minimal engine over `targets`, requests one **acknowledged** sync per
-/// watch, drains the engine (running every queued cycle to completion), and reads
-/// each cycle's terminal outcome off its acknowledgement in `targets` order. Runs
-/// the async work on a scoped runtime.
+/// Builds a minimal engine over `targets` — injecting each watch's
+/// **already-opened** backend, so `Engine::build` cannot re-fail on an open the
+/// caller vetted (per-watch isolation lives at the call site) — requests one
+/// **acknowledged** sync per watch, drains the engine (running every queued
+/// cycle to completion), and reads each cycle's terminal [`SyncOutcome`] off
+/// its acknowledgement in `targets` order. The two local no-answer cases (an
+/// ack whose sender was dropped, a request the engine did not accept) are
+/// synthesized as [`SyncOutcome::NotRun`], so callers fold ONE representation.
+/// Runs the async work on a scoped runtime.
 fn run_cycles(
     journal_dir: &Path,
     reconcile_dir: &Path,
-    targets: &[ResolvedWatch],
-) -> Result<Vec<Outcome>, String> {
+    targets: &[Candidate],
+) -> Result<Vec<SyncOutcome>, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -218,12 +236,12 @@ fn run_cycles(
             .event_capacity((targets.len() * 4).max(256))
             .sync_network_timeout(SYNC_NETWORK_TIMEOUT)
             .shutdown_drain_timeout(SYNC_DRAIN_TIMEOUT);
-        for rw in targets {
+        for (rw, backend) in targets {
             let scratch = reconcile_dir.join(journal::journal_file_name(rw.spec.path()));
             let spec: WatchSpec = rw.spec.clone().with_scratch_dir(scratch);
             let gate: SharedGate =
                 Arc::new(JournalOpGate::for_repo_in_dir(journal_dir, rw.spec.path()));
-            builder = builder.watch_with_gate(spec, gate);
+            builder = builder.watch_with_backend_and_gate(spec, Arc::new(backend.clone()), gate);
         }
         let engine = builder
             .build()
@@ -235,41 +253,29 @@ fn run_cycles(
 
         // Queue one acknowledged sync per watch, then drain: the drain runs every
         // queued cycle to completion before the workers exit, so each cycle's
-        // acknowledgement carries its real terminal outcome. A watch the engine
-        // does not know yields `None`; a cycle that never completed (an unfreed op
-        // gate, a cut-short drain) drops its sender, and the receiver resolving to
-        // `Err` is reported as "did not run".
+        // acknowledgement carries its real terminal outcome.
         let acks: Vec<_> = targets
             .iter()
-            .map(|rw| handle.request_sync_ack(rw.spec.name()))
+            .map(|(rw, _)| handle.request_sync_ack(rw.spec.name()))
             .collect();
         handle.shutdown().await;
 
         let mut outcomes = Vec::with_capacity(acks.len());
         for ack in acks {
             let outcome = match ack {
-                Some(rx) => match rx.await {
-                    Ok(outcome) => Outcome::Ran(outcome),
-                    Err(_) => Outcome::NotRun(
+                Some(rx) => rx.await.unwrap_or_else(|_| {
+                    SyncOutcome::NotRun(
                         "the sync did not run to completion before the engine stopped".to_string(),
-                    ),
-                },
-                None => Outcome::NotRun("the engine did not accept the sync request".to_string()),
+                    )
+                }),
+                None => {
+                    SyncOutcome::NotRun("the engine did not accept the sync request".to_string())
+                }
             };
             outcomes.push(outcome);
         }
         Ok(outcomes)
     })
-}
-
-/// Whether `spec`'s repository defines its configured remote — a cheap,
-/// non-network probe. A repository that cannot be opened, or whose remote lookup
-/// errors, counts as "no remote".
-fn spec_has_remote(spec: &WatchSpec) -> bool {
-    vard_core::open_git_backend(spec)
-        .ok()
-        .and_then(|backend| backend.has_remote().ok())
-        .unwrap_or(false)
 }
 
 /// Request path (a daemon is running): hand the sync to the daemon via a request
@@ -302,12 +308,33 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                     rw.spec.name()
                 )));
             }
-            if !spec_has_remote(&rw.spec) {
-                return Err(CmdError::attention(format!(
-                    "sync is enabled for watch {} but {SYNC_NO_REMOTE_REASON}; \
-                     add the remote first",
-                    rw.spec.name()
-                )));
+            // Distinguish the three repository dispositions honestly: an
+            // unopenable repository and a failing remote probe are real faults
+            // (exit 2, the same wording as the in-process failed row), while a
+            // genuinely missing remote is the attention-class refusal.
+            match vard_core::open_git_backend(&rw.spec) {
+                Err(e) => {
+                    return Err(CmdError::err(format!(
+                        "watch {}: cannot open repository: {e}",
+                        rw.spec.name()
+                    )));
+                }
+                Ok(backend) => match backend.has_remote() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(CmdError::attention(format!(
+                            "sync is enabled for watch {} but {}",
+                            rw.spec.name(),
+                            sync_no_remote_reason(rw.spec.remote())
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(CmdError::err(format!(
+                            "watch {}: cannot probe the repository's remotes: {e}",
+                            rw.spec.name()
+                        )));
+                    }
+                },
             }
             Some(rw.spec.name().to_string())
         }
@@ -330,14 +357,15 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     emit_action(out, &human, &record)
 }
 
-/// Builds the per-watch result record and its exit code from an [`Outcome`].
-/// `named` says whether the user asked for this watch explicitly (a selector was
-/// given): a few outcomes are informational on the everything path but an
-/// attention-worthy refusal when the user named the watch.
-fn result_record(name: &str, outcome: &Outcome, named: bool) -> (Record, u8) {
+/// Builds the per-watch result record and its exit code from the engine's
+/// terminal [`SyncOutcome`]. `remote` is the watch's configured remote name
+/// (for the no-remote detail); `named` says whether the user asked for this
+/// watch explicitly (a selector was given) — a few outcomes are informational
+/// on the everything path but an attention-worthy refusal when named.
+fn result_record(name: &str, remote: &str, outcome: &SyncOutcome, named: bool) -> (Record, u8) {
     match outcome {
-        Outcome::Ran(SyncOutcome::UpToDate) => (record(name, "up to date", None, None, None), 0),
-        Outcome::Ran(SyncOutcome::Moved { pushed, pulled }) => {
+        SyncOutcome::UpToDate => (record(name, "up to date", None, None, None), 0),
+        SyncOutcome::Moved { pushed, pulled } => {
             let status = match (pushed.is_some(), pulled) {
                 (true, true) => "synced",
                 (true, false) => "pushed",
@@ -351,7 +379,7 @@ fn result_record(name: &str, outcome: &Outcome, named: bool) -> (Record, u8) {
                 0,
             )
         }
-        Outcome::Ran(SyncOutcome::Conflict) => (
+        SyncOutcome::Conflict => (
             record(
                 name,
                 "conflict",
@@ -361,29 +389,31 @@ fn result_record(name: &str, outcome: &Outcome, named: bool) -> (Record, u8) {
             ),
             1,
         ),
-        Outcome::Ran(SyncOutcome::Failed(error)) => {
-            (record(name, "failed", Some(error), None, None), 2)
-        }
+        SyncOutcome::Failed(error) => (record(name, "failed", Some(error), None, None), 2),
         // A sync-disabled watch is filtered out before the cycle runs, so this is
         // defensive; report it honestly rather than as success.
-        Outcome::Ran(SyncOutcome::Disabled) => (
+        SyncOutcome::Disabled => (
             record(name, "disabled", Some("sync is not enabled"), None, None),
             1,
         ),
-        // The live remote gate found no configured remote. A NAMED watch reaching
-        // it (the remote vanished between the fast-path pre-check and the cycle)
-        // is the same attention-class refusal the pre-check makes — exit 1. On
-        // the no-selector path the row is informational and does not force a
-        // non-zero exit.
-        Outcome::Ran(SyncOutcome::NoRemote) => (
-            record(name, "disabled", Some(SYNC_NO_REMOTE_REASON), None, None),
+        // The live remote gate found the configured remote missing. A NAMED
+        // watch reaching it (the remote vanished between the fast-path
+        // pre-check and the cycle) is the same attention-class refusal the
+        // pre-check makes — exit 1. On the no-selector path the row is
+        // informational and does not force a non-zero exit.
+        SyncOutcome::NoRemote => (
+            record(
+                name,
+                "disabled",
+                Some(&sync_no_remote_reason(remote)),
+                None,
+                None,
+            ),
             u8::from(named),
         ),
-        // The engine's drain gave up on a persistently busy op gate: an honest
-        // "did not run" with the engine's reason.
-        Outcome::Ran(SyncOutcome::NotRun(reason)) | Outcome::NotRun(reason) => {
-            (record(name, "did not run", Some(reason), None, None), 2)
-        }
+        // The request never ran — the engine's drain gave up on a persistently
+        // busy op gate, or the CLI's local no-answer cases (see `run_cycles`).
+        SyncOutcome::NotRun(reason) => (record(name, "did not run", Some(reason), None, None), 2),
     }
 }
 
@@ -412,11 +442,18 @@ fn paused_record(name: &str) -> Record {
     )
 }
 
-/// The row for a sync-enabled watch whose repository has no configured remote
-/// (the shared [`SYNC_NO_REMOTE_REASON`] wording, so this row, the engine's
-/// `sync.skipped` log line, and the cycle-outcome row can never drift).
-fn no_remote_record(name: &str) -> Record {
-    record(name, "disabled", Some(SYNC_NO_REMOTE_REASON), None, None)
+/// The row for a sync-enabled watch whose repository does not define its
+/// configured remote (the shared [`sync_no_remote_reason`] wording — naming the
+/// remote — so this row, the engine's `sync.skipped` log line, and the
+/// cycle-outcome row can never drift).
+fn no_remote_record(name: &str, remote: &str) -> Record {
+    record(
+        name,
+        "disabled",
+        Some(&sync_no_remote_reason(remote)),
+        None,
+        None,
+    )
 }
 
 /// The row for a watch whose repository could not be opened at all: a real
@@ -467,22 +504,76 @@ mod tests {
         // A NAMED watch can reach the cycle's NoRemote outcome (the remote was
         // removed between the fast-path pre-check and the cycle): that is the
         // same attention-class refusal the pre-check makes, exit 1. On the
-        // no-selector path the row is informational, exit 0.
-        let (_, code) = result_record("w", &Outcome::Ran(SyncOutcome::NoRemote), true);
+        // no-selector path the row is informational, exit 0. The detail names
+        // the missing remote either way.
+        let (record, code) = result_record("w", "backup", &SyncOutcome::NoRemote, true);
         assert_eq!(code, 1, "named + NoRemote is an attention refusal");
-        let (_, code) = result_record("w", &Outcome::Ran(SyncOutcome::NoRemote), false);
+        let rendered = format!("{record:?}");
+        assert!(
+            rendered.contains("backup"),
+            "the detail names the missing remote: {rendered}"
+        );
+        let (_, code) = result_record("w", "backup", &SyncOutcome::NoRemote, false);
         assert_eq!(code, 0, "no-selector NoRemote rows are informational");
     }
 
     #[test]
     fn an_engine_not_run_outcome_maps_to_the_did_not_run_row() {
-        let outcome = Outcome::Ran(SyncOutcome::NotRun("the gate stayed busy".into()));
-        let (record, code) = result_record("w", &outcome, true);
+        let outcome = SyncOutcome::NotRun("the gate stayed busy".into());
+        let (record, code) = result_record("w", "origin", &outcome, true);
         assert_eq!(code, 2);
         let rendered = format!("{record:?}");
         assert!(
             rendered.contains("did not run") && rendered.contains("the gate stayed busy"),
             "got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn run_cycles_survives_a_repository_deleted_after_vetting() {
+        // The pre-check's open IS the backend the engine uses: `run_cycles`
+        // injects it, so `Engine::build` never re-opens the repository. A repo
+        // deleted between the pre-check and the build therefore cannot abort
+        // the whole engine (which previously dropped every decided row) — the
+        // build succeeds and the vanished repo surfaces as that one watch's
+        // failed cycle outcome.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repo)
+            .output()
+            .expect("spawn git");
+        assert!(init.status.success());
+
+        let spec = vard_core::WatchSpec::builder("w", &repo)
+            .trigger(vard_core::TriggerMode::Interval)
+            .interval(std::time::Duration::from_secs(3600))
+            .sync(true)
+            .build()
+            .unwrap();
+        let backend = vard_core::open_git_backend(&spec).expect("the repo opens while present");
+        let rw = ResolvedWatch {
+            spec,
+            paused: false,
+        };
+
+        // The repository vanishes AFTER the vetting open.
+        std::fs::remove_dir_all(&repo).unwrap();
+
+        let journal_dir = dir.path().join("journal");
+        let reconcile_dir = dir.path().join("reconcile");
+        let outcomes = run_cycles(&journal_dir, &reconcile_dir, &[(rw, backend)])
+            .expect("the engine builds on the injected backend; no wholesale abort");
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(
+                &outcomes[0],
+                SyncOutcome::Failed(_) | SyncOutcome::NotRun(_)
+            ),
+            "the vanished repo is a per-watch outcome, got {:?}",
+            outcomes[0]
         );
     }
 }
