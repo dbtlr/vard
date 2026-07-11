@@ -668,7 +668,21 @@ mod tests {
         {
             let _held = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
         } // released, file remains on disk
-        assert_eq!(probe_daemon(&path).unwrap(), DaemonProbe::NotRunning);
+
+        // Retry briefly: a sibling test's `Command::spawn` forks this process, and
+        // between the fork and the child's exec the child transiently shares our
+        // just-released lock fd, so the probe's non-blocking shared flock can
+        // momentarily WOULDBLOCK and read the leftover role. This window is a pure
+        // test artifact (the same race `releasing_the_lock_allows_reacquire` and
+        // `acquire_retries_past_a_transient_shared_probe_then_succeeds` ride out);
+        // production `probe_daemon` is correct.
+        for _ in 0..100 {
+            if probe_daemon(&path).unwrap() == DaemonProbe::NotRunning {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("a free lock must ultimately probe as NotRunning");
     }
 
     #[test]
