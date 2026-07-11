@@ -301,6 +301,24 @@ impl Journal {
         self.compact()
     }
 
+    /// Appends an `advance <target>` line, recording a committed reference the
+    /// in-flight operation is about to make live (its advance target). If the
+    /// process dies before the operation completes, [`recover`](Self::recover)
+    /// re-applies the advance idempotently once the record is proven ours and
+    /// stale. Append-only, so it never disturbs the `begin` record it follows;
+    /// the whole file is still compacted away on clean [`complete`](Self::complete).
+    ///
+    /// `target` is sanitized to a single token (a commit hash already is one).
+    pub(crate) fn note_advance(&self, target: &str) -> Result<(), JournalError> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)
+            .map_err(|source| self.io_err(source))?;
+        writeln!(file, "advance {}", sanitize_token(target)).map_err(|source| self.io_err(source))?;
+        file.flush().map_err(|source| self.io_err(source))
+    }
+
     /// Startup recovery for this watch's repository at `repo_path`. Try-acquires
     /// the watch's [`OpLock`] first — a live holder (`WOULDBLOCK`) means a writer
     /// is mid-operation right now, so recovery defers
@@ -310,8 +328,31 @@ impl Journal {
     /// panics and never returns an error: every outcome is folded into the
     /// returned [`RecoveryReport`] so startup is never blocked.
     pub(crate) fn recover(&self, repo_path: &Path) -> RecoveryReport {
+        self.recover_generic(repo_path, None)
+    }
+
+    /// [`recover`](Self::recover) with a [`SyncSettler`] that additionally
+    /// settles a dangling **sync** record — pruning its leftover scratch worktree
+    /// and idempotently re-applying its recorded advance target — but ONLY once
+    /// recovery has proven the record ours and its owner dead by the very same
+    /// gates that authorize removing a stale git lock (dead PID, ours-vs-foreign
+    /// op window, [`FOREIGN_LOCK_GRACE`]). Never touches anything else in the
+    /// user's tree. Used by daemon startup for sync-capable watches.
+    pub(crate) fn recover_with_settler(
+        &self,
+        repo_path: &Path,
+        settler: &dyn SyncSettler,
+    ) -> RecoveryReport {
+        self.recover_generic(repo_path, Some(settler))
+    }
+
+    fn recover_generic(
+        &self,
+        repo_path: &Path,
+        settler: Option<&dyn SyncSettler>,
+    ) -> RecoveryReport {
         match OpLock::try_acquire(&self.lock_path) {
-            Ok(Some(guard)) => self.recover_locked(repo_path, &guard),
+            Ok(Some(guard)) => self.recover_locked_inner(repo_path, &guard, settler),
             Ok(None) => RecoveryReport::HolderActive,
             Err(detail) => RecoveryReport::Failed { detail },
         }
@@ -329,7 +370,23 @@ impl Journal {
     /// supplant (see the [module docs](self)). A recorded PID equal to this
     /// process is treated as dead, not a live holder: holding the op lock proves
     /// our own prior operation unwound (the proof relies on the `_witness`).
-    fn recover_locked(&self, repo_path: &Path, _witness: &OpLock) -> RecoveryReport {
+    fn recover_locked(&self, repo_path: &Path, witness: &OpLock) -> RecoveryReport {
+        self.recover_locked_inner(repo_path, witness, None)
+    }
+
+    /// [`recover_locked`](Self::recover_locked) with an optional [`SyncSettler`].
+    /// When present and the dangling record is a **sync** op, its scratch worktree
+    /// is pruned and its recorded advance target re-applied at the two provably-
+    /// ours-and-dead settle points — no git lock present, or a stale one just
+    /// removed — before the journal is compacted. Every other disposition
+    /// (foreign lock, too-fresh lock, live holder, corrupt) leaves the tree
+    /// untouched, exactly as for a snapshot record.
+    fn recover_locked_inner(
+        &self,
+        repo_path: &Path,
+        _witness: &OpLock,
+        settler: Option<&dyn SyncSettler>,
+    ) -> RecoveryReport {
         let dangling = match self.read_dangling() {
             Ok(Some(record)) => record,
             Ok(None) => return RecoveryReport::Clean,
@@ -366,8 +423,13 @@ impl Journal {
         let lock_path = repo_path.join(".git").join("index.lock");
         let mtime = match lock_mtime(&lock_path) {
             LockMtime::Absent => {
-                // Owner is dead and nothing is wedged; drop the dangling record so
-                // we don't reconsider it every start.
+                // Owner is dead and nothing is wedged. Settle a sync record's
+                // tree (prune scratch, re-apply the advance) BEFORE compacting,
+                // so a settle failure keeps the evidence for a later start.
+                if let Err(detail) = self.settle_sync(&dangling, settler) {
+                    return RecoveryReport::Failed { detail };
+                }
+                // Drop the dangling record so we don't reconsider it every start.
                 let _ = self.compact();
                 return RecoveryReport::NoLockPresent { op: dangling.op };
             }
@@ -413,6 +475,11 @@ impl Journal {
         }
         match fs::remove_file(&lock_path) {
             Ok(()) => {
+                // Lock proven ours and removed: settle a sync record's tree
+                // before compacting (keep evidence on a settle failure).
+                if let Err(detail) = self.settle_sync(&dangling, settler) {
+                    return RecoveryReport::Failed { detail };
+                }
                 let _ = self.compact();
                 RecoveryReport::LockRemoved {
                     op: dangling.op,
@@ -423,6 +490,24 @@ impl Journal {
             Err(source) => RecoveryReport::Failed {
                 detail: format!("removing {}: {source}", lock_path.display()),
             },
+        }
+    }
+
+    /// Settles a dangling **sync** record's working tree once recovery has proven
+    /// it ours and its owner dead: prunes the leftover scratch worktree and
+    /// idempotently re-applies the recorded advance target, via the injected
+    /// [`SyncSettler`]. A no-op for a non-sync record, or when no settler was
+    /// supplied (the engine-admit and orphan-sweep paths, whose next sync cycle
+    /// re-derives the advance safely). Returns the settler's error so the caller
+    /// can preserve the evidence rather than compact it away.
+    fn settle_sync(
+        &self,
+        dangling: &DanglingOp,
+        settler: Option<&dyn SyncSettler>,
+    ) -> Result<(), String> {
+        match settler {
+            Some(settler) if dangling.op == "sync" => settler.settle(dangling.advance.as_deref()),
+            _ => Ok(()),
         }
     }
 
@@ -443,16 +528,7 @@ impl Journal {
         context: &str,
     ) -> RecoveryReport {
         let report = self.recover(repo_path);
-        match &report {
-            RecoveryReport::Clean => {}
-            RecoveryReport::LockRemoved { .. } => {
-                warn!(watch, context, report = %report, "recovered a stale git lock");
-            }
-            RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
-                warn!(watch, context, report = %report, "journal recovery: foreign lock left in place");
-            }
-            _ => info!(watch, context, report = %report, "journal recovery"),
-        }
+        log_recovery(&report, watch, context);
         report
     }
 
@@ -480,6 +556,16 @@ impl Journal {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+            // An `advance <target>` line records a mid-operation advance target
+            // (see [`note_advance`](Journal::note_advance)); attach it to the
+            // current `begin` record. A stray advance with no preceding begin is
+            // ignored — there is nothing to make live.
+            if let Some(rest) = line.strip_prefix("advance ") {
+                if let Some(record) = found.as_mut() {
+                    record.advance = Some(rest.trim().to_string());
+                }
                 continue;
             }
             let record =
@@ -512,6 +598,45 @@ impl Journal {
     }
 }
 
+/// Logs a [`RecoveryReport`] at the level every drain/recover site agrees on: a
+/// removed lock and any foreign-lock signal
+/// ([`LockNotOurs`](RecoveryReport::LockNotOurs),
+/// [`HolderAlive`](RecoveryReport::HolderAlive)) at `warn` — both are
+/// operator-significant even when the lock is not ours to touch — and every
+/// other non-`Clean` outcome (including [`HolderActive`](RecoveryReport::HolderActive),
+/// a transient live op-lock holder) at `info`; `Clean` is silent. Shared by
+/// [`recover_and_log`](Journal::recover_and_log) and the settler-driven startup
+/// recovery so their log levels never drift.
+pub(crate) fn log_recovery(report: &RecoveryReport, watch: &str, context: &str) {
+    match report {
+        RecoveryReport::Clean => {}
+        RecoveryReport::LockRemoved { .. } => {
+            warn!(watch, context, report = %report, "recovered a stale git lock");
+        }
+        RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
+            warn!(watch, context, report = %report, "journal recovery: foreign lock left in place");
+        }
+        _ => info!(watch, context, report = %report, "journal recovery"),
+    }
+}
+
+/// Settles a crashed **sync** operation's working tree during recovery, once the
+/// journal has proven the record ours and its owner dead. Injected into
+/// [`Journal::recover_with_settler`] so the safety-critical gate logic stays in
+/// the journal while the git work (which needs a backend and the scratch path)
+/// lives at the daemon/test call site.
+///
+/// The contract is idempotent and constitution-safe: prune the vard-owned
+/// scratch worktree (always safe — never the user's files) and, if an advance
+/// target was recorded, re-apply it — but only when doing so cannot destroy
+/// uncommitted work. Recovery calls this at most once per dangling record.
+pub(crate) trait SyncSettler {
+    /// Prune the scratch worktree and, when `advance_target` is `Some`,
+    /// idempotently re-apply the advance. Returns a human-readable error the
+    /// caller folds into a [`RecoveryReport::Failed`], preserving the evidence.
+    fn settle(&self, advance_target: Option<&str>) -> Result<(), String>;
+}
+
 /// A parsed dangling `begin` record.
 struct DanglingOp {
     op: String,
@@ -525,6 +650,11 @@ struct DanglingOp {
     /// decode: such a record cannot point the [orphan sweep](reconcile_journals)
     /// back at its repository, so its journal is retained rather than swept.
     path: Option<PathBuf>,
+    /// The advance target recorded mid-operation by a sync's
+    /// [`note_advance`](Journal::note_advance), if any: a committed reference the
+    /// crashed operation was about to make live. Recovery re-applies it
+    /// idempotently once the record is proven ours and stale (sync only).
+    advance: Option<String>,
 }
 
 /// Whether a git lock with the given mtime could belong to an operation that
@@ -794,6 +924,7 @@ fn parse_begin(line: &str) -> Option<DanglingOp> {
         pid: pid?,
         ts: ts?,
         path,
+        advance: None,
     })
 }
 
@@ -1195,6 +1326,17 @@ impl JournalOpGuard {
 impl vard_core::OpGuard for JournalOpGuard {
     fn complete(self: Box<Self>) {
         JournalOpGuard::complete(*self);
+    }
+
+    /// Records the sync cycle's advance target mid-operation (see
+    /// [`Journal::note_advance`]), so a crash between the out-of-tree rebase and
+    /// the advance leaves durable, idempotently-recoverable evidence. Surfaced as
+    /// an [`OpGateError`](vard_core::OpGateError) on I/O failure so the engine can
+    /// fail closed rather than advance without recorded evidence.
+    fn record_advance_target(&self, target: &str) -> Result<(), vard_core::OpGateError> {
+        self.journal
+            .note_advance(target)
+            .map_err(|e| vard_core::OpGateError::new(e.to_string()))
     }
 }
 

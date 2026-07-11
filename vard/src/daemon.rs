@@ -232,6 +232,9 @@ pub(crate) struct DaemonPaths {
     pub request_dir: PathBuf,
     /// The directory holding per-watch operation journals.
     pub journal_dir: PathBuf,
+    /// The parent directory under which each syncing watch gets its out-of-tree
+    /// reconcile scratch worktree (`<reconcile_dir>/<journal-key>`).
+    pub reconcile_dir: PathBuf,
     /// The health file rewritten on every watch state change and cleared on
     /// clean shutdown; `vard notify` reads it.
     pub health_file: PathBuf,
@@ -245,8 +248,16 @@ impl DaemonPaths {
             lock_file: paths::lock_file()?,
             request_dir: paths::request_dir()?,
             journal_dir: paths::journal_dir()?,
+            reconcile_dir: paths::reconcile_dir()?,
             health_file: paths::health_file()?,
         })
+    }
+
+    /// The out-of-tree reconcile scratch path for the watch rooted at
+    /// `repo_path`: `<reconcile_dir>/<journal-key>`, keyed by the same repository
+    /// identity as the watch's journal so recovery can address it.
+    fn scratch_for(&self, repo_path: &Path) -> PathBuf {
+        self.reconcile_dir.join(journal::journal_file_name(repo_path))
     }
 }
 
@@ -632,7 +643,77 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
 fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = &'a WatchSpec>) {
     for spec in specs {
         let journal = Journal::for_repo_in_dir(&paths.journal_dir, spec.path());
-        journal.recover_and_log(spec.path(), spec.name(), "startup");
+        // A syncing watch may have crashed mid-sync, leaving a scratch worktree
+        // and an un-applied advance target. Recover with a settler that cleans
+        // those up — but ONLY through the journal's provably-ours-and-dead gates.
+        // A non-sync watch (or a repo we cannot open) takes the plain path.
+        match sync_settler(paths, spec) {
+            Some(settler) => {
+                let report = journal.recover_with_settler(spec.path(), &settler);
+                journal::log_recovery(&report, spec.name(), "startup");
+            }
+            None => {
+                journal.recover_and_log(spec.path(), spec.name(), "startup");
+            }
+        }
+    }
+}
+
+/// Builds a [`SyncSettler`](journal::SyncSettler) for a syncing watch, or `None`
+/// when the watch does not sync or its repository cannot be opened (recovery
+/// then falls back to the plain lock-only path).
+fn sync_settler(paths: &DaemonPaths, spec: &WatchSpec) -> Option<GitSyncSettler> {
+    if !spec.sync() {
+        return None;
+    }
+    let backend = vard_core::open_git_backend(spec).ok()?;
+    Some(GitSyncSettler {
+        backend,
+        scratch: paths.scratch_for(spec.path()),
+    })
+}
+
+/// The daemon's [`SyncSettler`](journal::SyncSettler): idempotently settles a
+/// crashed sync's tree through a real [`GitBackend`](vard_core::GitBackend).
+struct GitSyncSettler {
+    backend: vard_core::GitBackend,
+    scratch: PathBuf,
+}
+
+impl journal::SyncSettler for GitSyncSettler {
+    fn settle(&self, advance_target: Option<&str>) -> Result<(), String> {
+        use vard_core::VcsBackend;
+        // Pruning the vard-owned scratch worktree is always safe (never the
+        // user's files) and a no-op when absent.
+        self.backend
+            .prune_scratch(&self.scratch)
+            .map_err(|e| e.to_string())?;
+        let Some(target) = advance_target else {
+            return Ok(());
+        };
+        // Re-apply the advance only when it cannot destroy uncommitted work:
+        // the repository must be safe (on-branch, no operation in progress) and
+        // the tree clean. A dirty tree is left to the next sync cycle, which
+        // snapshots local-first before advancing. This upholds the constitution:
+        // no vard operation may destroy the only copy of anything.
+        if !matches!(
+            self.backend.is_safe_state().map_err(|e| e.to_string())?,
+            vard_core::SafeState::Safe
+        ) {
+            return Ok(());
+        }
+        let dirty = !self
+            .backend
+            .diff(&vard_core::VcsRef::new("HEAD"), None, None)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .is_empty();
+        if dirty {
+            return Ok(());
+        }
+        self.backend
+            .advance(&vard_core::SnapshotId::new(target))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1796,6 +1877,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -1905,6 +1987,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         let removed_repo = root.path().join("removed");
@@ -2058,6 +2141,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2115,6 +2199,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2174,6 +2259,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2260,6 +2346,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
