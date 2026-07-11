@@ -22,7 +22,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vard_core::{Engine, SYNC_MAX_ATTEMPTS, SharedGate, SyncOutcome, VcsBackend, WatchSpec};
+use vard_core::{
+    Engine, SYNC_MAX_ATTEMPTS, SYNC_NO_REMOTE_REASON, SharedGate, SyncOutcome, VcsBackend,
+    WatchSpec,
+};
 
 use super::{
     CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_records, load_config, resolve_all,
@@ -88,64 +91,91 @@ fn run_inner(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> 
 /// watch under the held instance lock, and report per watch.
 fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     let config = load_config(&paths.config_file)?;
+    let named = args.target.is_some();
 
-    // Resolve targets.
+    // Resolve targets into cycle candidates plus pre-decided rows (each with its
+    // exit-code contribution).
     //
-    // * A NAMED target that exists but has syncing disabled, or (as a fast-path
-    //   UX check) whose repository has no configured remote, is reported as a
-    //   disabled row and exits 1 — the user asked for that one watch explicitly.
-    // * With NO selector we run every sync-enabled watch and do NOT pre-filter on
-    //   the remote (finding 5): the engine's live remote gate answers a
-    //   remote-less watch with a `NoRemote` outcome, which renders as an
-    //   informational disabled row that does NOT force a non-zero exit — so every
-    //   sync-enabled watch gets a row and the remote-having ones still sync.
-    let (syncable, mut disabled_rows) = match &args.target {
+    // * A NAMED target that has syncing disabled, is **paused** (the same
+    //   refusal the daemon path makes — pausing a watch suspends it everywhere,
+    //   not just under a daemon), or (as a fast-path UX check) has no configured
+    //   remote, is reported as an attention row and exits 1 — the user asked for
+    //   that one watch explicitly. A named repository that cannot be opened is a
+    //   failed row (exit 2).
+    // * With NO selector we run every non-paused sync-enabled watch and do NOT
+    //   pre-filter on the remote: the engine's live remote gate answers a
+    //   remote-less watch with a `NoRemote` outcome, an informational disabled
+    //   row that does not force a non-zero exit. Paused watches are skipped
+    //   silently, exactly as the daemon (which does not supervise them) skips
+    //   them on a request for all watches.
+    let (candidates, mut pre_rows): (Vec<ResolvedWatch>, Vec<(Record, u8)>) = match &args.target {
         Some(t) => {
             let rw = select_one(&config, t)?;
+            let name = rw.spec.name().to_string();
             if !rw.spec.sync() {
-                (Vec::new(), vec![disabled_record(rw.spec.name())])
-            } else if !spec_has_remote(&rw.spec) {
-                let row = no_remote_record(rw.spec.name(), rw.spec.remote());
-                (Vec::new(), vec![row])
+                (Vec::new(), vec![(disabled_record(&name), 1)])
+            } else if rw.paused {
+                (Vec::new(), vec![(paused_record(&name), 1)])
             } else {
-                (vec![rw], Vec::new())
+                match vard_core::open_git_backend(&rw.spec) {
+                    Err(e) => (Vec::new(), vec![(open_failed_record(&name, &e), 2)]),
+                    // A definite "no remote" refuses up front; a probe error
+                    // falls through to the cycle, whose own live gate reports it
+                    // as a real failure rather than masking it as "no remote".
+                    Ok(backend) if matches!(backend.has_remote(), Ok(false)) => {
+                        (Vec::new(), vec![(no_remote_record(&name), 1)])
+                    }
+                    Ok(_) => (vec![rw], Vec::new()),
+                }
             }
         }
         None => {
             let all = resolve_all(&config)?;
-            let syncable: Vec<ResolvedWatch> =
-                all.into_iter().filter(|rw| rw.spec.sync()).collect();
-            (syncable, Vec::new())
+            let candidates: Vec<ResolvedWatch> = all
+                .into_iter()
+                .filter(|rw| rw.spec.sync() && !rw.paused)
+                .collect();
+            (candidates, Vec::new())
         }
     };
 
-    if syncable.is_empty() {
-        // Nothing to sync: either the named watch cannot sync (its disabled row
-        // explains why), or no watch has syncing enabled at all.
-        emit_records(out, &disabled_rows, "syncs")?;
-        return Err(CmdError::attention(match &args.target {
-            Some(_) => "that watch is not syncing (see the row above)",
-            None => "no sync-enabled watches configured",
-        }));
+    // Per-watch isolation: a watch whose repository cannot be opened must not
+    // block the rest (`Engine::build` opens every backend and fails as a whole).
+    // Openability is validated per watch here; a broken one becomes an honest
+    // failed row (exit 2) and every other watch still syncs.
+    let mut syncable = Vec::new();
+    for rw in candidates {
+        match vard_core::open_git_backend(&rw.spec) {
+            Ok(_) => syncable.push(rw),
+            Err(e) => pre_rows.push((open_failed_record(rw.spec.name(), &e), 2)),
+        }
     }
 
-    let reconcile_dir =
-        paths::reconcile_dir().map_err(|e: HomeNotFound| CmdError::err(e.to_string()))?;
-    let results =
-        run_cycles(&paths.journal_dir, &reconcile_dir, &syncable).map_err(CmdError::err)?;
+    if syncable.is_empty() && pre_rows.is_empty() {
+        // No selector and nothing sync-enabled at all.
+        emit_records(out, &[], "syncs")?;
+        return Err(CmdError::attention("no sync-enabled watches configured"));
+    }
 
-    let mut records = Vec::with_capacity(results.len() + disabled_rows.len());
+    let results = if syncable.is_empty() {
+        Vec::new()
+    } else {
+        let reconcile_dir =
+            paths::reconcile_dir().map_err(|e: HomeNotFound| CmdError::err(e.to_string()))?;
+        run_cycles(&paths.journal_dir, &reconcile_dir, &syncable).map_err(CmdError::err)?
+    };
+
+    let mut records = Vec::with_capacity(results.len() + pre_rows.len());
     let mut worst = 0u8;
     for (rw, outcome) in syncable.iter().zip(results) {
-        let (record, code) = result_record(rw.spec.name(), &outcome);
+        let (record, code) = result_record(rw.spec.name(), &outcome, named);
         worst = CmdError::worse(worst, code);
         records.push(record);
     }
-    // A named non-sync target contributes an attention row and code.
-    worst = disabled_rows
-        .iter()
-        .fold(worst, |w, _| CmdError::worse(w, 1));
-    records.append(&mut disabled_rows);
+    for (record, code) in pre_rows {
+        worst = CmdError::worse(worst, code);
+        records.push(record);
+    }
     emit_records(out, &records, "syncs")?;
 
     match worst {
@@ -247,11 +277,15 @@ fn spec_has_remote(spec: &WatchSpec) -> bool {
 /// request was queued.
 fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     // Resolve a selector to the watch's *name* (the daemon routes by name) and
-    // pre-check eligibility here, mirroring `snapshot`: the daemon would accept a
-    // request for an ineligible watch and silently do nothing, which would look
-    // like success. A watch with syncing disabled, a paused watch (the daemon does
-    // not sync it), and a repository with no configured remote (the daemon left
-    // its sync disabled) are all refused up front.
+    // pre-check a NAMED target's eligibility here as fast-path UX. The daemon
+    // answers every request honestly on its own — an ineligible watch's cycle
+    // terminates as a logged no-op (`sync.skipped` for a missing remote) and a
+    // remote added after daemon start is picked up live — but this request path
+    // is fire-and-forget: the user would see only "requested" and have to read
+    // the daemon log for the outcome. For a watch the user explicitly named,
+    // a request that is doomed *right now* (syncing disabled, paused so the
+    // daemon does not supervise it, no configured remote) fails fast with an
+    // actionable message instead. The no-selector path sends the request as-is.
     let watch_name = match &args.target {
         Some(t) => {
             let config = load_config(&paths.config_file)?;
@@ -270,10 +304,9 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
             }
             if !spec_has_remote(&rw.spec) {
                 return Err(CmdError::attention(format!(
-                    "sync is enabled for watch {} but its repository has no remote {:?}; \
+                    "sync is enabled for watch {} but {SYNC_NO_REMOTE_REASON}; \
                      add the remote first",
-                    rw.spec.name(),
-                    rw.spec.remote()
+                    rw.spec.name()
                 )));
             }
             Some(rw.spec.name().to_string())
@@ -298,7 +331,10 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
 }
 
 /// Builds the per-watch result record and its exit code from an [`Outcome`].
-fn result_record(name: &str, outcome: &Outcome) -> (Record, u8) {
+/// `named` says whether the user asked for this watch explicitly (a selector was
+/// given): a few outcomes are informational on the everything path but an
+/// attention-worthy refusal when the user named the watch.
+fn result_record(name: &str, outcome: &Outcome, named: bool) -> (Record, u8) {
     match outcome {
         Outcome::Ran(SyncOutcome::UpToDate) => (record(name, "up to date", None, None, None), 0),
         Outcome::Ran(SyncOutcome::Moved { pushed, pulled }) => {
@@ -334,21 +370,20 @@ fn result_record(name: &str, outcome: &Outcome) -> (Record, u8) {
             record(name, "disabled", Some("sync is not enabled"), None, None),
             1,
         ),
-        // The live remote gate found no configured remote. On the no-selector
-        // path this is an informational row (the watch was not named), so it does
-        // NOT force a non-zero exit — a named remote-less watch is already caught
-        // by the fast-path pre-check and never reaches here.
+        // The live remote gate found no configured remote. A NAMED watch reaching
+        // it (the remote vanished between the fast-path pre-check and the cycle)
+        // is the same attention-class refusal the pre-check makes — exit 1. On
+        // the no-selector path the row is informational and does not force a
+        // non-zero exit.
         Outcome::Ran(SyncOutcome::NoRemote) => (
-            record(
-                name,
-                "disabled",
-                Some("the repository has no configured remote"),
-                None,
-                None,
-            ),
-            0,
+            record(name, "disabled", Some(SYNC_NO_REMOTE_REASON), None, None),
+            u8::from(named),
         ),
-        Outcome::NotRun(reason) => (record(name, "did not run", Some(reason), None, None), 2),
+        // The engine's drain gave up on a persistently busy op gate: an honest
+        // "did not run" with the engine's reason.
+        Outcome::Ran(SyncOutcome::NotRun(reason)) | Outcome::NotRun(reason) => {
+            (record(name, "did not run", Some(reason), None, None), 2)
+        }
     }
 }
 
@@ -363,12 +398,35 @@ fn disabled_record(name: &str) -> Record {
     )
 }
 
-/// The row for a sync-enabled watch whose repository has no configured remote.
-fn no_remote_record(name: &str, remote: &str) -> Record {
+/// The row for a named watch that is paused: pausing suspends the watch
+/// everywhere (the daemon does not supervise it, and the in-process path
+/// refuses it identically), so an explicit sync of it is an attention-class
+/// refusal, never a silent cycle.
+fn paused_record(name: &str) -> Record {
     record(
         name,
-        "disabled",
-        Some(&format!("no remote {remote:?} in the repository")),
+        "paused",
+        Some("the watch is paused; resume it to sync"),
+        None,
+        None,
+    )
+}
+
+/// The row for a sync-enabled watch whose repository has no configured remote
+/// (the shared [`SYNC_NO_REMOTE_REASON`] wording, so this row, the engine's
+/// `sync.skipped` log line, and the cycle-outcome row can never drift).
+fn no_remote_record(name: &str) -> Record {
+    record(name, "disabled", Some(SYNC_NO_REMOTE_REASON), None, None)
+}
+
+/// The row for a watch whose repository could not be opened at all: a real
+/// failure (exit 2), isolated per watch so one broken repository never blocks
+/// the others from syncing.
+fn open_failed_record(name: &str, error: &vard_core::VcsError) -> Record {
+    record(
+        name,
+        "failed",
+        Some(&format!("cannot open repository: {error}")),
         None,
         None,
     )
@@ -397,5 +455,34 @@ fn record(
             RecordField::opt_int("commits", commits),
             RecordField::opt("ref", reference.map(str::to_string)),
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_no_remote_outcome_is_attention_when_named_and_informational_otherwise() {
+        // A NAMED watch can reach the cycle's NoRemote outcome (the remote was
+        // removed between the fast-path pre-check and the cycle): that is the
+        // same attention-class refusal the pre-check makes, exit 1. On the
+        // no-selector path the row is informational, exit 0.
+        let (_, code) = result_record("w", &Outcome::Ran(SyncOutcome::NoRemote), true);
+        assert_eq!(code, 1, "named + NoRemote is an attention refusal");
+        let (_, code) = result_record("w", &Outcome::Ran(SyncOutcome::NoRemote), false);
+        assert_eq!(code, 0, "no-selector NoRemote rows are informational");
+    }
+
+    #[test]
+    fn an_engine_not_run_outcome_maps_to_the_did_not_run_row() {
+        let outcome = Outcome::Ran(SyncOutcome::NotRun("the gate stayed busy".into()));
+        let (record, code) = result_record("w", &outcome, true);
+        assert_eq!(code, 2);
+        let rendered = format!("{record:?}");
+        assert!(
+            rendered.contains("did not run") && rendered.contains("the gate stayed busy"),
+            "got: {rendered}"
+        );
     }
 }

@@ -313,6 +313,132 @@ fn sync_all_shows_a_remote_less_watch_as_a_row_and_still_exits_zero() {
     assert_journals_clean(&env);
 }
 
+/// A `[[watch]]` block like [`sync_watch`] but paused.
+fn paused_sync_watch(name: &str, path: &Path) -> String {
+    format!(
+        "[[watch]]\nname = \"{name}\"\npath = \"{}\"\nsync = true\npaused = true\n\
+         branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"1h\"\n",
+        path.display()
+    )
+}
+
+#[test]
+fn sync_named_paused_watch_refuses_in_process() {
+    // Parity with the daemon-present path: a paused watch is suspended
+    // everywhere, so `vard sync <paused>` with NO daemon must refuse (attention
+    // row, exit 1) instead of quietly running the cycle.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&paused_sync_watch("notes", &repo)));
+
+    // Uncommitted work that a wrongly-run cycle would have pushed.
+    std::fs::write(repo.join("draft.txt"), "local work\n").unwrap();
+
+    let out = env.vard(&["--format", "records", "sync", "notes"]);
+    assert_eq!(
+        code(&out),
+        1,
+        "expected attention exit; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("status   paused"),
+        "got: {}",
+        stdout(&out)
+    );
+    // No cycle ran: nothing new reached the remote.
+    let count = git_in(&env, &origin, &["rev-list", "--count", "refs/heads/main"]);
+    assert_eq!(stdout(&count).trim(), "1", "the paused watch must not sync");
+}
+
+#[test]
+fn sync_named_paused_watch_refuses_with_a_daemon_running() {
+    // The daemon-present half of the parity: via_request refuses a paused named
+    // watch up front with the same attention exit.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&paused_sync_watch("notes", &repo)));
+
+    let mut daemon = env
+        .command(&["run"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn vard run");
+    // The daemon writes its health file once it is up and holding the lock.
+    let health = env.health_file();
+    for _ in 0..100 {
+        if health.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(health.exists(), "the daemon never started");
+
+    let out = env.vard(&["sync", "notes"]);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert_eq!(
+        code(&out),
+        1,
+        "expected attention exit; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("paused"),
+        "the refusal names the paused state: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn sync_all_isolates_a_broken_repo_and_still_syncs_the_rest() {
+    // Per-watch isolation: a sync-enabled watch whose repository cannot be
+    // opened yields an honest failed row (exit 2) while every other watch still
+    // syncs — one broken repo never blocks the rest.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let healthy = synced_repo(&env, "notes", &origin);
+    std::fs::write(healthy.join("draft.txt"), "local work\n").unwrap();
+
+    // A sync-enabled watch whose path is not a git repository at all.
+    let broken = env.root.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    let broken = std::fs::canonicalize(&broken).unwrap();
+
+    let watches = format!(
+        "{}{}",
+        sync_watch("notes", &healthy),
+        sync_watch("broken", &broken)
+    );
+    env.write_config(&config_for(&watches));
+
+    let out = env.vard(&["--format", "records", "sync"]);
+    assert_eq!(code(&out), 2, "the broken repo contributes an error exit");
+    let text = stdout(&out);
+    assert!(
+        text.contains("name     notes") && text.contains("status   pushed"),
+        "the healthy watch still synced: {text}"
+    );
+    assert!(
+        text.contains("name     broken")
+            && text.contains("status   failed")
+            && text.contains("cannot open repository"),
+        "the broken watch gets an honest failed row: {text}"
+    );
+    // The healthy watch's work really reached the remote.
+    let remote_head = git_in(&env, &origin, &["rev-parse", "refs/heads/main"]);
+    let local_head = git_in(&env, &healthy, &["rev-parse", "HEAD"]);
+    assert_eq!(stdout(&remote_head).trim(), stdout(&local_head).trim());
+}
+
 #[test]
 fn sync_named_unknown_watch_errors() {
     let env = Env::new();
