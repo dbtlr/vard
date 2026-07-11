@@ -59,7 +59,13 @@ pub type SharedGate = Arc<dyn OpGate>;
 /// a non-blocking lock attempt plus a small record write, so it is called
 /// directly from async context without a `spawn_blocking` hop (it must not
 /// block the runtime — a busy gate returns [`None`] immediately rather than
-/// waiting).
+/// waiting). [`OpGuard::complete`] is likewise called directly from async: its
+/// work is a small journal *compaction* (a file truncate) plus the lock release,
+/// both cheap synchronous I/O in the same class as `begin`'s record write, never
+/// a blocking wait. The one heavy step — the git commit between them — is the
+/// only part the engine hands to `spawn_blocking` (see the engine's
+/// `run_snapshot_under_guard`, which keeps the guard coupled to that blocking
+/// work so an async abort cannot release the lock while git is mid-write).
 pub trait OpGate: Send + Sync {
     /// Tries to begin operation `op` (e.g. `"snapshot"`) for this watch:
     ///

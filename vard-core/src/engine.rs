@@ -104,7 +104,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::config::{TriggerMode, WatchSpec};
 use crate::event::{Event, EventBus, EventReceiver, SkipReason, Trigger, TroubleKind, WatchState};
-use crate::gate::{SharedGate, default_gate};
+use crate::gate::{OpGuard, SharedGate, default_gate};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
 use crate::vcs::git::GitBackend;
 use crate::vcs::{SafeState, SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError};
@@ -141,6 +141,13 @@ pub const DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS: u32 = 480;
 /// completes regardless (see [`EngineHandle::shutdown`]).
 pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default cadence for the op-gate-busy self-retry (F7). Much shorter than
+/// [`DEFAULT_UNSAFE_REPOLL_INTERVAL`] because the contended lock is *our own*
+/// per-watch op lock — held only across a peer's commit window and freed
+/// quickly — so re-attempting soon converges an event-only watch that would
+/// otherwise wait for a fresh trigger, without hammering a foreign lock.
+pub const DEFAULT_GATE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Tunable timing policy for a worker's retry and re-poll loops.
 ///
 /// The defaults are the `DEFAULT_*` constants in this module; the
@@ -153,6 +160,9 @@ struct EngineConfig {
     unsafe_repoll_interval: Duration,
     unsafe_repoll_max_attempts: u32,
     shutdown_drain_timeout: Duration,
+    /// The (shorter) cadence for the op-gate-busy self-retry; see
+    /// [`RetryKind::GateBusy`] and [`DEFAULT_GATE_BUSY_RETRY_INTERVAL`].
+    gate_busy_retry_interval: Duration,
 }
 
 impl Default for EngineConfig {
@@ -163,6 +173,7 @@ impl Default for EngineConfig {
             unsafe_repoll_interval: DEFAULT_UNSAFE_REPOLL_INTERVAL,
             unsafe_repoll_max_attempts: DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS,
             shutdown_drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+            gate_busy_retry_interval: DEFAULT_GATE_BUSY_RETRY_INTERVAL,
         }
     }
 }
@@ -408,6 +419,15 @@ enum RetryKind {
     /// [`Event::SnapshotFailed`] was emitted once on entry and the change is
     /// retried silently (no per-tick failure storm).
     Failure,
+    /// The op gate was busy (another writer holds this watch's op lock): the
+    /// change is un-snapshotted, so a short bounded self-retry is armed to
+    /// converge it once the lock frees, without any external trigger (F7). No
+    /// state change and no failure event — gate contention is transient, not a
+    /// fault. Uses a shorter cadence than the other kinds
+    /// ([`EngineConfig::gate_busy_retry_interval`]): our own op lock frees
+    /// quickly, unlike a foreign index lock (whose hammering concern keeps the
+    /// [`StillLocked`](PassResult::StillLocked) path trigger-driven).
+    GateBusy,
 }
 
 /// One per-watch worker: the serialized snapshot loop for a single watch.
@@ -462,7 +482,13 @@ impl Worker {
         loop {
             let waiting_on_retry = self.retry.is_some() && !self.retry_exhausted;
             let input = if waiting_on_retry {
-                match timeout(self.cfg.unsafe_repoll_interval, rx.recv()).await {
+                // A gate-busy retry uses the shorter cadence (our own op lock frees
+                // quickly); every other kind uses the unsafe/failure re-poll.
+                let interval = match self.retry {
+                    Some(RetryKind::GateBusy) => self.cfg.gate_busy_retry_interval,
+                    _ => self.cfg.unsafe_repoll_interval,
+                };
+                match timeout(interval, rx.recv()).await {
                     Ok(received) => received,
                     Err(_elapsed) => {
                         self.retry_tick().await;
@@ -571,44 +597,49 @@ impl Worker {
             // The repository is safe and a backend commit is imminent. Admit the
             // operation through the gate FIRST: this acquires the watch's op lock
             // and writes the journal `begin`, making this worker the sole writer
-            // for the commit window. A busy gate means another holder owns the
-            // watch right now (a second engine mid-reload, a CLI restore); requeue
-            // exactly like a contended index lock and wait for the next trigger,
-            // WITHOUT opening an event bracket (no `SnapshotStarted` was emitted,
-            // so nothing to close and the bracket invariant is preserved).
+            // for the commit window. `gate.begin` is a non-blocking op-lock attempt
+            // plus a small record write, so it runs directly here — synchronous, no
+            // `.await` — which also keeps the non-`Sync` `self` from being held
+            // across the blocking git work below.
             let guard = match self.gate.begin("snapshot") {
                 Ok(Some(guard)) => guard,
                 Ok(None) => {
+                    // Another holder owns the watch's op lock (a second engine
+                    // mid-reload, a CLI restore). Requeue like a contended index
+                    // lock — WITHOUT opening a bracket (no `SnapshotStarted`) — and
+                    // arm a short bounded self-retry so an event-only watch still
+                    // converges once the lock frees, without a fresh trigger (F7).
                     self.pending = Some(coalesce(self.pending.take(), prov));
+                    self.enter_gate_busy();
                     return;
                 }
                 Err(err) => {
                     // The gate itself could not be evaluated (op-lock or journal
-                    // I/O trouble). Preserve the change and converge it on the
-                    // bounded retry timer, surfacing the failure once — the same
-                    // discipline as a failed safe-state probe.
+                    // I/O trouble), including a fail-closed `begin`-write failure.
+                    // Preserve the change and converge it on the bounded retry
+                    // timer, surfacing the failure once — the same discipline as a
+                    // failed safe-state probe. No bracket was opened.
                     self.pending = Some(prov.clone());
                     self.enter_failure_msg(prov.trigger, format!("operation gate failed: {err}"));
                     return;
                 }
             };
 
-            // The commit window is open. Announce it before the git write can
-            // begin so a bus subscriber can bracket it. This fires per sweep,
-            // including the bounded post-op re-check below, because each sweep is
-            // its own commit window. INVARIANT: every arm below closes this
+            // The commit window is open. Announce it before any git write, so a
+            // bus subscriber can bracket it. INVARIANT: every arm below closes this
             // bracket with exactly one outcome event — `SnapshotCompleted`,
             // `SnapshotFailed`, or `SnapshotSkipped` — so a subscriber's record
-            // never dangles (see `Event::SnapshotStarted`). The `guard` closes the
-            // matching journal bracket: `complete` on every non-panic outcome,
-            // and a plain drop (release-only, no journal close) on a panic, whose
-            // dangling `begin` is the recovery evidence for the abandoned lock.
+            // never dangles (see `Event::SnapshotStarted`).
             self.emit_started(prov.trigger);
 
-            match snapshot_with_retry(Arc::clone(&self.backend), self.cfg, &prov).await {
+            // Run the snapshot with the op guard COUPLED to the blocking git work
+            // (F2): the guard moves into the blocking scope and is closed there, so
+            // an async abort cannot separate lock-release from git-completion. This
+            // await borrows no `self` (owned backend/cfg, the local `prov`).
+            match run_snapshot_under_guard(Arc::clone(&self.backend), self.cfg, &prov, guard).await
+            {
                 PassResult::Committed(outcome) => {
                     self.emit_completed(prov.trigger, &outcome);
-                    guard.complete();
                     // A commit means any prior retry has converged.
                     self.clear_retry();
                     // A successful commit clears a snapshots-failing (or blocked)
@@ -636,7 +667,6 @@ impl Worker {
                     // bracket, then clear any retry so a prior failure episode
                     // does not keep ticking.
                     self.emit_skipped(prov.trigger, SkipReason::Clean);
-                    guard.complete();
                     self.clear_retry();
                     // Skip-to-clean also clears a snapshots-failing state: the
                     // pending change resolved (committed or reverted elsewhere),
@@ -649,7 +679,6 @@ impl Worker {
                     // pause itself travels as `WatchStateChanged`). git wrote
                     // nothing, so the journal bracket closes cleanly.
                     self.emit_skipped(prov.trigger, SkipReason::Unsafe);
-                    guard.complete();
                     self.pending = Some(prov);
                     self.enter_unsafe(reason);
                     return;
@@ -658,7 +687,6 @@ impl Worker {
                     // Never delete a foreign lock: requeue and try again on the
                     // next trigger. Nothing was committed, so close the bracket.
                     self.emit_skipped(prov.trigger, SkipReason::LockContended);
-                    guard.complete();
                     self.pending = Some(coalesce(self.pending.take(), prov));
                     return;
                 }
@@ -676,17 +704,16 @@ impl Worker {
                     if self.retry == Some(RetryKind::Failure) {
                         self.emit_skipped(prov.trigger, SkipReason::RetryStillFailing);
                     }
-                    guard.complete();
                     self.enter_failure(prov.trigger, &err);
                     return;
                 }
                 PassResult::Panicked(detail) => {
-                    // The blocking commit unwound: it may have left a git
-                    // `index.lock` behind. Drop `guard` WITHOUT completing it —
-                    // release-only, so the journal `begin` stays dangling as the
-                    // recovery evidence for that abandoned lock. Writing a close
-                    // here would destroy it (see the gate module docs).
-                    drop(guard);
+                    // The blocking commit unwound inside the gated scope: the guard
+                    // was already dropped there WITHOUT completing (release-only),
+                    // so the journal `begin` stays dangling as recovery evidence
+                    // for any abandoned git lock (see the gate module docs). The
+                    // `SnapshotStarted` bracket is closed by the `SnapshotFailed`
+                    // that `on_backend_panic` emits.
                     self.on_backend_panic(prov.trigger, &detail);
                     return;
                 }
@@ -745,6 +772,18 @@ impl Worker {
     fn enter_unsafe(&mut self, reason: UnsafeReason) {
         self.retry = Some(RetryKind::UnsafePause);
         self.set_state(WatchState::Paused, None, Some(reason.to_string()));
+    }
+
+    /// Arms the short bounded op-gate-busy self-retry (F7). Unlike
+    /// [`enter_unsafe`](Self::enter_unsafe)/[`enter_failure`](Self::enter_failure)
+    /// it makes **no** state transition and emits **no** event: op-gate
+    /// contention is transient (a peer's commit window on our own op lock), not a
+    /// fault, so the watch stays whatever it was. It only arms the retry timer so
+    /// the preserved change converges once the lock frees, without a fresh
+    /// trigger. Never resets the budget — the attempt count belongs to the whole
+    /// stuck episode and is reset only by fresh activity ([`apply`](Self::apply)).
+    fn enter_gate_busy(&mut self) {
+        self.retry = Some(RetryKind::GateBusy);
     }
 
     /// Enters (or stays in) the failure retry after a probe or snapshot failed.
@@ -904,23 +943,34 @@ async fn check_safe(backend: SharedBackend) -> Result<Result<SafeState, VcsError
     tokio::task::spawn_blocking(move || backend.is_safe_state()).await
 }
 
-/// Runs [`snapshot`](VcsBackend::snapshot) off the async runtime. See
-/// [`check_safe`] for why it takes the backend by value and returns the
-/// [`JoinError`] rather than propagating a panic.
-async fn call_snapshot(
-    backend: SharedBackend,
-    req: SnapshotRequest,
-) -> Result<Result<Option<SnapshotOutcome>, VcsError>, JoinError> {
-    tokio::task::spawn_blocking(move || backend.snapshot(&req)).await
-}
-
-/// Calls [`snapshot`](VcsBackend::snapshot), retrying a contended lock with
-/// exponential backoff up to [`EngineConfig::lock_retry_attempts`]. A free
-/// function (not a method) so the future stays `Send` — see [`check_safe`].
-async fn snapshot_with_retry(
+/// Runs [`snapshot`](VcsBackend::snapshot) for an already-admitted operation,
+/// retrying a contended index lock with exponential backoff up to
+/// [`EngineConfig::lock_retry_attempts`], with the op `guard` **coupled to the
+/// blocking git work** (F2).
+///
+/// Each attempt runs `backend.snapshot` in a `spawn_blocking` scope with the
+/// guard moved IN and returned OUT with the result. That coupling is the whole
+/// point: if this worker's async task is aborted mid-write (a shutdown drain
+/// timeout), the detached blocking task carries the guard to completion and only
+/// then drops it — so an async abort can never release the op lock while git is
+/// still writing (and a new engine's `begin` can never truncate the evidence out
+/// from under a live commit). A panic in the git call unwinds the scope, dropping
+/// the guard *release-only* (no journal close) and leaving the dangling `begin`
+/// as recovery evidence; it surfaces as [`PassResult::Panicked`].
+///
+/// The lock-retry backoff stays on the **async** timer between attempts: no git
+/// is in flight during the sleep (a contended attempt already released git's own
+/// `index.lock`), so the guard rests on the async side safely there, and the
+/// sleep stays controllable under paused-time tests. A free function (not a
+/// method) so the future stays `Send` — see [`check_safe`].
+///
+/// The guard is closed at a single decision point (Q1): [`complete`](OpGuard::complete)
+/// on every non-panic outcome, a deliberate release-only drop on a panic.
+async fn run_snapshot_under_guard(
     backend: SharedBackend,
     cfg: EngineConfig,
     prov: &Provenance,
+    guard: Box<dyn OpGuard>,
 ) -> PassResult {
     let req = SnapshotRequest {
         trigger: prov.trigger,
@@ -928,24 +978,45 @@ async fn snapshot_with_retry(
         extra_trailers: Vec::new(),
     };
 
-    for attempt in 1..=cfg.lock_retry_attempts {
-        match call_snapshot(Arc::clone(&backend), req.clone()).await {
-            Ok(Ok(Some(outcome))) => return PassResult::Committed(outcome),
-            Ok(Ok(None)) => return PassResult::Clean,
-            Ok(Err(VcsError::UnsafeState(reason))) => return PassResult::Unsafe(reason),
-            Ok(Err(VcsError::LockContended { .. })) => {
+    let mut guard = guard;
+    let mut attempt = 1u32;
+    let result = loop {
+        let backend_for_call = Arc::clone(&backend);
+        let req_for_call = req.clone();
+        // Guard moves INTO the blocking scope for the git write and back OUT with
+        // the result (see the doc above for why this coupling is load-bearing).
+        let joined = tokio::task::spawn_blocking(move || {
+            let outcome = backend_for_call.snapshot(&req_for_call);
+            (guard, outcome)
+        })
+        .await;
+        let (returned_guard, outcome) = match joined {
+            Ok(pair) => pair,
+            // The blocking git call panicked: the guard was already dropped
+            // release-only during the unwind, preserving the dangling `begin`.
+            Err(join) => return PassResult::Panicked(join.to_string()),
+        };
+        guard = returned_guard;
+        match outcome {
+            Ok(Some(outcome)) => break PassResult::Committed(outcome),
+            Ok(None) => break PassResult::Clean,
+            Err(VcsError::UnsafeState(reason)) => break PassResult::Unsafe(reason),
+            Err(VcsError::LockContended { .. }) => {
                 if attempt < cfg.lock_retry_attempts {
                     tokio::time::sleep(backoff(cfg, attempt)).await;
+                    attempt += 1;
                     continue;
                 }
-                return PassResult::StillLocked;
+                break PassResult::StillLocked;
             }
-            Ok(Err(other)) => return PassResult::Failed(other),
-            Err(join) => return PassResult::Panicked(join.to_string()),
+            Err(other) => break PassResult::Failed(other),
         }
-    }
-    // `lock_retry_attempts` is always >= 1, so the loop always returns.
-    PassResult::StillLocked
+    };
+    // Single close point (Q1): `complete` on every non-panic outcome — compacts
+    // the journal and releases the op lock. The panic path returned early with
+    // the guard already dropped release-only.
+    guard.complete();
+    result
 }
 
 /// The backoff before the retry that follows `attempt` (1-based):
@@ -1366,6 +1437,13 @@ impl EngineBuilder {
     /// The backend is opened at [`build`](Self::build): the branch comes from
     /// [`WatchSpec::branch`], or is adopted from the repository's current branch
     /// when unset (spec §3 branch policy).
+    ///
+    /// **UNGATED.** This watch uses the standalone no-op gate: it enforces no
+    /// cross-process one-writer-per-watch invariant, which is the right default
+    /// for an embedding SDK host that is the sole writer of its repositories. The
+    /// `vard` daemon must instead use [`watch_with_gate`](Self::watch_with_gate)
+    /// to inject its per-watch op lock; running multiple ungated writers against
+    /// one repository can corrupt it.
     pub fn watch(mut self, spec: WatchSpec) -> Self {
         self.watches.push(PendingWatch {
             source: BackendSource::Git(spec),
@@ -1391,26 +1469,15 @@ impl EngineBuilder {
     /// Lets an embedder plug in an alternate [`VcsBackend`] and lets tests drive
     /// the engine with a fake. The backend must be `Send + Sync` because the
     /// worker calls it from a blocking task (see [`SharedBackend`]).
+    ///
+    /// **UNGATED.** Like [`watch`](Self::watch), this uses the standalone no-op
+    /// gate — no cross-process one-writer-per-watch invariant. A host that needs
+    /// the op lock (the daemon) must inject one via
+    /// [`watch_with_gate`](Self::watch_with_gate).
     pub fn watch_with_backend(mut self, spec: WatchSpec, backend: SharedBackend) -> Self {
         self.watches.push(PendingWatch {
             source: BackendSource::Backend(spec, backend),
             gate: default_gate(),
-        });
-        self
-    }
-
-    /// [`watch_with_backend`](Self::watch_with_backend) with an injected operation
-    /// `gate` — for tests that need to drive the gate-busy / gate-error paths with
-    /// a fake gate alongside a fake backend.
-    pub fn watch_with_backend_and_gate(
-        mut self,
-        spec: WatchSpec,
-        backend: SharedBackend,
-        gate: SharedGate,
-    ) -> Self {
-        self.watches.push(PendingWatch {
-            source: BackendSource::Backend(spec, backend),
-            gate,
         });
         self
     }
@@ -1443,6 +1510,14 @@ impl EngineBuilder {
     /// Sets the cap on consecutive unsafe re-polls before waiting for activity.
     pub fn unsafe_repoll_max_attempts(mut self, attempts: u32) -> Self {
         self.cfg.unsafe_repoll_max_attempts = attempts;
+        self
+    }
+
+    /// Sets the (shorter) cadence for the op-gate-busy self-retry. Exists mainly
+    /// for deterministic tests.
+    #[allow(dead_code)]
+    pub fn gate_busy_retry_interval(mut self, interval: Duration) -> Self {
+        self.cfg.gate_busy_retry_interval = interval;
         self
     }
 
@@ -1910,6 +1985,7 @@ mod tests {
             unsafe_repoll_interval: Duration::from_secs(30),
             unsafe_repoll_max_attempts: 480,
             shutdown_drain_timeout: Duration::from_secs(30),
+            gate_busy_retry_interval: Duration::from_millis(500),
         }
     }
 
@@ -2527,6 +2603,49 @@ mod tests {
         assert!(
             matches!(ev, Event::SnapshotCompleted { .. }),
             "once the gate frees, the requeued change commits, got {ev:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_busy_self_retries_and_converges_without_a_fresh_trigger() {
+        // F7: an event-only watch that hit a busy gate must converge once the gate
+        // frees, driven by the short bounded self-retry timer — NOT waiting for a
+        // fresh filesystem trigger (which an event-only watch may never get). This
+        // closes the reload-teardown corner where a preserved change could strand.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let gate = FakeGate::busy();
+        let (tx, mut events, _counter) = spawn_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        // One trigger; the gate refuses, so the change is preserved and a short
+        // self-retry is armed. No fresh trigger is sent after this.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        for _ in 0..10 {
+            settle().await;
+            tokio::time::advance(Duration::from_millis(500)).await;
+        }
+        assert_eq!(
+            backend.snapshot_calls(),
+            0,
+            "a busy gate blocks the commit while it is refused"
+        );
+        assert!(
+            gate.begins() >= 2,
+            "the self-retry must re-attempt the gate on its own timer, got {} begins",
+            gate.begins()
+        );
+
+        // The gate frees. WITHOUT any new trigger, the self-retry timer alone must
+        // drive the preserved change to a commit.
+        gate.admit();
+        let ev = advance_until_event(&mut events, Duration::from_millis(500)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the gate-busy self-retry must converge with no fresh trigger, got {ev:?}"
         );
     }
 
