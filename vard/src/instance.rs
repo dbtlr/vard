@@ -592,7 +592,14 @@ mod tests {
         let probe_path = path.clone();
         let probe = std::thread::spawn(move || {
             let f = File::open(&probe_path).unwrap();
-            flock(&f, FlockOperation::NonBlockingLockShared).unwrap();
+            // Retry the acquire to ride out the sibling-fork/exec window that can
+            // transiently hold the just-released exclusive seed fd (the same
+            // artifact `concurrent_probes_do_not_misread_a_crashed_daemon_as_running`'s
+            // peer and the other flock tests document).
+            assert!(
+                retry_until(|| flock(&f, FlockOperation::NonBlockingLockShared).is_ok()),
+                "the probe's shared lock must ultimately acquire once the fork/exec race clears"
+            );
             ready_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(10));
             drop(f);
