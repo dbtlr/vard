@@ -92,6 +92,24 @@ pub trait OpGuard: Send {
     /// and releases the lock. Consumes the guard. Not calling this — dropping the
     /// guard instead — is the release-only path that preserves recovery evidence.
     fn complete(self: Box<Self>);
+
+    /// Records a mid-operation **advance target**: a committed reference the
+    /// operation has produced but not yet made live, so that if the process dies
+    /// after this call the host's recovery can re-apply it idempotently.
+    ///
+    /// The sync cycle calls this with the reconciled tip after its out-of-tree
+    /// rebase and *before* the `advance` that makes that tip live — so a crash in
+    /// the narrow window between rebase and advance leaves durable evidence of
+    /// exactly where the tree was supposed to land. Takes `&self` so it can be
+    /// called while the guard is owned inside the blocking git scope; it is small
+    /// synchronous host I/O in the same class as [`begin`](OpGate::begin).
+    ///
+    /// The default is a no-op: a host that journals nothing (the standalone
+    /// [`NoOpGate`]) has no evidence to record and no recovery to drive.
+    fn record_advance_target(&self, target: &str) -> Result<(), OpGateError> {
+        let _ = target;
+        Ok(())
+    }
 }
 
 /// The default gate: admits every operation, records nothing, locks nothing. The

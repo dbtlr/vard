@@ -124,6 +124,10 @@ pub enum Event {
     SyncPushed {
         /// Stable name of the watch.
         watch: String,
+        /// The reference (tip) that was pushed to the remote.
+        new_ref: String,
+        /// How many commits the remote received in this push.
+        commits: usize,
     },
     /// Remote changes were pulled into the local repository.
     SyncPulled {
@@ -638,6 +642,8 @@ mod tests {
             (
                 Event::SyncPushed {
                     watch: "w".to_string(),
+                    new_ref: "abc".to_string(),
+                    commits: 2,
                 },
                 "sync.pushed",
             ),

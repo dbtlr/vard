@@ -1198,7 +1198,11 @@ fn log_event(event: &Event) {
                 info!(event = name, %watch, %from, %to, reason, "watch state changed");
             }
         }
-        Event::SyncPushed { watch } => info!(event = name, %watch, "pushed to remote"),
+        Event::SyncPushed {
+            watch,
+            new_ref,
+            commits,
+        } => info!(event = name, %watch, %new_ref, commits, "pushed to remote"),
         Event::SyncPulled {
             watch,
             prev_ref,

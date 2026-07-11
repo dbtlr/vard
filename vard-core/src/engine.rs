@@ -93,10 +93,50 @@
 //! nothing dies silently. Whether that `Attention` clears itself once a later
 //! pass succeeds, or stays until an operator resolves it, is decided per
 //! [`crate::TroubleKind`] — see [`crate::TroubleKind::latches`].
+//!
+//! # The sync cycle
+//!
+//! A syncing watch reconciles with its remote on the *same serialized worker*,
+//! so a sync never overlaps a snapshot on that watch. A cycle is requested via
+//! [`EngineHandle::request_sync`] (manual) or
+//! [`EngineHandle::request_auto_sync`] (the automatic cadence a future interval
+//! or post-snapshot trigger will use); it runs under two hard invariants.
+//!
+//! **Lock/network separation.** The network-facing steps — [`fetch`](VcsBackend::fetch)
+//! and [`push`](VcsBackend::push) — run **outside** the per-watch op lock, each
+//! timeout-bounded ([`EngineConfig::sync_network_timeout`]), so a hung endpoint
+//! can never block a worker while holding the lock. Between them, one **locked
+//! window** holds the op lock and one journal bracket (`begin("sync")` →
+//! `complete`) with **zero network I/O** inside: a pre-sync snapshot
+//! ([`Trigger::PreSync`], a no-op on a clean tree), then the out-of-tree
+//! [`reconcile`](VcsBackend::reconcile), then the single [`advance`](VcsBackend::advance)
+//! that makes the reconciled tip live. The op guard is coupled to that blocking
+//! git work (it moves into `spawn_blocking` and is closed there), so an async
+//! abort can never separate lock-release from git-completion — the same
+//! discipline as the snapshot path.
+//!
+//! **No dirty tree, ever.** The reconcile rebases in a vard-owned scratch
+//! worktree ([`WatchSpec::scratch_dir`], host-injected — vard-core resolves no
+//! paths), never touching the user's tree; the tree only ever moves between
+//! fully-committed states, and only via the single `advance` under the lock (the
+//! pre-sync snapshot having committed everything first). Snapshot-local-first
+//! means no sync step can destroy the only copy of anything. The advance's tree
+//! rewrite is performed under the self-suppression [`MuteGuard`], and it lands a
+//! fully-committed tree, so it can neither feed back as fresh activity nor leave
+//! anything for a follow-up pass to commit.
+//!
+//! A [`ReconcileOutcome::Conflict`] latches the watch [`WatchState::Conflicted`]
+//! (auto-sync then stops for it; local snapshotting continues); a network/auth
+//! failure enters [`WatchState::SyncError`] with an exponential backoff
+//! (capped at [`DEFAULT_SYNC_BACKOFF_CAP`], reset on success) re-driven by the
+//! worker's own timer. A lost fast-forward race ([`PushOutcome::NonFastForward`])
+//! re-runs the cycle in place up to [`SYNC_MAX_ATTEMPTS`] before degrading to a
+//! backoff.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -109,7 +149,10 @@ use crate::event::{Event, EventBus, EventReceiver, SkipReason, Trigger, TroubleK
 use crate::gate::{OpGuard, SharedGate, default_gate};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
 use crate::vcs::git::GitBackend;
-use crate::vcs::{SafeState, SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError};
+use crate::vcs::{
+    LogFilter, PushOutcome, ReconcileOutcome, SafeState, SnapshotOutcome, SnapshotRequest,
+    UnsafeReason, VcsBackend, VcsError,
+};
 use crate::watcher::{MuteGuard, WatchHandle, Watcher, WatcherRx, WatcherSignal};
 
 /// Default number of attempts made against a contended index lock before the
@@ -150,6 +193,37 @@ pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// otherwise wait for a fresh trigger, without hammering a foreign lock.
 pub const DEFAULT_GATE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Default wall-clock bound on each network-facing sync step
+/// ([`fetch`](VcsBackend::fetch) and [`push`](VcsBackend::push)). On expiry the
+/// backend kills the git child (and its process group) and returns
+/// [`VcsError::Timeout`], which the sync cycle treats as a network failure:
+/// [`WatchState::SyncError`] with exponential backoff. Sixty seconds
+/// comfortably covers a healthy fetch/push while bounding a hung endpoint.
+pub const DEFAULT_SYNC_NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Base delay of the sync failure backoff. On the first
+/// [`WatchState::SyncError`] the watch re-attempts after this long, then doubles
+/// each consecutive failure up to [`DEFAULT_SYNC_BACKOFF_CAP`]. This is its own
+/// escalating schedule, deliberately separate from the snapshot retry cadences
+/// (the long unsafe/failure re-poll and the short gate-busy retry): a network
+/// outage is retried on a network-appropriate ramp, not the snapshot ramp.
+pub const DEFAULT_SYNC_BACKOFF_BASE: Duration = Duration::from_secs(60);
+
+/// Cap on the sync failure backoff: consecutive failures ramp
+/// `1m, 2m, 4m, …` and then hold here. A persistently unreachable remote is
+/// retried at most once an hour, never abandoned (unlike the bounded snapshot
+/// retry budget) — sync has no local-data-loss stake, so it simply keeps trying
+/// on a slow cadence until the remote returns.
+pub const DEFAULT_SYNC_BACKOFF_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// How many times one sync cycle re-runs `fetch → reconcile → advance → push`
+/// when the push loses a fast-forward race
+/// ([`PushOutcome::NonFastForward`]) before it stops converging in-cycle and
+/// degrades to a [`WatchState::SyncError`] backoff. Three total attempts bounds
+/// a pathologically contended remote without giving up on the common
+/// single-race case.
+pub const SYNC_MAX_ATTEMPTS: u32 = 3;
+
 /// Tunable timing policy for a worker's retry and re-poll loops.
 ///
 /// The defaults are the `DEFAULT_*` constants in this module; the
@@ -165,6 +239,13 @@ struct EngineConfig {
     /// The (shorter) cadence for the op-gate-busy self-retry; see
     /// [`RetryKind::GateBusy`] and [`DEFAULT_GATE_BUSY_RETRY_INTERVAL`].
     gate_busy_retry_interval: Duration,
+    /// Per-step timeout for the sync cycle's network ops (fetch/push); see
+    /// [`DEFAULT_SYNC_NETWORK_TIMEOUT`].
+    sync_network_timeout: Duration,
+    /// Base delay of the sync failure backoff; see [`DEFAULT_SYNC_BACKOFF_BASE`].
+    sync_backoff_base: Duration,
+    /// Cap on the sync failure backoff; see [`DEFAULT_SYNC_BACKOFF_CAP`].
+    sync_backoff_cap: Duration,
 }
 
 impl Default for EngineConfig {
@@ -176,6 +257,9 @@ impl Default for EngineConfig {
             unsafe_repoll_max_attempts: DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS,
             shutdown_drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
             gate_busy_retry_interval: DEFAULT_GATE_BUSY_RETRY_INTERVAL,
+            sync_network_timeout: DEFAULT_SYNC_NETWORK_TIMEOUT,
+            sync_backoff_base: DEFAULT_SYNC_BACKOFF_BASE,
+            sync_backoff_cap: DEFAULT_SYNC_BACKOFF_CAP,
         }
     }
 }
@@ -313,11 +397,20 @@ fn coalesce(existing: Option<Provenance>, incoming: Provenance) -> Provenance {
     }
 }
 
-/// One item routed to a worker: a snapshot trigger or a trouble report.
+/// One item routed to a worker: a snapshot trigger, a sync request, or a
+/// trouble report.
 #[derive(Clone, Debug)]
 enum WatchInput {
     /// A snapshot is due for the given reason.
     Trigger(Provenance),
+    /// A sync cycle is requested. `manual` distinguishes an explicit user/CLI
+    /// request (which attempts even a [`Conflicted`](WatchState::Conflicted)
+    /// watch, to try resolving it) from an automatic one (interval/push-driven,
+    /// suppressed while a conflict latches — "auto-sync stops for that watch").
+    RequestSync {
+        /// Whether this is an explicit manual request.
+        manual: bool,
+    },
     /// A signal source reported trouble; the kind and detail are both
     /// surfaced on the bus.
     Trouble {
@@ -470,15 +563,36 @@ struct Worker {
     retry_attempts: u32,
     /// Whether the retry budget is spent; the worker then waits for activity.
     retry_exhausted: bool,
+
+    /// Whether this watch may actually sync: [`WatchSpec::sync`] is `true` **and**
+    /// a [`scratch_dir`](WatchSpec::scratch_dir) was injected. When `false`, every
+    /// sync request is an immediate no-op (see [`run_sync_cycle`](Self::run_sync_cycle)).
+    sync_enabled: bool,
+    /// The out-of-tree reconcile directory for this watch's [`reconcile`](VcsBackend::reconcile).
+    /// `None` disables sync (mirrored in [`sync_enabled`](Self::sync_enabled)).
+    scratch_dir: Option<PathBuf>,
+    /// A coalesced pending sync request, if any: `Some(manual)` records whether
+    /// the most-intentional pending request is a manual one (manual wins).
+    sync_pending: Option<bool>,
+    /// Consecutive sync-cycle failures, driving the exponential backoff
+    /// ([`sync_backoff`](Self::sync_backoff)); reset to zero on any success.
+    sync_failures: u32,
+    /// When set, the deadline at which a backed-off (or gate-deferred) sync
+    /// re-attempts itself, without any external trigger. The run loop wakes on
+    /// it exactly as it wakes on the snapshot retry timer.
+    sync_retry_at: Option<Instant>,
 }
 
 impl Worker {
     /// Runs the worker until its input channel closes (every signal source for
     /// this watch was dropped, i.e. the engine is shutting down).
     ///
-    /// The loop blocks for the next input, except while a pending change is
-    /// being retried, when it also wakes on the retry deadline so the change
-    /// converges without any further signal.
+    /// The loop blocks for the next input, except while a timer is armed — the
+    /// snapshot retry timer (a stuck pending change) or the sync retry timer (a
+    /// backed-off or gate-deferred sync) — when it also wakes on the nearest
+    /// deadline so the operation converges without any further signal. A
+    /// snapshot pass and a sync cycle both run on this one task, so every
+    /// operation on a watch stays strictly serial.
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<WatchInput>) {
         self.probe_initial_state().await;
         loop {
@@ -497,6 +611,22 @@ impl Worker {
                         continue;
                     }
                 }
+            } else if let Some(deadline) = self.sync_retry_at {
+                // A sync is scheduled (backoff after a failure, or a short
+                // re-attempt after a busy op gate). Wake at its deadline and
+                // fire it, driven by the timer rather than an external trigger.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match timeout(remaining, rx.recv()).await {
+                    Ok(received) => received,
+                    Err(_elapsed) => {
+                        self.sync_retry_at = None;
+                        // Re-attempt as an automatic sync (the manual intent, if
+                        // any, was consumed by the request that armed the timer).
+                        self.sync_pending = Some(self.sync_pending.take().unwrap_or(false));
+                        self.run_sync_cycle().await;
+                        continue;
+                    }
+                }
             } else {
                 rx.recv().await
             };
@@ -504,15 +634,22 @@ impl Worker {
             let Some(input) = input else { break };
             self.apply(input);
             // Drain everything else already queued so a burst that arrived while
-            // a snapshot was in flight collapses into one follow-up.
+            // an operation was in flight collapses into one follow-up.
             while let Ok(more) = rx.try_recv() {
                 self.apply(more);
             }
 
-            // While retrying, the bounded timer (not a fresh input) drives the
-            // next attempt, so we do not hammer a still-broken repository.
+            // While a snapshot retry is armed, its bounded timer (not a fresh
+            // input) drives the next attempt, so we do not hammer a still-broken
+            // repository.
             if self.pending.is_some() && self.retry.is_none() {
                 self.run_pass().await;
+            }
+            // Sync runs after snapshots and only when the watch is not mid
+            // snapshot-retry: a watch whose local snapshots are failing has no
+            // business talking to a remote yet.
+            if self.sync_pending.is_some() && self.retry.is_none() {
+                self.run_sync_cycle().await;
             }
         }
     }
@@ -548,6 +685,12 @@ impl Worker {
                     self.retry_exhausted = false;
                 }
                 self.pending = Some(coalesce(self.pending.take(), prov));
+            }
+            WatchInput::RequestSync { manual } => {
+                // Coalesce with any already-pending request; a manual request
+                // upgrades a pending automatic one (manual wins on intent).
+                let was_manual = self.sync_pending.unwrap_or(false);
+                self.sync_pending = Some(was_manual || manual);
             }
             WatchInput::Trouble { kind, detail } => {
                 self.set_state(WatchState::Attention, Some(kind), Some(detail));
@@ -943,17 +1086,56 @@ impl Worker {
     /// event. A reason-only refresh updates the shared cell (so queries stay
     /// accurate) without bumping `entered_at` or emitting.
     ///
-    /// This is also the single choke point for the latching contract
-    /// ([`TroubleKind::latches`]): once the watch's current trouble latches,
-    /// every attempt to move it to a different `(state, trouble)` is refused,
+    /// This is also the single choke point for the latching contract: once the
+    /// watch's current trouble latches ([`TroubleKind::latches`]) **or** it sits
+    /// in a sync-owned state ([`is_sync_owned`]), every attempt to move it to a
+    /// different `(state, trouble)` from this snapshot/trouble path is refused,
     /// no matter which caller drives it — an unsafe pause, a fresh failure, a
-    /// panic, or a recovery. Enforcing it here rather than only at the
-    /// recovery call site means a latching condition can never be silently
-    /// clobbered by an unrelated later transition; nothing currently resolves
-    /// it (no explicit-resolve path exists yet), so it stays until whatever
-    /// external action a future one provides — for `SourceDied` that is the
-    /// daemon replacing this worker outright, not a transition on it.
+    /// panic, or a snapshot recovery. Enforcing it here means a latching
+    /// condition can never be silently clobbered.
+    ///
+    /// The exception is an incoming **latching trouble** ([`SourceDied`](TroubleKind::SourceDied)):
+    /// it always records, even over a sync-owned state, so the daemon can still
+    /// rebuild a watch whose signal source died mid-conflict.
+    ///
+    /// The **sync cycle** transitions its own states (`Conflicted`, `SyncError`,
+    /// and clearing them back to `Ok`) through [`set_sync_state`](Self::set_sync_state),
+    /// which bypasses the sync-owned guard because it *is* the owner. A snapshot
+    /// commit's [`recover_to_ok`](Self::recover_to_ok) uses this method and is
+    /// therefore correctly refused while a sync state stands — a successful
+    /// commit says nothing about remote reachability or an unresolved conflict.
     fn set_state(&mut self, to: WatchState, trouble: Option<TroubleKind>, reason: Option<String>) {
+        if self.state == to && self.trouble == trouble {
+            let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            if shared.reason != reason {
+                shared.reason = reason;
+            }
+            return;
+        }
+        // A latching trouble (SourceDied) always records; every other transition
+        // yields to a latched trouble or a sync-owned state.
+        let incoming_latches = trouble.is_some_and(TroubleKind::latches);
+        if !incoming_latches
+            && (self.trouble.is_some_and(TroubleKind::latches) || is_sync_owned(self.state))
+        {
+            return;
+        }
+        self.apply_transition(to, trouble, reason);
+    }
+
+    /// The state transitions the **sync cycle** owns: entering
+    /// [`Conflicted`](WatchState::Conflicted)/[`SyncError`](WatchState::SyncError)
+    /// and clearing them back to `Ok` on a successful cycle. Bypasses the
+    /// sync-owned-state guard in [`set_state`](Self::set_state) (this is the
+    /// owner, the one caller allowed to clear a latched conflict), but still
+    /// honors a latching trouble ([`SourceDied`](TroubleKind::SourceDied)): a
+    /// dying worker's sync outcome must not paper over its dead source.
+    fn set_sync_state(
+        &mut self,
+        to: WatchState,
+        trouble: Option<TroubleKind>,
+        reason: Option<String>,
+    ) {
         if self.state == to && self.trouble == trouble {
             let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
             if shared.reason != reason {
@@ -964,6 +1146,20 @@ impl Worker {
         if self.trouble.is_some_and(TroubleKind::latches) {
             return;
         }
+        self.apply_transition(to, trouble, reason);
+    }
+
+    /// Applies an already-authorized transition: updates the reported state and
+    /// the shared status cell (stamping a fresh `entered_at`) and emits
+    /// [`Event::WatchStateChanged`]. The gate checks live in
+    /// [`set_state`](Self::set_state) / [`set_sync_state`](Self::set_sync_state);
+    /// this is the shared commit step both funnel through.
+    fn apply_transition(
+        &mut self,
+        to: WatchState,
+        trouble: Option<TroubleKind>,
+        reason: Option<String>,
+    ) {
         let from = self.state;
         self.state = to;
         self.trouble = trouble;
@@ -985,6 +1181,349 @@ impl Worker {
             trouble,
         });
     }
+
+    /// Drives one full sync cycle for a coalesced request, on the worker's
+    /// serialized loop so it never overlaps a snapshot on the same watch.
+    ///
+    /// The network (fetch, push) runs **outside** the op lock and the
+    /// reconcile+advance run **inside** it, exactly as the module's
+    /// lock/network separation requires. `fetch → reconcile → advance → push`
+    /// re-runs in-cycle up to [`SYNC_MAX_ATTEMPTS`] when the push loses a
+    /// fast-forward race; on a conflict the watch latches
+    /// [`Conflicted`](WatchState::Conflicted); on a network failure it enters
+    /// [`SyncError`](WatchState::SyncError) with exponential backoff.
+    async fn run_sync_cycle(&mut self) {
+        let Some(manual) = self.sync_pending.take() else {
+            return;
+        };
+        // A watch that cannot sync (sync disabled, or no scratch directory to
+        // reconcile in) drops the request silently — there is nothing to do.
+        if !self.sync_enabled {
+            return;
+        }
+        // Auto-sync stops while a conflict latches: only an explicit manual
+        // request re-attempts, to pick up a resolution the user just made.
+        if self.state == WatchState::Conflicted && !manual {
+            return;
+        }
+        let Some(scratch) = self.scratch_dir.clone() else {
+            return;
+        };
+
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.sync_once(&scratch).await {
+                SyncStep::NothingToDo | SyncStep::Done => {
+                    self.sync_succeeded();
+                    return;
+                }
+                SyncStep::Conflict => {
+                    self.enter_conflict();
+                    return;
+                }
+                SyncStep::RaceLost => {
+                    if attempt >= SYNC_MAX_ATTEMPTS {
+                        self.enter_sync_error(
+                            "push kept losing a fast-forward race to a moving remote".into(),
+                        );
+                        return;
+                    }
+                    // Loop: re-fetch and reconcile against the newly-moved remote.
+                }
+                SyncStep::GateBusy => {
+                    // Another writer holds the op lock (a CLI restore, a second
+                    // engine mid-reload). Preserve the request and re-attempt on
+                    // the short gate-busy cadence, no state change — contention is
+                    // transient, not a sync fault.
+                    self.sync_pending = Some(manual);
+                    self.sync_retry_at =
+                        Some(Instant::now() + self.cfg.gate_busy_retry_interval);
+                    return;
+                }
+                SyncStep::Failed(error) => {
+                    self.enter_sync_error(error);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// One `fetch → (locked) reconcile+advance → push` pass. Emits
+    /// [`Event::SyncPulled`]/[`Event::SyncPushed`] for what actually moved and
+    /// returns the [`SyncStep`] the caller folds into state and retry decisions.
+    async fn sync_once(&mut self, scratch: &std::path::Path) -> SyncStep {
+        // 1. Fetch — OUTSIDE the op lock, timeout-bounded. Nothing to pull and
+        //    nothing to push is the whole job done.
+        let remote = match sync_fetch(Arc::clone(&self.backend), self.cfg.sync_network_timeout)
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => return SyncStep::Failed(error),
+        };
+        if remote.ahead == 0 && remote.behind == 0 {
+            return SyncStep::NothingToDo;
+        }
+
+        // 2. Locked window — op lock + one journal bracket, ZERO network I/O:
+        //    pre-sync snapshot → reconcile → advance, under the self-suppression
+        //    mute so the advance's tree rewrite does not feed back as activity.
+        let guard = match self.gate.begin("sync") {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return SyncStep::GateBusy,
+            Err(err) => return SyncStep::Failed(format!("operation gate failed: {err}")),
+        };
+        let locked = {
+            let _mute = self.mute.acquire();
+            run_locked_window(Arc::clone(&self.backend), scratch.to_path_buf(), guard).await
+        };
+        let tip = match locked {
+            LockedResult::Reconciled { pulled, tip } => {
+                if let Some((prev, new)) = pulled {
+                    self.emit_sync_pulled(prev, new);
+                }
+                tip
+            }
+            LockedResult::Conflict => return SyncStep::Conflict,
+            LockedResult::Failed(error) => return SyncStep::Failed(error),
+        };
+
+        // 3. Push — OUTSIDE the op lock, timeout-bounded.
+        match sync_push(Arc::clone(&self.backend), self.cfg.sync_network_timeout).await {
+            Ok(PushOutcome::Pushed) => {
+                self.emit_sync_pushed(tip, remote.ahead);
+                SyncStep::Done
+            }
+            Ok(PushOutcome::UpToDate) => SyncStep::Done,
+            Ok(PushOutcome::NonFastForward) => SyncStep::RaceLost,
+            Err(error) => SyncStep::Failed(error),
+        }
+    }
+
+    /// Latches the watch [`Conflicted`](WatchState::Conflicted): a reconcile hit
+    /// a conflict the user must resolve. Auto-sync stops (no backoff re-enqueue);
+    /// only a manual request re-attempts. Emits [`Event::SyncConflict`].
+    fn enter_conflict(&mut self) {
+        self.bus.emit(Event::SyncConflict {
+            watch: self.name.clone(),
+        });
+        self.sync_failures = 0;
+        self.sync_retry_at = None;
+        self.set_sync_state(
+            WatchState::Conflicted,
+            None,
+            Some("a sync conflict needs resolution".into()),
+        );
+    }
+
+    /// Enters [`SyncError`](WatchState::SyncError) after a network/gate failure
+    /// and schedules an exponential-backoff re-attempt. Emits
+    /// [`Event::SyncFailed`]. Self-clearing: the next successful cycle returns
+    /// the watch to `Ok` (see [`sync_succeeded`](Self::sync_succeeded)).
+    fn enter_sync_error(&mut self, error: String) {
+        self.bus.emit(Event::SyncFailed {
+            watch: self.name.clone(),
+            error: error.clone(),
+        });
+        self.sync_failures = self.sync_failures.saturating_add(1);
+        self.sync_retry_at = Some(Instant::now() + self.sync_backoff());
+        self.set_sync_state(WatchState::SyncError, None, Some(error));
+    }
+
+    /// Records a successful cycle: resets the failure backoff and clears a
+    /// standing [`Conflicted`](WatchState::Conflicted)/[`SyncError`](WatchState::SyncError)
+    /// back to `Ok`. A no-op when the watch is already `Ok`.
+    fn sync_succeeded(&mut self) {
+        self.sync_failures = 0;
+        self.sync_retry_at = None;
+        self.set_sync_state(WatchState::Ok, None, Some("sync succeeded".into()));
+    }
+
+    /// The backoff before the next sync re-attempt: `base * 2^(failures-1)`,
+    /// capped at [`EngineConfig::sync_backoff_cap`]. `failures` is at least one
+    /// here (this is only consulted after a failure).
+    fn sync_backoff(&self) -> Duration {
+        let shift = self.sync_failures.saturating_sub(1).min(20);
+        let factor = 2u32.saturating_pow(shift);
+        self.cfg
+            .sync_backoff_base
+            .checked_mul(factor)
+            .unwrap_or(self.cfg.sync_backoff_cap)
+            .min(self.cfg.sync_backoff_cap)
+    }
+
+    /// Emits [`Event::SyncPulled`] for an advance that integrated remote changes.
+    fn emit_sync_pulled(&self, prev_ref: String, new_ref: String) {
+        self.bus.emit(Event::SyncPulled {
+            watch: self.name.clone(),
+            prev_ref,
+            new_ref,
+        });
+    }
+
+    /// Emits [`Event::SyncPushed`] for commits the remote received.
+    fn emit_sync_pushed(&self, new_ref: String, commits: usize) {
+        self.bus.emit(Event::SyncPushed {
+            watch: self.name.clone(),
+            new_ref,
+            commits,
+        });
+    }
+}
+
+/// Whether `state` is owned by the sync cycle — a state only the sync cycle may
+/// set or clear ([`Conflicted`](WatchState::Conflicted) latches until a manual
+/// resolving cycle succeeds; [`SyncError`](WatchState::SyncError) self-clears on
+/// the next successful cycle). A snapshot/trouble transition never clobbers one
+/// (see [`Worker::set_state`]).
+fn is_sync_owned(state: WatchState) -> bool {
+    matches!(state, WatchState::Conflicted | WatchState::SyncError)
+}
+
+/// The outcome of one [`Worker::sync_once`] pass, folded into state and retry
+/// decisions by [`Worker::run_sync_cycle`].
+enum SyncStep {
+    /// Fetch showed nothing to pull and nothing to push.
+    NothingToDo,
+    /// The cycle completed (pushed, or the push was already up to date).
+    Done,
+    /// Reconcile hit a conflict: the watch latches `Conflicted`.
+    Conflict,
+    /// The push lost a fast-forward race: re-run the cycle (capped).
+    RaceLost,
+    /// The op gate was busy: re-attempt on the short gate-busy cadence.
+    GateBusy,
+    /// A network, gate, or reconcile step failed (message ready to surface).
+    Failed(String),
+}
+
+/// The outcome of the locked reconcile+advance window ([`run_locked_window`]).
+enum LockedResult {
+    /// Reconcile ran and (if it moved remote changes in) advanced. `pulled` is
+    /// `Some((prev_ref, new_ref))` when the advance integrated remote commits,
+    /// `None` when there was nothing upstream to integrate. `tip` is the branch
+    /// tip after the window, for the push event.
+    Reconciled {
+        /// The prev/new refs when remote changes were pulled in, else `None`.
+        pulled: Option<(String, String)>,
+        /// The branch tip after the window (the ref a push would send).
+        tip: String,
+    },
+    /// Reconcile hit a conflict; nothing advanced.
+    Conflict,
+    /// A step in the window failed (message ready to surface).
+    Failed(String),
+}
+
+/// Runs [`fetch`](VcsBackend::fetch) off the async runtime, timeout-bounded.
+/// Takes the backend by value (a cheap [`Arc`] clone) so the future stays
+/// `Send`. A backend panic is surfaced as an error message rather than aborting
+/// the worker task.
+async fn sync_fetch(backend: SharedBackend, timeout: Duration) -> Result<crate::vcs::RemoteState, String> {
+    match tokio::task::spawn_blocking(move || backend.fetch(timeout)).await {
+        Ok(Ok(remote)) => Ok(remote),
+        Ok(Err(err)) => Err(format!("fetch: {err}")),
+        Err(join) => Err(format!("fetch task panicked: {join}")),
+    }
+}
+
+/// Runs [`push`](VcsBackend::push) off the async runtime, timeout-bounded.
+async fn sync_push(backend: SharedBackend, timeout: Duration) -> Result<PushOutcome, String> {
+    match tokio::task::spawn_blocking(move || backend.push(timeout)).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(err)) => Err(format!("push: {err}")),
+        Err(join) => Err(format!("push task panicked: {join}")),
+    }
+}
+
+/// Runs the locked window — pre-sync snapshot → reconcile → advance — off the
+/// async runtime with the op `guard` **coupled to the blocking git work**
+/// exactly like the snapshot path: the guard moves into the blocking scope and
+/// is [`complete`](OpGuard::complete)d there on every non-panic outcome, so an
+/// async abort can never release the op lock mid-write. On a panic the guard is
+/// dropped release-only, leaving the journal `begin` (and any recorded advance
+/// target) as recovery evidence.
+///
+/// The advance target is recorded on the guard ([`record_advance_target`](OpGuard::record_advance_target))
+/// after reconcile and before advance, so a crash in that window is recoverable.
+/// A prior crashed cycle's leftover scratch worktree is pruned first, since
+/// reconcile requires the scratch path not to exist.
+async fn run_locked_window(
+    backend: SharedBackend,
+    scratch: PathBuf,
+    guard: Box<dyn OpGuard>,
+) -> LockedResult {
+    let joined = tokio::task::spawn_blocking(move || {
+        // Snapshot local first, always: commit any pending local work before the
+        // tree can be moved by advance. A no-op on a clean tree.
+        if let Err(err) = backend.snapshot(&SnapshotRequest::new(Trigger::PreSync)) {
+            guard.complete();
+            return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
+        }
+        // Clear any scratch worktree a prior crashed cycle left behind (reconcile
+        // requires the path not to exist). A no-op when absent.
+        let _ = backend.prune_scratch(&scratch);
+        let tip_before = current_tip(&backend).unwrap_or_default();
+        match backend.reconcile(&scratch) {
+            Ok(ReconcileOutcome::Rebased { new_head }) => {
+                if let Err(err) = guard.record_advance_target(new_head.as_str()) {
+                    // Could not durably record where the tree is about to land;
+                    // advancing anyway would be unrecoverable on a crash. Fail
+                    // closed, leaving a clean record.
+                    guard.complete();
+                    return LockedResult::Failed(format!("recording advance target: {err}"));
+                }
+                match backend.advance(&new_head) {
+                    Ok(()) => {
+                        guard.complete();
+                        LockedResult::Reconciled {
+                            pulled: Some((tip_before, new_head.to_string())),
+                            tip: new_head.to_string(),
+                        }
+                    }
+                    Err(err) => {
+                        guard.complete();
+                        LockedResult::Failed(format!("advance: {err}"))
+                    }
+                }
+            }
+            Ok(ReconcileOutcome::AlreadyUpToDate) => {
+                guard.complete();
+                LockedResult::Reconciled {
+                    pulled: None,
+                    tip: tip_before,
+                }
+            }
+            Ok(ReconcileOutcome::Conflict) => {
+                guard.complete();
+                LockedResult::Conflict
+            }
+            Err(err) => {
+                guard.complete();
+                LockedResult::Failed(format!("reconcile: {err}"))
+            }
+        }
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        Err(join) => LockedResult::Failed(format!("sync task panicked: {join}")),
+    }
+}
+
+/// The branch tip's id via a one-entry `log`, or `None` on any error/empty
+/// history. Cheap, non-network, and read-only — used to fill the sync events'
+/// ref fields.
+fn current_tip(backend: &SharedBackend) -> Option<String> {
+    backend
+        .log(&LogFilter {
+            since: None,
+            until: None,
+            limit: Some(1),
+        })
+        .ok()
+        .and_then(|entries| entries.into_iter().next())
+        .map(|snap| snap.id.to_string())
 }
 
 /// Runs [`is_safe_state`](VcsBackend::is_safe_state) off the async runtime.
@@ -1184,6 +1723,11 @@ impl Engine {
                 None
             };
 
+            // Sync runs only when the watch opts in AND a scratch directory was
+            // injected for the out-of-tree reconcile (vard-core resolves none).
+            let scratch_dir = cw.spec.scratch_dir().map(|p| p.to_path_buf());
+            let sync_enabled = cw.spec.sync() && scratch_dir.is_some();
+
             let worker = Worker {
                 name,
                 backend: cw.backend,
@@ -1199,6 +1743,11 @@ impl Engine {
                 retry: None,
                 retry_attempts: 0,
                 retry_exhausted: false,
+                sync_enabled,
+                scratch_dir,
+                sync_pending: None,
+                sync_failures: 0,
+                sync_retry_at: None,
             };
             prepared.push((worker, rx));
         }
@@ -1300,6 +1849,40 @@ impl EngineHandle {
     pub fn trigger(&self, watch: &str) -> bool {
         match self.routes.get(watch) {
             Some(tx) => tx.send(WatchInput::Trigger(Provenance::manual())).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Requests a **manual** sync cycle for the named watch: fetch, reconcile
+    /// out of tree, advance, and push, on the watch's serialized worker (so it
+    /// never overlaps a snapshot). This is the explicit user/CLI verb — it
+    /// attempts even a watch latched [`Conflicted`](WatchState::Conflicted), to
+    /// pick up a resolution the user just made.
+    ///
+    /// A watch that cannot sync — [`WatchSpec::sync`] is `false`, or no
+    /// [`scratch_dir`](WatchSpec::scratch_dir) was injected — accepts the
+    /// request and does nothing.
+    ///
+    /// Returns `true` if the watch exists and the request was delivered; `false`
+    /// if no watch by that name is configured (or its worker has stopped).
+    /// Fire-and-forget: the outcome arrives later on the event bus
+    /// ([`Event::SyncPushed`]/[`Event::SyncPulled`]/[`Event::SyncConflict`]/[`Event::SyncFailed`]).
+    pub fn request_sync(&self, watch: &str) -> bool {
+        self.deliver_sync(watch, true)
+    }
+
+    /// Requests an **automatic** sync cycle for the named watch (the cadence a
+    /// future interval timer or post-snapshot trigger uses). Identical to
+    /// [`request_sync`](Self::request_sync) except it is **suppressed while the
+    /// watch is [`Conflicted`](WatchState::Conflicted)** — auto-sync stops for a
+    /// conflicted watch until a manual request resolves it.
+    pub fn request_auto_sync(&self, watch: &str) -> bool {
+        self.deliver_sync(watch, false)
+    }
+
+    fn deliver_sync(&self, watch: &str, manual: bool) -> bool {
+        match self.routes.get(watch) {
+            Some(tx) => tx.send(WatchInput::RequestSync { manual }).is_ok(),
             None => false,
         }
     }
@@ -1583,6 +2166,27 @@ impl EngineBuilder {
     /// [`DEFAULT_SHUTDOWN_DRAIN_TIMEOUT`]).
     pub fn shutdown_drain_timeout(mut self, timeout: Duration) -> Self {
         self.cfg.shutdown_drain_timeout = timeout;
+        self
+    }
+
+    /// Sets the per-step timeout for the sync cycle's network ops (default
+    /// [`DEFAULT_SYNC_NETWORK_TIMEOUT`]).
+    pub fn sync_network_timeout(mut self, timeout: Duration) -> Self {
+        self.cfg.sync_network_timeout = timeout;
+        self
+    }
+
+    /// Sets the base delay of the sync failure backoff (default
+    /// [`DEFAULT_SYNC_BACKOFF_BASE`]). Mainly for deterministic tests.
+    pub fn sync_backoff_base(mut self, base: Duration) -> Self {
+        self.cfg.sync_backoff_base = base;
+        self
+    }
+
+    /// Sets the cap on the sync failure backoff (default
+    /// [`DEFAULT_SYNC_BACKOFF_CAP`]). Mainly for deterministic tests.
+    pub fn sync_backoff_cap(mut self, cap: Duration) -> Self {
+        self.cfg.sync_backoff_cap = cap;
         self
     }
 
@@ -2051,6 +2655,11 @@ mod tests {
             retry: None,
             retry_attempts: 0,
             retry_exhausted: false,
+            sync_enabled: false,
+            scratch_dir: None,
+            sync_pending: None,
+            sync_failures: 0,
+            sync_retry_at: None,
         };
         tokio::spawn(worker.run(rx));
         (tx, events, counter)
@@ -2064,6 +2673,9 @@ mod tests {
             unsafe_repoll_max_attempts: 480,
             shutdown_drain_timeout: Duration::from_secs(30),
             gate_busy_retry_interval: Duration::from_millis(500),
+            sync_network_timeout: Duration::from_secs(60),
+            sync_backoff_base: Duration::from_secs(60),
+            sync_backoff_cap: Duration::from_secs(60 * 60),
         }
     }
 
