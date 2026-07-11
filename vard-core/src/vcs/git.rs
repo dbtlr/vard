@@ -632,29 +632,18 @@ impl VcsBackend for GitBackend {
                 // The branch does not exist on the remote: a normal state — it
                 // was never pushed, or it was deleted remotely. Everything
                 // local is "ahead" (the next push [re]creates it); there is
-                // nothing to be behind.
-                //
-                // Prune any STALE tracking ref a prior fetch left (the
-                // deleted-remote-branch case): git does not remove it for a
-                // single-refspec fetch, and leaving it would make every
-                // local-only read against the tracking ref
-                // ([`upstream_status`](VcsBackend::upstream_status), and the
-                // push-time commit count built on it) disagree with the truth
-                // the remote just reported. Best-effort: a ref that is already
-                // absent (the common first-push case) is a no-op.
-                if before.is_some() {
-                    let _ = git_output(
-                        &self.path,
-                        &[],
-                        ["update-ref", "-d", tracking.as_str()],
-                        false,
-                    );
-                }
+                // nothing to be behind. `upstream_missing` carries the fact so
+                // callers know a locally-readable tracking ref may be a stale
+                // pre-deletion leftover: this lock-free path deliberately
+                // mutates NO refs (no prune — a ref deletion would run user
+                // reference-transaction hooks from the daemon and race
+                // concurrent user fetches and a peer's locked reconcile).
                 let ahead = self.commit_count(&format!("refs/heads/{}", self.branch))?;
                 return Ok(RemoteState {
                     remote_moved: false,
                     ahead,
                     behind: 0,
+                    upstream_missing: true,
                 });
             }
             return Err(classify_failure("fetch", &out));
@@ -678,6 +667,7 @@ impl VcsBackend for GitBackend {
             remote_moved,
             ahead,
             behind,
+            upstream_missing: false,
         })
     }
 

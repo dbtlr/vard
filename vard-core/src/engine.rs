@@ -121,12 +121,14 @@
 //! watch, and a clean ahead-only push, never touch the gate — a foreign op-lock
 //! holder cannot fail work that needs no lock. A busy gate defers on a short
 //! cadence with the pre-flight cached: while the holder wedges, the paced
-//! retries stay LOCAL-ONLY (zero network I/O) — each re-derives whether the
-//! locked work still exists (a watch hand-resolved mid-wait terminates
-//! up-to-date without ever taking the gate) and otherwise probes only the
-//! gate. The cache's freshness is judged once, at gate acquisition — still
-//! fresh proceeds on it, stale costs exactly one fresh pre-flight. A stale
-//! rebase target is never a correctness
+//! retries probe only the gate (zero network I/O and zero subprocesses), and
+//! the cache's freshness is judged once, at gate acquisition — still fresh
+//! proceeds on it, stale costs exactly one fresh pre-flight. The wait
+//! deliberately does NOT re-evaluate whether the work still exists (a user who
+//! hand-resolves mid-wait re-runs after the bounded wait's honest "did not
+//! run"): a wedged gate is an abnormal state, and rare-edge honesty beats
+//! rare-edge cleverness that could report a false success against a stale
+//! tracking ref. A stale rebase target is never a correctness
 //! problem: a remote that moved past the cache surfaces as a non-fast-forward
 //! push, which re-runs the cycle with a fresh fetch.
 //! The op guard is coupled to that blocking
@@ -1782,12 +1784,11 @@ impl Worker {
     ///   with the gate never probed: a foreign/peer op-lock holder cannot fail
     ///   work that needs no lock.
     /// - **Waiting on a busy gate costs zero network I/O.** A retry arriving
-    ///   with a `cached` pre-flight re-derives, from LOCAL state only, whether
-    ///   the locked work still exists (a hand-resolved watch terminates
-    ///   up-to-date without the gate), then probes the gate and, while it stays
-    ///   busy, returns the cache untouched. The freshness TTL is consulted only
-    ///   at gate ACQUISITION: still fresh → the cycle proceeds on the cache;
-    ///   stale → exactly one fresh pre-flight, then proceed.
+    ///   with a `cached` pre-flight probes the gate FIRST and, while it stays
+    ///   busy, returns the cache untouched (no network, no subprocesses). The
+    ///   freshness TTL is consulted only at gate ACQUISITION: still fresh → the
+    ///   cycle proceeds on the cache; stale → exactly one fresh pre-flight,
+    ///   then proceed.
     /// - **The early exits cannot miss an edit saved during the fetch.** The
     ///   dirty check runs AFTER the fetch returns, so its answer postdates the
     ///   whole network window; the locked window's own pre-sync snapshot remains
@@ -1798,31 +1799,20 @@ impl Worker {
         cached: Option<CachedFetch>,
     ) -> SyncStep {
         // 0. Waiting phase: a retry carrying a cached pre-flight exists only
-        //    because locked work was needed and the gate was busy. Everything
-        //    here is LOCAL-ONLY (zero network), no matter how long the holder
-        //    wedges:
-        //
-        //    a. Re-derive whether locked work is STILL needed. A user may have
-        //       hand-resolved mid-wait (committed and pushed manually — .git-only
-        //       changes fire no watcher trigger, and a manual push updates the
-        //       tracking ref), in which case the request must terminate
-        //       up-to-date instead of waiting on a lock it no longer needs.
-        //       Best-effort: a backend that cannot answer keeps waiting.
-        //    b. Otherwise probe the gate; while busy, return the cache
-        //       untouched — pure lock-probing.
-        //    c. Once the gate looks free, judge the cache's freshness (only
-        //       now): fresh short-circuits the pre-flight; stale is dropped and
-        //       replaced by exactly one fresh pre-flight.
+        //    because locked work was needed and the gate was busy. Probe the
+        //    gate BEFORE anything else — while it stays busy the retry is pure
+        //    lock-probing (zero network AND zero subprocesses), no matter how
+        //    long the holder wedges. DECISION: the wait does NOT re-evaluate
+        //    whether the work still exists — a user who hand-resolves mid-wait
+        //    still gets the bounded wait's honest "did not run" and re-runs.
+        //    A wedged gate is an abnormal state; rare-edge honesty beats
+        //    rare-edge cleverness (a local re-evaluation could report a false
+        //    "up to date" against an arbitrarily stale tracking ref). Only once
+        //    the gate looks free is the cache's freshness judged: a fresh cache
+        //    short-circuits the pre-flight below; a stale one is dropped and
+        //    replaced by exactly one fresh pre-flight.
         let cached = match cached {
             Some(c) => {
-                if let (Ok(false), Some((0, 0))) = (
-                    sync_is_dirty(Arc::clone(&self.backend)).await,
-                    sync_upstream_status(Arc::clone(&self.backend)).await,
-                ) {
-                    // Clean tree, no local divergence from the tracking ref:
-                    // the work this request was waiting to do no longer exists.
-                    return SyncStep::NothingToDo;
-                }
                 if !self.gate.available() {
                     return SyncStep::GateBusy(c);
                 }
@@ -1875,10 +1865,17 @@ impl Worker {
             }
             // Count what this push actually sends at PUSH time when the backend
             // can (commits may have landed since the fetch); fall back to the
-            // fetch-time count.
-            let pushed = sync_upstream_status(Arc::clone(&self.backend))
-                .await
-                .map_or(remote.ahead, |(ahead, _)| ahead);
+            // fetch-time count. When the remote reported the branch MISSING
+            // (never pushed, or deleted remotely) the fetch-time count is the
+            // recreate-the-branch truth and a local tracking ref may be a stale
+            // pre-deletion leftover, so `upstream_status` must not be consulted.
+            let pushed = if remote.upstream_missing {
+                remote.ahead
+            } else {
+                sync_upstream_status(Arc::clone(&self.backend))
+                    .await
+                    .map_or(remote.ahead, |(ahead, _)| ahead)
+            };
             let tip = sync_current_tip(Arc::clone(&self.backend)).await;
             return self.push_step(tip, pushed, false).await;
         }
@@ -3555,6 +3552,7 @@ mod tests {
                     remote_moved: false,
                     ahead: 0,
                     behind: 0,
+                    upstream_missing: false,
                 }))
         }
 
@@ -3797,6 +3795,19 @@ mod tests {
             remote_moved: behind > 0,
             ahead,
             behind,
+            upstream_missing: false,
+        })
+    }
+
+    /// A scripted fetch result for a branch the remote reports MISSING (never
+    /// pushed, or deleted remotely): ahead by `ahead` (the full local history),
+    /// with the flag set so the cycle must not trust local tracking-ref reads.
+    fn remote_missing_upstream(ahead: usize) -> Result<crate::vcs::RemoteState, VcsError> {
+        Ok(crate::vcs::RemoteState {
+            remote_moved: false,
+            ahead,
+            behind: 0,
+            upstream_missing: true,
         })
     }
 
@@ -4741,55 +4752,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_hand_resolved_watch_terminates_up_to_date_without_the_gate() {
-        // Finding 1 (round 6): a user hand-resolves during a wedged-gate wait
-        // (commits + pushes manually — .git-only changes fire no trigger, and
-        // the manual push updates the tracking ref). The next paced retry
-        // re-derives work-needed from LOCAL state only and terminates UpToDate:
-        // no further fetch, and the gate is never acquired.
-        let backend = FakeBackend::new();
-        backend.set_dirty(true);
-        let gate = FakeGate::busy();
-        let (tx, _events) = spawn_sync_worker_with_gate(
-            Arc::clone(&backend),
-            test_cfg(),
-            Arc::clone(&gate) as SharedGate,
-        );
-
-        let (ack_tx, ack_rx) = oneshot::channel();
-        tx.send(WatchInput::RequestSync {
-            manual: true,
-            ack: Some(ack_tx),
-        })
-        .unwrap();
-        // First attempt: fetch once, locked work needed, gate busy, defer.
-        settle_until("the first attempt probed the gate", || gate.probes() >= 1).await;
-        assert_eq!(backend.fetch_calls(), 1);
-
-        // The user hand-resolves: clean tree, local branch == tracking ref.
-        backend.set_dirty(false);
-        backend.set_upstream_now(0, 0);
-
-        // The next paced retry detects the resolution locally and terminates.
-        tokio::time::advance(Duration::from_millis(600)).await;
-        let outcome = timeout(Duration::from_secs(30), ack_rx)
-            .await
-            .expect("the retry terminates the request")
-            .expect("the request resolves");
-        assert_eq!(
-            outcome,
-            SyncOutcome::UpToDate,
-            "a hand-resolved wait ends up-to-date, not did-not-run"
-        );
-        assert_eq!(
-            backend.fetch_calls(),
-            1,
-            "resolution detection is local-only"
-        );
-        assert_eq!(gate.begins(), 0, "the gate was never acquired");
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_failing_dirty_probe_fails_before_any_network_fetch() {
         // Finding 4 (round 6): a repository whose status cannot be read (a
         // corrupt index) must fail pre-network — never a full fetch on every
@@ -4882,6 +4844,41 @@ mod tests {
             ack_rx.await,
             Ok(SyncOutcome::Moved {
                 pushed: Some(3),
+                pulled: false
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_upstream_uses_the_fetch_time_count_not_the_stale_tracking_ref() {
+        // Deleted-remote-branch scenario, zero-mutation variant: the fetch
+        // reports the branch missing (upstream_missing), so the push count is
+        // the fetch-time ahead (full history — what the push recreates) and the
+        // stale local tracking ref (poisoned here via upstream_status) is never
+        // consulted. No ref is mutated outside a locked window.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote_missing_upstream(2)]);
+        // A stale tracking ref would claim ahead == 1; it must be ignored.
+        backend.set_upstream_now(1, 0);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        match advance_until_event(&mut events, Duration::from_millis(200)).await {
+            Event::SyncPushed { commits, .. } => {
+                assert_eq!(commits, 2, "the fetch-time full-history count is used");
+            }
+            other => panic!("expected SyncPushed, got {other:?}"),
+        }
+        assert_eq!(
+            ack_rx.await,
+            Ok(SyncOutcome::Moved {
+                pushed: Some(2),
                 pulled: false
             })
         );

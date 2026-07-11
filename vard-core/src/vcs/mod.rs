@@ -248,17 +248,15 @@ pub trait VcsBackend {
     /// `(ahead, behind)` as a cheap, local-only read (no network; the tracking
     /// ref reflects the last fetch, and a manual `git push` updates it too).
     ///
-    /// The sync engine uses it twice: the gate-free push resolves its commit
-    /// count at push time (so commits landing after the cycle's fetch are
-    /// counted), and a gate-busy wait re-derives whether locked work is still
-    /// needed without any network — a user who hand-resolved mid-wait
-    /// (committed and pushed manually) reads as clean and `(0, 0)` here, so
-    /// the request terminates up-to-date instead of waiting on a lock it no
-    /// longer needs.
+    /// The sync engine's gate-free push resolves its commit count from this at
+    /// push time, so commits landing after the cycle's fetch are counted —
+    /// EXCEPT when that fetch reported the upstream missing
+    /// ([`RemoteState::upstream_missing`]): the tracking ref may then be a
+    /// stale pre-deletion leftover, and the fetch-time count is used instead.
     ///
     /// Returns `Ok(None)` when the backend has no such notion (the default);
     /// callers must then fall back to their fetch-time knowledge. The values
-    /// are advisory (counts, wait short-circuits) — never a correctness gate.
+    /// are advisory (counts) — never a correctness gate.
     fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
         Ok(None)
     }
@@ -492,13 +490,21 @@ pub struct RestoreTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteState {
     /// The remote-tracking ref changed as a result of the fetch (new upstream
-    /// commits, or the upstream appeared for the first time).
+    /// commits, or the upstream appearing for the first time).
     pub remote_moved: bool,
     /// How many commits the local branch is ahead of the upstream (all of
     /// them, when the branch does not exist on the remote yet).
     pub ahead: usize,
     /// How many commits the local branch is behind the upstream.
     pub behind: usize,
+    /// The remote reported that the branch does not exist there (never pushed,
+    /// or deleted remotely). `ahead` is then the branch's full history — what
+    /// the next push (re)creates — and a locally-readable tracking ref may be a
+    /// STALE leftover from before the deletion: local reads against it
+    /// ([`VcsBackend::upstream_status`]) must not be trusted for this cycle.
+    /// The flag carries that truth instead of any ref being mutated outside a
+    /// locked window.
+    pub upstream_missing: bool,
 }
 
 /// The result of a single [`VcsBackend::reconcile`] attempt.

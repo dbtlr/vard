@@ -1072,11 +1072,14 @@ fn upstream_status_counts_commits_since_the_last_fetch() {
 }
 
 #[test]
-fn a_deleted_remote_branch_prunes_the_stale_tracking_ref_and_counts_full_history() {
+fn a_deleted_remote_branch_reports_upstream_missing_with_the_full_history_count() {
     // The remote branch is deleted after a normal synced state: the next fetch
-    // reports the missing remote ref AND prunes the stale tracking ref a prior
-    // fetch left, so the fetch-time count (ahead = full history, what the next
-    // push recreates) and every local-only read against the tracking ref agree.
+    // reports the missing remote ref via `upstream_missing`, with ahead = the
+    // FULL history (what the next push recreates). ZERO mutation: the stale
+    // tracking ref is deliberately left alone (deleting it from this lock-free
+    // path would run user reference-transaction hooks and race concurrent
+    // fetches); the flag is what tells callers not to trust local reads
+    // against it for this cycle.
     let fx = remote_fixture();
     // `b` synced at the base commit, tracking ref present. Add one local commit.
     write(&fx.b_path, "extra.txt", "x\n");
@@ -1087,24 +1090,21 @@ fn a_deleted_remote_branch_prunes_the_stale_tracking_ref_and_counts_full_history
     git_ok(fx._origin.path(), &["update-ref", "-d", "refs/heads/main"]);
 
     let state = fx.b.fetch(TEST_TIMEOUT).unwrap();
+    assert!(state.upstream_missing, "the deletion is reported as a fact");
     assert_eq!(
         (state.ahead, state.behind),
         (2, 0),
         "ahead is the FULL history the next push recreates (base + extra)"
     );
-    // The stale tracking ref is gone, so the local-only read agrees.
-    assert_eq!(
-        fx.b.upstream_status().unwrap(),
-        Some((2, 0)),
-        "the pruned tracking ref makes the push-time count match full history"
-    );
+    // The stale tracking ref is LEFT ALONE (no ref mutation outside a locked
+    // window) — the flag, not a prune, carries the truth.
     let out = git(
         &fx.b_path,
         &["rev-parse", "--verify", "refs/remotes/origin/main"],
     );
     assert!(
-        !out.status.success(),
-        "the stale tracking ref was pruned by the fetch"
+        out.status.success(),
+        "the stale tracking ref is deliberately not pruned"
     );
 }
 
