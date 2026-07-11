@@ -104,6 +104,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::config::{TriggerMode, WatchSpec};
 use crate::event::{Event, EventBus, EventReceiver, SkipReason, Trigger, TroubleKind, WatchState};
+use crate::gate::{SharedGate, default_gate};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
 use crate::vcs::git::GitBackend;
 use crate::vcs::{SafeState, SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError};
@@ -413,6 +414,12 @@ enum RetryKind {
 struct Worker {
     name: String,
     backend: SharedBackend,
+    /// The per-watch operation gate: every commit is admitted (op lock + journal
+    /// `begin`) through this before the backend runs and closed through the
+    /// returned guard, making one-writer-per-watch a structural invariant. The
+    /// standalone default is a no-op ([`default_gate`]); the daemon/CLI inject an
+    /// op-lock-backed gate.
+    gate: SharedGate,
     mute: MuteSource,
     // Kept only to hold the interval schedule armed for this worker's lifetime.
     _schedule: Option<ScheduleHandle>,
@@ -561,19 +568,47 @@ impl Worker {
                 }
             }
 
-            // The repository is safe and a backend commit is imminent. Announce
-            // it before the git write can begin so a bus subscriber can bracket
-            // the commit window (journal begin/complete). This fires per sweep,
+            // The repository is safe and a backend commit is imminent. Admit the
+            // operation through the gate FIRST: this acquires the watch's op lock
+            // and writes the journal `begin`, making this worker the sole writer
+            // for the commit window. A busy gate means another holder owns the
+            // watch right now (a second engine mid-reload, a CLI restore); requeue
+            // exactly like a contended index lock and wait for the next trigger,
+            // WITHOUT opening an event bracket (no `SnapshotStarted` was emitted,
+            // so nothing to close and the bracket invariant is preserved).
+            let guard = match self.gate.begin("snapshot") {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    self.pending = Some(coalesce(self.pending.take(), prov));
+                    return;
+                }
+                Err(err) => {
+                    // The gate itself could not be evaluated (op-lock or journal
+                    // I/O trouble). Preserve the change and converge it on the
+                    // bounded retry timer, surfacing the failure once — the same
+                    // discipline as a failed safe-state probe.
+                    self.pending = Some(prov.clone());
+                    self.enter_failure_msg(prov.trigger, format!("operation gate failed: {err}"));
+                    return;
+                }
+            };
+
+            // The commit window is open. Announce it before the git write can
+            // begin so a bus subscriber can bracket it. This fires per sweep,
             // including the bounded post-op re-check below, because each sweep is
             // its own commit window. INVARIANT: every arm below closes this
             // bracket with exactly one outcome event — `SnapshotCompleted`,
             // `SnapshotFailed`, or `SnapshotSkipped` — so a subscriber's record
-            // never dangles (see `Event::SnapshotStarted`).
+            // never dangles (see `Event::SnapshotStarted`). The `guard` closes the
+            // matching journal bracket: `complete` on every non-panic outcome,
+            // and a plain drop (release-only, no journal close) on a panic, whose
+            // dangling `begin` is the recovery evidence for the abandoned lock.
             self.emit_started(prov.trigger);
 
             match snapshot_with_retry(Arc::clone(&self.backend), self.cfg, &prov).await {
                 PassResult::Committed(outcome) => {
                     self.emit_completed(prov.trigger, &outcome);
+                    guard.complete();
                     // A commit means any prior retry has converged.
                     self.clear_retry();
                     // A successful commit clears a snapshots-failing (or blocked)
@@ -601,6 +636,7 @@ impl Worker {
                     // bracket, then clear any retry so a prior failure episode
                     // does not keep ticking.
                     self.emit_skipped(prov.trigger, SkipReason::Clean);
+                    guard.complete();
                     self.clear_retry();
                     // Skip-to-clean also clears a snapshots-failing state: the
                     // pending change resolved (committed or reverted elsewhere),
@@ -610,8 +646,10 @@ impl Worker {
                 PassResult::Unsafe(reason) => {
                     // The repo turned unsafe between the probe and the commit:
                     // no commit was made, so the bracket closes as skipped (the
-                    // pause itself travels as `WatchStateChanged`).
+                    // pause itself travels as `WatchStateChanged`). git wrote
+                    // nothing, so the journal bracket closes cleanly.
                     self.emit_skipped(prov.trigger, SkipReason::Unsafe);
+                    guard.complete();
                     self.pending = Some(prov);
                     self.enter_unsafe(reason);
                     return;
@@ -620,6 +658,7 @@ impl Worker {
                     // Never delete a foreign lock: requeue and try again on the
                     // next trigger. Nothing was committed, so close the bracket.
                     self.emit_skipped(prov.trigger, SkipReason::LockContended);
+                    guard.complete();
                     self.pending = Some(coalesce(self.pending.take(), prov));
                     return;
                 }
@@ -631,15 +670,23 @@ impl Worker {
                     // episode closes this pass's bracket as skipped instead
                     // (checked here, before `enter_failure` mutates the retry
                     // state), so the bracket invariant holds without a per-tick
-                    // failure storm.
+                    // failure storm. A hard git failure cleans up its own lock, so
+                    // the journal bracket closes cleanly.
                     self.pending = Some(prov.clone());
                     if self.retry == Some(RetryKind::Failure) {
                         self.emit_skipped(prov.trigger, SkipReason::RetryStillFailing);
                     }
+                    guard.complete();
                     self.enter_failure(prov.trigger, &err);
                     return;
                 }
                 PassResult::Panicked(detail) => {
+                    // The blocking commit unwound: it may have left a git
+                    // `index.lock` behind. Drop `guard` WITHOUT completing it —
+                    // release-only, so the journal `begin` stays dangling as the
+                    // recovery evidence for that abandoned lock. Writing a close
+                    // here would destroy it (see the gate module docs).
+                    drop(guard);
                     self.on_backend_panic(prov.trigger, &detail);
                     return;
                 }
@@ -714,14 +761,22 @@ impl Worker {
     /// repeat failure inside the episode does not re-emit
     /// [`Event::WatchStateChanged`].
     fn enter_failure(&mut self, trigger: Trigger, err: &VcsError) {
+        self.enter_failure_msg(trigger, err.to_string());
+    }
+
+    /// [`enter_failure`](Self::enter_failure) for a failure whose message is not
+    /// a [`VcsError`] — a gate-evaluation failure (op-lock/journal I/O trouble)
+    /// that has no backend error to carry. Same once-per-episode surfacing and
+    /// snapshots-failing state.
+    fn enter_failure_msg(&mut self, trigger: Trigger, msg: String) {
         if self.retry != Some(RetryKind::Failure) {
-            self.emit_failed(trigger, err);
+            self.emit_failed_error(trigger, msg.clone());
         }
         self.retry = Some(RetryKind::Failure);
         self.set_state(
             WatchState::Attention,
             Some(TroubleKind::SnapshotsFailing),
-            Some(err.to_string()),
+            Some(msg),
         );
     }
 
@@ -782,11 +837,6 @@ impl Worker {
             files_changed: outcome.summary.total(),
             trigger,
         });
-    }
-
-    /// Emits [`Event::SnapshotFailed`] for a failed attempt.
-    fn emit_failed(&self, trigger: Trigger, err: &VcsError) {
-        self.emit_failed_error(trigger, err.to_string());
     }
 
     /// Emits [`Event::SnapshotFailed`] with a raw error message (for conditions
@@ -915,10 +965,12 @@ pub struct Engine {
     cfg: EngineConfig,
 }
 
-/// One watch paired with the backend it snapshots through.
+/// One watch paired with the backend it snapshots through and the operation
+/// gate that admits its mutations.
 struct ConfiguredWatch {
     spec: WatchSpec,
     backend: SharedBackend,
+    gate: SharedGate,
 }
 
 impl Engine {
@@ -1007,6 +1059,7 @@ impl Engine {
             let worker = Worker {
                 name,
                 backend: cw.backend,
+                gate: cw.gate,
                 mute,
                 _schedule: schedule,
                 bus: bus.clone(),
@@ -1261,9 +1314,17 @@ async fn dispatch_scheduler(
     }
 }
 
-/// A watch queued into an [`EngineBuilder`], with how its backend is obtained.
-enum PendingWatch {
-    /// Build a [`GitBackend`] from the spec at [`build`](EngineBuilder::build).
+/// A watch queued into an [`EngineBuilder`]: how its backend is obtained, plus
+/// the operation gate that admits its mutations (the injected op-lock seam, or
+/// the standalone [`default_gate`]).
+struct PendingWatch {
+    source: BackendSource,
+    gate: SharedGate,
+}
+
+/// How a [`PendingWatch`]'s backend is obtained at [`build`](EngineBuilder::build).
+enum BackendSource {
+    /// Build a [`GitBackend`] from the spec.
     Git(WatchSpec),
     /// Use the caller-supplied backend.
     Backend(WatchSpec, SharedBackend),
@@ -1272,8 +1333,8 @@ enum PendingWatch {
 impl PendingWatch {
     /// The watch's stable name.
     fn name(&self) -> &str {
-        match self {
-            PendingWatch::Git(spec) | PendingWatch::Backend(spec, _) => spec.name(),
+        match &self.source {
+            BackendSource::Git(spec) | BackendSource::Backend(spec, _) => spec.name(),
         }
     }
 }
@@ -1306,7 +1367,22 @@ impl EngineBuilder {
     /// [`WatchSpec::branch`], or is adopted from the repository's current branch
     /// when unset (spec §3 branch policy).
     pub fn watch(mut self, spec: WatchSpec) -> Self {
-        self.watches.push(PendingWatch::Git(spec));
+        self.watches.push(PendingWatch {
+            source: BackendSource::Git(spec),
+            gate: default_gate(),
+        });
+        self
+    }
+
+    /// Adds a git-backed watch whose mutations are admitted through an injected
+    /// operation `gate` (the `vard` daemon's per-watch op lock + journal), rather
+    /// than the standalone no-op default. Otherwise identical to
+    /// [`watch`](Self::watch).
+    pub fn watch_with_gate(mut self, spec: WatchSpec, gate: SharedGate) -> Self {
+        self.watches.push(PendingWatch {
+            source: BackendSource::Git(spec),
+            gate,
+        });
         self
     }
 
@@ -1316,7 +1392,26 @@ impl EngineBuilder {
     /// the engine with a fake. The backend must be `Send + Sync` because the
     /// worker calls it from a blocking task (see [`SharedBackend`]).
     pub fn watch_with_backend(mut self, spec: WatchSpec, backend: SharedBackend) -> Self {
-        self.watches.push(PendingWatch::Backend(spec, backend));
+        self.watches.push(PendingWatch {
+            source: BackendSource::Backend(spec, backend),
+            gate: default_gate(),
+        });
+        self
+    }
+
+    /// [`watch_with_backend`](Self::watch_with_backend) with an injected operation
+    /// `gate` — for tests that need to drive the gate-busy / gate-error paths with
+    /// a fake gate alongside a fake backend.
+    pub fn watch_with_backend_and_gate(
+        mut self,
+        spec: WatchSpec,
+        backend: SharedBackend,
+        gate: SharedGate,
+    ) -> Self {
+        self.watches.push(PendingWatch {
+            source: BackendSource::Backend(spec, backend),
+            gate,
+        });
         self
     }
 
@@ -1379,9 +1474,14 @@ impl EngineBuilder {
 
         let mut watches = Vec::with_capacity(self.watches.len());
         for pending in self.watches {
-            let cw = match pending {
-                PendingWatch::Backend(spec, backend) => ConfiguredWatch { spec, backend },
-                PendingWatch::Git(spec) => {
+            let PendingWatch { source, gate } = pending;
+            let cw = match source {
+                BackendSource::Backend(spec, backend) => ConfiguredWatch {
+                    spec,
+                    backend,
+                    gate,
+                },
+                BackendSource::Git(spec) => {
                     let backend =
                         open_git_backend(&spec).map_err(|source| EngineError::Backend {
                             watch: spec.name().to_string(),
@@ -1390,6 +1490,7 @@ impl EngineBuilder {
                     ConfiguredWatch {
                         spec,
                         backend: Arc::new(backend),
+                        gate,
                     }
                 }
             };
@@ -1693,12 +1794,86 @@ mod tests {
         }
     }
 
+    /// A scriptable [`OpGate`] for driving the worker's admission paths: it can
+    /// admit (the default), report busy, or fail, and counts how many times it
+    /// was asked to begin.
+    struct FakeGate {
+        admit: std::sync::atomic::AtomicBool,
+        fail: std::sync::atomic::AtomicBool,
+        begins: AtomicUsize,
+    }
+
+    impl FakeGate {
+        /// A gate that reports busy on every `begin` until [`admit`](Self::admit).
+        fn busy() -> Arc<FakeGate> {
+            Arc::new(FakeGate {
+                admit: std::sync::atomic::AtomicBool::new(false),
+                fail: std::sync::atomic::AtomicBool::new(false),
+                begins: AtomicUsize::new(0),
+            })
+        }
+
+        /// A gate that returns an error on every `begin`.
+        fn failing() -> Arc<FakeGate> {
+            Arc::new(FakeGate {
+                admit: std::sync::atomic::AtomicBool::new(false),
+                fail: std::sync::atomic::AtomicBool::new(true),
+                begins: AtomicUsize::new(0),
+            })
+        }
+
+        fn admit(&self) {
+            self.admit.store(true, Ordering::SeqCst);
+        }
+
+        fn begins(&self) -> usize {
+            self.begins.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::gate::OpGate for FakeGate {
+        fn begin(
+            &self,
+            _op: &str,
+        ) -> Result<Option<Box<dyn crate::gate::OpGuard>>, crate::gate::OpGateError> {
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(crate::gate::OpGateError::new("scripted gate failure"));
+            }
+            if self.admit.load(Ordering::SeqCst) {
+                Ok(Some(Box::new(FakeGuard)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    struct FakeGuard;
+    impl crate::gate::OpGuard for FakeGuard {
+        fn complete(self: Box<Self>) {}
+    }
+
     /// Spawns a worker driven directly by an injected input channel and a fake
     /// backend, bypassing the real watcher/scheduler for determinism. Returns
-    /// the input sender, an event subscriber, and the shared mute counter.
+    /// the input sender, an event subscriber, and the shared mute counter. Uses
+    /// the standalone no-op gate.
     fn spawn_worker(
         backend: Arc<FakeBackend>,
         cfg: EngineConfig,
+    ) -> (
+        mpsc::UnboundedSender<WatchInput>,
+        EventReceiver,
+        Arc<AtomicUsize>,
+    ) {
+        spawn_worker_with_gate(backend, cfg, default_gate())
+    }
+
+    /// [`spawn_worker`] with an injected operation gate, for the gate-busy /
+    /// gate-error admission paths.
+    fn spawn_worker_with_gate(
+        backend: Arc<FakeBackend>,
+        cfg: EngineConfig,
+        gate: SharedGate,
     ) -> (
         mpsc::UnboundedSender<WatchInput>,
         EventReceiver,
@@ -1711,6 +1886,7 @@ mod tests {
         let worker = Worker {
             name: "w".to_string(),
             backend: backend as SharedBackend,
+            gate,
             mute: MuteSource::Counter(Arc::clone(&counter)),
             _schedule: None,
             bus,
@@ -2299,6 +2475,96 @@ mod tests {
         assert_eq!(backend.snapshot_calls(), cfg.lock_retry_attempts as usize);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn gate_busy_requeues_without_snapshotting_then_proceeds_when_free() {
+        // A busy gate (another holder owns the watch's op lock) must requeue like
+        // a contended index lock: no backend call, and — crucially — no event
+        // bracket opened (nothing to close). Once the gate frees, a fresh trigger
+        // drives the preserved change to a commit.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let gate = FakeGate::busy();
+        let (tx, mut events, _counter) =
+            spawn_worker_with_gate(Arc::clone(&backend), test_cfg(), Arc::clone(&gate) as SharedGate);
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // Let the worker run: the gate refuses, so nothing commits and no outcome
+        // (or Started bracket) is emitted.
+        for _ in 0..20 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        settle().await;
+        assert_eq!(
+            backend.snapshot_calls(),
+            0,
+            "a busy gate must block the backend commit entirely"
+        );
+        assert!(
+            gate.begins() >= 1,
+            "the worker must have consulted the gate"
+        );
+        let mut seen: Vec<Event> = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            seen.push(ev);
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, Event::SnapshotStarted { .. })),
+            "a busy gate opens no bracket: {seen:?}"
+        );
+        assert_brackets_balanced(&seen);
+
+        // The gate frees; a fresh trigger drives the preserved change to a commit.
+        gate.admit();
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "once the gate frees, the requeued change commits, got {ev:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_error_is_surfaced_and_retried_like_a_failed_probe() {
+        // A gate that cannot even be evaluated (op-lock/journal I/O trouble)
+        // preserves the pending change and surfaces one SnapshotFailed +
+        // snapshots-failing state, exactly like a failed safe-state probe — never
+        // a silent unbracketed mutation.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let gate = FakeGate::failing();
+        let (tx, mut events, _counter) =
+            spawn_worker_with_gate(Arc::clone(&backend), test_cfg(), gate as SharedGate);
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotFailed { .. }),
+            "a gate-evaluation failure is surfaced, got {ev:?}"
+        );
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SnapshotsFailing),
+                    ..
+                }
+            ),
+            "a gate failure surfaces as snapshots-failing, got {ev:?}"
+        );
+        assert_eq!(
+            backend.snapshot_calls(),
+            0,
+            "a gate that never admits must never let the backend mutate"
+        );
+    }
+
     /// Counts [`Event::SnapshotFailed`] drained so far without blocking.
     fn drain_failures(events: &mut EventReceiver) -> usize {
         let mut n = 0;
@@ -2783,6 +3049,25 @@ mod tests {
                 ..
             }
         ));
+
+        // Wait until the pause is genuinely *retry-driven* before flipping to
+        // safe: the startup probe emits Paused up front (safe_call 1), and the
+        // trigger's own pass re-checks (safe_call 2) and arms the UnsafePause
+        // retry — but if we flipped to safe before that pass ran, its check would
+        // see Safe directly and never arm the retry, so the resume-to-Ok this test
+        // pins down could not happen. A retry *tick* re-checking (safe_call 3)
+        // only occurs once the retry is armed, so it is the reliable signal.
+        for _ in 0..500 {
+            settle().await;
+            if backend.safe_calls() >= 3 {
+                break;
+            }
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        assert!(
+            backend.safe_calls() >= 3,
+            "the unsafe pause must be retry-driven before the safe flip"
+        );
 
         // The repo returns to safe; the pause resolves (Paused->Ok) and the
         // snapshot then fails. Scan to the failure, tolerating the intermediate

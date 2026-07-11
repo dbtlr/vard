@@ -17,6 +17,7 @@
 pub mod config;
 pub mod engine;
 pub mod event;
+pub mod gate;
 pub mod excludes;
 pub mod scheduler;
 pub mod timefmt;
@@ -37,6 +38,7 @@ pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, SkipReason, Trigger,
     TroubleKind, TryRecvError, WatchState,
 };
+pub use gate::{NoOpGate, OpGate, OpGateError, OpGuard, SharedGate};
 pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
 pub use vcs::git::GitBackend;
 pub use vcs::{
