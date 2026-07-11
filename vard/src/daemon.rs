@@ -2217,20 +2217,39 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reload_detects_a_second_same_tick_config_edit_by_content() {
-        // VRD-15's review: an mtime-only debounce can settle on a value and
-        // then silently ignore a later edit that happens to land on the exact
-        // same (coarse, 1-second) mtime. Pin two content-different writes to
-        // the identical mtime and confirm the second is still detected —
-        // proof the poll's "did it change?" predicate now keys off content.
+        // Found in VRD-15's review, fixed as VRD-35: an mtime-only debounce
+        // can settle on a value and then silently ignore a later edit that
+        // happens to land on the exact same (coarse, 1-second) mtime. Pin two
+        // content-different writes to the identical mtime and confirm the
+        // second is still detected — proof the poll's "did it change?"
+        // predicate keys off content.
+        //
+        // Detection of edit B is observed DETERMINISTICALLY, never by a blind
+        // sleep: edit B both pauses `w` and activates a sentinel watch `s`
+        // that no earlier engine ever had active, so a commit landing in `s`'s
+        // repo (poll-with-deadline via `wait_for_commits`) can only come from
+        // the engine built from edit B's content. Drain-and-rebuild joins the
+        // old engine before starting the new one, and the new engine excludes
+        // the re-paused `w` structurally, so once `s` commits, nothing is
+        // supervising `w` and the no-new-commit assertion cannot race.
         let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        init_repo(&repo);
+        let w_repo = root.path().join("w-repo");
+        let s_repo = root.path().join("s-repo");
+        init_repo(&w_repo);
+        init_repo(&s_repo);
         let state = root.path().join("state");
         let config_file = root.path().join("config.toml");
-        let idle = format!(
-            "version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"200ms\"\npaused = true\n",
+        let watch_toml = |name: &str, repo: &Path, paused: bool| {
+            format!(
+                "[[watch]]\nname = \"{name}\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"200ms\"\npaused = {paused}\n"
+            )
+        };
+        let all_paused = format!(
+            "version = 1\n\n{}\n{}",
+            watch_toml("w", &w_repo, true),
+            watch_toml("s", &s_repo, true)
         );
-        std::fs::write(&config_file, &idle).unwrap();
+        std::fs::write(&config_file, &all_paused).unwrap();
 
         let paths = DaemonPaths {
             config_file: config_file.clone(),
@@ -2240,6 +2259,7 @@ mod tests {
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
+        let health_file = paths.health_file.clone();
 
         let shutdown = Arc::new(Notify::new());
         let reload = Arc::new(Notify::new());
@@ -2252,41 +2272,63 @@ mod tests {
             Duration::from_millis(150),
         ));
 
-        // Let startup settle into the idle engine.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait (with deadline) for the supervise loop's startup health write:
+        // it happens after the initial config fingerprint is captured, so once
+        // the file exists, edit A below is guaranteed to register as a change.
+        for i in 0..200 {
+            if health_file.exists() {
+                break;
+            }
+            assert!(i < 199, "daemon never reached its supervise loop");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-        // Edit A activates the watch. Pin its mtime to a fixed instant.
+        // Edit A activates `w` (sentinel stays paused). Pin its mtime to a
+        // fixed instant.
         let same_tick = SystemTime::now();
-        let active = format!(
-            "version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"200ms\"\npaused = false\n",
+        let edit_a = format!(
+            "version = 1\n\n{}\n{}",
+            watch_toml("w", &w_repo, false),
+            watch_toml("s", &s_repo, true)
         );
-        std::fs::write(&config_file, &active).unwrap();
+        std::fs::write(&config_file, &edit_a).unwrap();
         set_mtime(&config_file, same_tick);
 
-        // The one-cycle debounce settles over two poll ticks and the watch
-        // goes live; a write now reaches a commit.
-        let note = repo.join("note.md");
-        std::fs::write(&note, b"first").unwrap();
-        wait_for_commits(&repo, 2, Some(&note)).await;
+        // Edit A's reload is proven complete when `w` snapshots a write.
+        let w_note = w_repo.join("note.md");
+        std::fs::write(&w_note, b"first").unwrap();
+        wait_for_commits(&w_repo, 2, Some(&w_note)).await;
 
-        // Edit B re-pauses the watch: different content, but pinned to the
-        // SAME mtime as edit A — simulating two back-to-back CLI writes
-        // landing in one mtime tick on a coarse filesystem.
-        std::fs::write(&config_file, &idle).unwrap();
+        // Edit B re-pauses `w` and activates the sentinel `s`: different
+        // content, but pinned to the SAME mtime as edit A — simulating two
+        // back-to-back CLI writes landing in one mtime tick on a coarse
+        // filesystem.
+        let edit_b = format!(
+            "version = 1\n\n{}\n{}",
+            watch_toml("w", &w_repo, true),
+            watch_toml("s", &s_repo, false)
+        );
+        std::fs::write(&config_file, &edit_b).unwrap();
         set_mtime(&config_file, same_tick);
 
-        // Give the debounce two more poll cycles to settle on the new content,
-        // plus slack for the reload's drain-and-rebuild to finish.
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        // The deterministic reload-complete signal: only the engine built from
+        // edit B's content has `s` active, so this commit proves edit B was
+        // detected despite the unchanged mtime. An mtime-only debounce would
+        // hang here (and the harness would panic at its deadline).
+        let s_note = s_repo.join("note.md");
+        std::fs::write(&s_note, b"sentinel").unwrap();
+        wait_for_commits(&s_repo, 2, Some(&s_note)).await;
 
-        // Prove the daemon really went idle again: a further write must NOT
-        // produce a new commit. An mtime-only debounce would have missed edit
-        // B (same mtime as the already-settled edit A) and kept snapshotting.
-        let before = commit_count(&repo);
-        std::fs::write(&note, b"second").unwrap();
+        // The same reload structurally dropped `w` from the engine, so a
+        // further write must not produce a commit. The grace period only
+        // strengthens the check (a wrongly-live watch would need its 200ms
+        // quiesce to commit); the reload itself was already proven above, so
+        // this cannot flake into a false failure.
+        let before = commit_count(&w_repo);
+        std::fs::write(&w_note, b"second").unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
-            commit_count(&repo),
+            commit_count(&w_repo),
             before,
             "edit B (same mtime as edit A, different content) must still be \
              detected and re-pause the watch"
