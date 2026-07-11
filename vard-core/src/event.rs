@@ -157,6 +157,17 @@ pub enum Event {
         /// Human-readable description of the failure.
         error: String,
     },
+    /// A sync request reached a benign no-op and was skipped — currently only
+    /// when the live remote gate finds the repository has no configured remote.
+    /// Emitted so a request on a remote-less watch is never *silently* dropped
+    /// (the daemon logs it); it carries no state change, no failure, and no
+    /// backoff.
+    SyncSkipped {
+        /// Stable name of the watch.
+        watch: String,
+        /// Human-readable reason the cycle was skipped.
+        reason: String,
+    },
     /// A restore completed, moving the working tree to a prior snapshot.
     RestoreCompleted {
         /// Stable name of the watch.
@@ -213,6 +224,7 @@ impl Event {
             Event::SyncConflict { .. } => "sync.conflict",
             Event::SyncResolved { .. } => "sync.resolved",
             Event::SyncFailed { .. } => "sync.failed",
+            Event::SyncSkipped { .. } => "sync.skipped",
             Event::RestoreCompleted { .. } => "restore.completed",
             Event::WatchStateChanged { .. } => "watch.state_changed",
             Event::DaemonStarted => "daemon.started",
@@ -674,6 +686,13 @@ mod tests {
                     error: "e".to_string(),
                 },
                 "sync.failed",
+            ),
+            (
+                Event::SyncSkipped {
+                    watch: "w".to_string(),
+                    reason: "no remote".to_string(),
+                },
+                "sync.skipped",
             ),
             (
                 Event::RestoreCompleted {
