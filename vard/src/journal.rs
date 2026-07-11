@@ -625,6 +625,53 @@ impl RecoveryReport {
                 | RecoveryReport::LockNotOurs { .. }
         )
     }
+
+    /// A human-readable "why admission is deferred" line for a recovery that ran
+    /// inside [`JournalOpGate::admit`] and did **not** [`settle`](Self::settled)
+    /// the record. Such an outcome leaves the dangling `begin` as the *only*
+    /// evidence a later recovery can act on (a too-fresh-or-foreign git lock still
+    /// on disk, a reused-PID live holder, an unreadable journal, an I/O failure),
+    /// so `admit` must decline WITHOUT letting [`begin`](Journal::begin) truncate
+    /// it (see [`admit`](JournalOpGate::admit)). Returns `Some(reason)` for every
+    /// non-settled outcome and `None` for a settled one — so
+    /// `admit_deferral_reason().is_none()` is exactly [`settled`](Self::settled),
+    /// and a settled outcome proceeds to `begin` as before.
+    ///
+    /// The prose is derived from the outcome's own fields (never a fixed
+    /// duration), so it cannot drift from the gates that produced it.
+    pub(crate) fn admit_deferral_reason(&self) -> Option<String> {
+        match self {
+            // Settled: the record is now clean or provably foreign — safe to
+            // overwrite with a fresh `begin`.
+            RecoveryReport::Clean
+            | RecoveryReport::LockRemoved { .. }
+            | RecoveryReport::NoLockPresent { .. }
+            | RecoveryReport::LockNotOurs { .. } => None,
+            // Non-settled: the dangling record is live evidence; defer.
+            RecoveryReport::LockTooFresh { op, age, .. } => {
+                let remaining = FOREIGN_LOCK_GRACE.saturating_sub(*age);
+                Some(format!(
+                    "a prior {op} operation's git lock is still being verified as stale rather \
+                     than a live foreign lock; retry in ~{} min",
+                    remaining.as_secs().div_ceil(60),
+                ))
+            }
+            RecoveryReport::HolderAlive { op, pid } => Some(format!(
+                "a prior {op} operation's recorded owner (PID {pid}) is still alive, so its git \
+                 lock cannot yet be verified stale; retry once it exits"
+            )),
+            RecoveryReport::HolderActive => Some(
+                "another writer holds this watch's operation lock; retry once it releases".into(),
+            ),
+            RecoveryReport::Corrupt { detail } => Some(format!(
+                "a prior operation's journal could not be read and its recovery evidence must be \
+                 preserved: {detail}"
+            )),
+            RecoveryReport::Failed { detail } => Some(format!(
+                "a prior operation's git lock could not be inspected: {detail}"
+            )),
+        }
+    }
 }
 
 impl fmt::Display for RecoveryReport {
@@ -1026,9 +1073,23 @@ impl JournalOpGate {
     ///   lock), so we run recovery in-place first ([`recover_locked`](Journal::recover_locked),
     ///   not [`recover`](Journal::recover), which would re-acquire the lock and
     ///   `WOULDBLOCK` against our own hold): a dead-owner stale lock is cleaned
-    ///   and its record compacted before we overwrite. A still-live or too-fresh
-    ///   case leaves the lock in place, and the fresh record below names the same
-    ///   repo, so a later recovery can still act on it.
+    ///   and its record compacted before we overwrite.
+    /// * **Never truncate live evidence (R1).** Only a *settled* recovery makes
+    ///   the record safe to overwrite. A non-settled outcome — a too-fresh (still
+    ///   possibly foreign) lock retained by the [`FOREIGN_LOCK_GRACE`] floor, a
+    ///   reused-PID live holder, an unreadable journal, or an I/O failure — leaves
+    ///   the dangling `begin` as the ONLY evidence a later recovery can act on. If
+    ///   we let `begin` truncate it, a snapshot that then hit the still-present
+    ///   stale lock would close its bracket cleanly and compact the journal, so
+    ///   the orphaned lock would wedge the watch forever with nothing left to
+    ///   recover from. So we decline admission WITHOUT `begin` and release the op
+    ///   lock (drop `lock`), returning an [evidence-pending](RecoveryReport::admit_deferral_reason)
+    ///   `Err`. The engine maps that `Err` onto its long-cadence bounded retry
+    ///   (the unsafe/failure class — 30 s ticks, ~4 h budget, long enough to
+    ///   outlast the 15-min floor), and the CLI surfaces it as an attention-class
+    ///   error; either way a later admission re-runs recovery once the lock has
+    ///   aged past the floor (or the holder exits), settles it (`LockRemoved`),
+    ///   and proceeds — convergence is self-driving.
     /// * **Fail closed on a begin-write failure (F8).** A journaling hiccup is
     ///   surfaced as `Err`, not swallowed: without the `begin` record a crash
     ///   mid-operation would strand an unrecoverable git lock, so we release the
@@ -1040,7 +1101,22 @@ impl JournalOpGate {
         // hold the op lock, so recover in-place first. Only bother when a record
         // is actually present (the common clean case reads once and proceeds).
         if !matches!(journal.read_dangling(), Ok(None)) {
-            journal.recover_locked(&self.identity, &lock);
+            let report = journal.recover_locked(&self.identity, &lock);
+            // Our OWN prior release-only drop (a panicked op in *this* process)
+            // leaves a dangling record with this process's still-live PID. We hold
+            // the op lock and are the writer, so it is ours to overwrite — deferring
+            // on it would wedge every post-panic retry in the same process. Any
+            // OTHER non-settled outcome leaves live evidence a later recovery needs
+            // (a stranded too-fresh/foreign lock, a *reused*-PID foreign holder, an
+            // unreadable journal, an I/O failure), so decline WITHOUT begin and
+            // release the op lock (drop `lock`) (R1).
+            let own_unwound = matches!(
+                &report,
+                RecoveryReport::HolderAlive { pid, .. } if *pid == std::process::id()
+            );
+            if !own_unwound && let Some(reason) = report.admit_deferral_reason() {
+                return Err(reason);
+            }
         }
         journal.begin(op).map_err(|e| e.to_string())?;
         Ok(JournalOpGuard {
@@ -1620,11 +1696,44 @@ pub(crate) mod test_support {
         .unwrap();
         (repo.to_path_buf(), lock)
     }
+
+    /// Like [`plant_crashed`] but leaves the git lock at its FRESH (current)
+    /// mtime, so recovery sees an in-window lock younger than
+    /// [`FOREIGN_LOCK_GRACE`] and retains it as
+    /// [`RecoveryReport::LockTooFresh`] rather than removing it. The dangling
+    /// record's `ts` is taken from that fresh mtime so it stays inside the
+    /// operation window. Returns `(repo, lock)`.
+    pub(crate) fn plant_crashed_fresh(journal_dir: &Path, repo: &Path) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = fs::metadata(&lock)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let journal = Journal::for_repo_in_dir(journal_dir, repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin snapshot pid={} ts={ts} path={}\n",
+                dead_pid(),
+                hex_encode(identity_path(repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+        (repo.to_path_buf(), lock)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{age_far_past, dead_pid, plant_crashed, retry_until};
+    use super::test_support::{
+        age_far_past, dead_pid, plant_crashed, plant_crashed_fresh, retry_until,
+    };
     use super::*;
 
     /// A `repo_path` whose `.git` directory exists, plus a pre-written
@@ -2524,6 +2633,73 @@ mod tests {
         assert!(
             !journal.is_clean(),
             "admit writes its own fresh begin record after recovering"
+        );
+        guard.complete();
+        assert!(journal.is_clean(), "complete compacts the fresh record");
+    }
+
+    #[test]
+    fn admit_defers_a_too_fresh_lock_without_truncating_then_converges_after_the_floor() {
+        // R1 regression: a crash left a dangling `begin` plus a git lock that is
+        // in-window but younger than the freshness floor, so recovery RETAINS it
+        // as LockTooFresh (F1). `admit` must not let `begin` truncate that live
+        // evidence — it declines with an evidence-pending error and leaves BOTH the
+        // dangling record and the lock intact. Once the lock ages past the floor a
+        // later admission recovers it (LockRemoved) and proceeds, so the block is
+        // self-healing rather than a permanent silent wedge.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let short = Duration::from_millis(500);
+
+        // --- Phase 1: a too-fresh lock — recovery retains, admit DEFERS ---------
+        let (_repo, lock) = plant_crashed_fresh(&journal_dir, &repo);
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        let record_before = fs::read(journal.path()).unwrap();
+        // The sweep/recovery precondition: this lock is retained as too-fresh.
+        assert!(
+            matches!(journal.recover(&repo), RecoveryReport::LockTooFresh { .. }),
+            "precondition: a fresh in-window lock is retained as too-fresh"
+        );
+
+        let gate = JournalOpGate::for_repo_in_dir(&journal_dir, &repo);
+        let err = match gate.begin_blocking("snapshot", short) {
+            Ok(Some(_)) => panic!("admit must NOT admit (and truncate) while evidence is pending"),
+            Ok(None) => panic!("evidence-pending is not the busy case — the op lock was free"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("being verified") && err.contains("retry"),
+            "the evidence-pending error must name the state (CLI attention path): {err:?}"
+        );
+        assert!(
+            lock.exists(),
+            "admit must not remove a too-fresh lock (it may be a live foreign lock)"
+        );
+        assert_eq!(
+            fs::read(journal.path()).unwrap(),
+            record_before,
+            "admit must NOT truncate the dangling record — it is the only recovery evidence"
+        );
+
+        // --- Phase 2: the lock ages past the floor — admit recovers & proceeds --
+        // Re-plant the same residue with the lock aged far past the freshness floor
+        // and a coherent `ts` (equivalent to wall-clock advancing past the floor;
+        // `recover_locked` reads the real clock, which tests cannot inject).
+        let (_repo, lock) = plant_crashed(&journal_dir, &repo);
+        assert!(lock.exists(), "precondition: the aged residue is present");
+
+        let guard = gate
+            .begin_blocking("snapshot", short)
+            .unwrap()
+            .expect("once the lock ages past the floor, admit recovers and admits");
+        assert!(
+            !lock.exists(),
+            "the now-provably-stale lock is removed on the converging admission"
+        );
+        assert!(
+            !journal.is_clean(),
+            "admit wrote its own fresh begin after recovering"
         );
         guard.complete();
         assert!(journal.is_clean(), "complete compacts the fresh record");
