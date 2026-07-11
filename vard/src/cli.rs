@@ -182,16 +182,20 @@ as explicit intent).
     #[command(long_about = "\
 Reconcile a watch with its remote now.
 
-Runs one sync cycle for a watch that has syncing enabled: fetch the remote, \
-reconcile local and remote history out of tree (rebasing in a scratch worktree, \
-never the working tree), and push. Any uncommitted local work is committed by a \
-pre-sync snapshot first, so nothing is ever lost and the working tree only ever \
-moves between fully-committed states. With no selector every sync-enabled watch \
-is synced; with a `<name|path>` only that one is.
+Runs one sync cycle for a watch that has syncing enabled. The cycle fetches the \
+remote first, then — inside a single locked window — commits any uncommitted \
+local work with a pre-sync snapshot, reconciles local history onto the remote \
+out of tree (rebasing in a scratch worktree, never the working tree), and \
+advances; it then pushes. The advance never overwrites uncommitted work: if a \
+local change or a commit raced onto the branch would be clobbered, vard refuses \
+and retries rather than destroying anything, so the working tree only ever moves \
+between fully-committed states. With no selector every sync-enabled watch is \
+synced; with a `<name|path>` only that one is.
 
 Syncing must be enabled for the watch (`defaults.sync`/the watch's `sync` key, \
-with a `branch` and `remote` configured). A watch without syncing enabled is \
-reported as such and skipped; asking for one by name exits 1.
+with a `branch` and `remote` configured), and its repository must actually have \
+that remote. A watch without syncing enabled — or whose repository has no such \
+remote — is reported as such and skipped; asking for one by name exits 1.
 
 If the vard daemon is running it owns the repositories, so the sync is handed to \
 it as a request and runs asynchronously; the command reports that the request \
