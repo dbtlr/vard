@@ -53,14 +53,22 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// wrongly refuse. Retrying briefly lets a transient probe clear: persistent
 /// `WOULDBLOCK` across every retry then means a *genuine* exclusive holder,
 /// whose role content — written under its own lock — is trustworthy.
-/// Four fast attempts (~24 ms total) — a probe's shared hold lasts
-/// microseconds (plus scheduler noise), so a couple dozen milliseconds of
-/// patience rides it out, while the common genuinely-held case (a running
-/// daemon) pays an imperceptible pause instead of a tenth of a second on
-/// every CLI invocation.
-const PROBE_CONTENTION_RETRIES: u32 = 4;
+///
+/// 16 fast attempts (~96 ms total, see [`PROBE_CONTENTION_INTERVAL`]) — a
+/// probe's shared hold is microseconds in the uncontended case, but under
+/// heavy scheduler contention (many concurrent probes/acquirers, the kind
+/// VRD-37's subprocess-heavy test load surfaced) both the holder's release and
+/// the acquirer's own retry cadence can be stretched well past that. Nielsen's
+/// ~100 ms "feels instantaneous" threshold is the budget's ceiling: wide
+/// enough to absorb that contention, while the common genuinely-held case (a
+/// running daemon) still pays an imperceptible pause instead of the tenth of a
+/// second `RETRY_INTERVAL`-based waiting costs on every CLI invocation. (A
+/// smaller, 4-attempt/~24 ms budget proved too tight under that load — the
+/// `acquire_retries_survive_a_hold_past_the_old_probe_budget` test pins the
+/// boundary.)
+const PROBE_CONTENTION_RETRIES: u32 = 16;
 
-/// The pause between [`PROBE_CONTENTION_RETRIES`] attempts (~24 ms total).
+/// The pause between [`PROBE_CONTENTION_RETRIES`] attempts (~96 ms total).
 const PROBE_CONTENTION_INTERVAL: Duration = Duration::from_millis(6);
 
 /// The role recorded in the lock file, so a contending CLI can tell a daemon
@@ -289,7 +297,8 @@ impl InstanceLock {
     }
 
     /// Acquires the lock for the daemon. A duplicate *daemon* holder fails
-    /// immediately (no point waiting on a peer that will not exit); a transient
+    /// without entering the `cli_wait` loop — only the brief probe-contention
+    /// retries run first (no point waiting on a peer that will not exit); a transient
     /// *CLI* holder is retried for up to `cli_wait` before failing, so a daemon
     /// starting a beat after a CLI `snapshot` took the lock in-process does not
     /// spuriously refuse to start. The returned [`LockError::Held`] carries the
@@ -592,7 +601,14 @@ mod tests {
         let probe_path = path.clone();
         let probe = std::thread::spawn(move || {
             let f = File::open(&probe_path).unwrap();
-            flock(&f, FlockOperation::NonBlockingLockShared).unwrap();
+            // Retry the acquire to ride out the sibling-fork/exec window that can
+            // transiently hold the just-released exclusive seed fd (the same
+            // artifact `concurrent_probes_do_not_misread_a_crashed_daemon_as_running`'s
+            // peer and the other flock tests document).
+            assert!(
+                retry_until(|| flock(&f, FlockOperation::NonBlockingLockShared).is_ok()),
+                "the probe's shared lock must ultimately acquire once the fork/exec race clears"
+            );
             ready_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(10));
             drop(f);
@@ -607,6 +623,42 @@ mod tests {
             read_holder(&path),
             (Some(std::process::id()), Some(LockRole::Cli)),
             "the acquirer's own role overwrote the stale one"
+        );
+        drop(lock);
+        probe.join().unwrap();
+    }
+
+    #[test]
+    fn acquire_retries_survive_a_hold_past_the_old_probe_budget() {
+        // Pins the [`PROBE_CONTENTION_RETRIES`] boundary VRD-38 widened: under
+        // heavy scheduler contention a probe's shared hold (and the acquirer's
+        // own retry cadence) can stretch well past the old 4-attempt/~24 ms
+        // budget without the holder being anything but a transient probe. A
+        // 60 ms hold is comfortably past that old budget but well inside the
+        // current one (~96 ms) — proof the widened budget, not luck, is what
+        // rides it out.
+        let (_dir, path) = temp_lock_path();
+        {
+            let _seed = InstanceLock::acquire_at(&path, LockRole::Daemon).unwrap();
+        } // released, but leaves "pid\ndaemon" on disk (a crashed-daemon leftover)
+
+        let hold = Duration::from_millis(60);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        let probe = std::thread::spawn(move || {
+            let f = File::open(&probe_path).unwrap();
+            assert!(
+                retry_until(|| flock(&f, FlockOperation::NonBlockingLockShared).is_ok()),
+                "the probe's shared lock must ultimately acquire once the fork/exec race clears"
+            );
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(f);
+        });
+        ready_rx.recv().unwrap();
+
+        let lock = InstanceLock::acquire_at(&path, LockRole::Cli).expect(
+            "the widened probe-retry budget must outlast a hold past the old, too-tight budget",
         );
         drop(lock);
         probe.join().unwrap();
