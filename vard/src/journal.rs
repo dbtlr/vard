@@ -946,7 +946,8 @@ impl JournalOpGate {
     }
 
     /// Builds a gate for the watch rooted at `repo_path`, resolving its identity
-    /// and keys once (the CLI path, which has no cached [`WatchIdentity`]).
+    /// and keys once (the CLI path, which has no cached
+    /// [`WatchIdentity`](crate::daemon)).
     pub(crate) fn for_repo_in_dir(journal_dir: &Path, repo_path: &Path) -> JournalOpGate {
         let identity = identity_path(repo_path);
         let journal_key = journal_file_name_for_identity(&identity);
@@ -1933,11 +1934,7 @@ mod tests {
         let legacy = legacy_journal_file_name("notes");
         fs::write(dir.path().join(&legacy), b"begin snapshot pid=1 ts=1\n").unwrap();
 
-        let report = reconcile_journals(
-            dir.path(),
-            &[("notes", repo.as_path())],
-            SweepOpts::new(),
-        );
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
         assert_eq!(report.migrated.len(), 1, "one file migrated: {report:?}");
         assert!(
             report.trouble.is_empty(),
@@ -1963,11 +1960,7 @@ mod tests {
         fs::write(dir.path().join(&legacy), b"legacy\n").unwrap();
         fs::write(dir.path().join(&path_key), b"authoritative\n").unwrap();
 
-        let report = reconcile_journals(
-            dir.path(),
-            &[("notes", repo.as_path())],
-            SweepOpts::new(),
-        );
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
         assert!(report.migrated.is_empty(), "no rename when both exist");
         // Path-keyed file wins, untouched; the legacy file is left as an orphan
         // (young, so not swept this pass).
@@ -2028,11 +2021,7 @@ mod tests {
             now: mtime + ORPHAN_JOURNAL_MAX_AGE * 10,
             max_orphan_age: ORPHAN_JOURNAL_MAX_AGE,
         };
-        let report = reconcile_journals(
-            dir.path(),
-            &[("active", repo.as_path())],
-            opts,
-        );
+        let report = reconcile_journals(dir.path(), &[("active", repo.as_path())], opts);
         assert!(
             report.gc_deleted.is_empty(),
             "a configured watch's journal is never swept: {report:?}"
@@ -2056,11 +2045,7 @@ mod tests {
         .unwrap();
 
         // Migration renames the legacy file to the repo's path key.
-        let report = reconcile_journals(
-            dir.path(),
-            &[("notes", repo.as_path())],
-            SweepOpts::new(),
-        );
+        let report = reconcile_journals(dir.path(), &[("notes", repo.as_path())], SweepOpts::new());
         assert_eq!(report.migrated.len(), 1, "legacy file migrated: {report:?}");
 
         // Recovery under the path key now proves the lock ours and removes it.
@@ -2248,7 +2233,10 @@ mod tests {
             report.retained.is_empty(),
             "a live-holder deferral is not manual-cleanup retention: {report:?}"
         );
-        assert!(report.gc_deleted.is_empty(), "a deferred orphan is not GC'd");
+        assert!(
+            report.gc_deleted.is_empty(),
+            "a deferred orphan is not GC'd"
+        );
         assert!(lock.exists(), "the git lock is untouched while deferred");
 
         // Once the writer releases, a fresh sweep recovers the stale git lock.
@@ -2267,7 +2255,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!lock.exists(), "the stale lock is now cleaned once the op lock frees");
+        assert!(
+            !lock.exists(),
+            "the stale lock is now cleaned once the op lock frees"
+        );
     }
 
     #[test]

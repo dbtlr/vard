@@ -17,8 +17,8 @@
 pub mod config;
 pub mod engine;
 pub mod event;
-pub mod gate;
 pub mod excludes;
+pub mod gate;
 pub mod scheduler;
 pub mod timefmt;
 pub mod vcs;

@@ -2484,8 +2484,11 @@ mod tests {
         let backend = FakeBackend::new();
         backend.script([Scripted::Commit(1)]);
         let gate = FakeGate::busy();
-        let (tx, mut events, _counter) =
-            spawn_worker_with_gate(Arc::clone(&backend), test_cfg(), Arc::clone(&gate) as SharedGate);
+        let (tx, mut events, _counter) = spawn_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
 
         tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
 

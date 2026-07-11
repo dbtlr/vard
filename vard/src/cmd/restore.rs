@@ -104,16 +104,30 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
         Ok(CliLock::Acquired(lock)) => {
             // No daemon: hold the instance lock (outer) across the restore; the op
             // gate takes the op lock (inner) inside `real_restore`.
-            let result = real_restore(&paths, &out, &backend, repo_path, &rev, file.as_deref(), name);
+            let result = real_restore(
+                &paths,
+                &out,
+                &backend,
+                repo_path,
+                &rev,
+                file.as_deref(),
+                name,
+            );
             drop(lock);
             result
         }
         // A daemon owns the repo. We do not hold the instance lock, but we still
         // op-lock + journal via the gate: the daemon's worker contends on the same
         // op lock, so we serialize against it AND leave a recoverable record.
-        Ok(CliLock::DaemonHeld) => {
-            real_restore(&paths, &out, &backend, repo_path, &rev, file.as_deref(), name)
-        }
+        Ok(CliLock::DaemonHeld) => real_restore(
+            &paths,
+            &out,
+            &backend,
+            repo_path,
+            &rev,
+            file.as_deref(),
+            name,
+        ),
         Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
             "another vard command is running; retry in a moment",
         )),

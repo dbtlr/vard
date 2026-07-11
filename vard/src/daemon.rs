@@ -9,13 +9,11 @@
 //!    watch-less config is a startup error (nothing to do).
 //! 3. Recover any stale git index locks left by a previous crash (per-watch
 //!    [`Journal`] recovery), then build and start the engine.
-//! 4. Supervise it: log every bus [`Event`], bracket each commit window in the
-//!    per-watch journal (`begin` on `snapshot.started`, `complete` on the
-//!    `snapshot.completed`/`snapshot.failed`/`snapshot.skipped` outcome the
-//!    engine guarantees follows it — see [`journal_event`]), reload on SIGHUP
-//!    or a config-file edit, rebuild on a dead signal source with exponential
-//!    backoff, drain snapshot/sync request files, and shut down cleanly on
-//!    SIGINT/SIGTERM.
+//! 4. Supervise it: log every bus [`Event`] (the per-watch journal is bracketed
+//!    structurally by the engine worker's op-lock guard, VRD-37 — no longer from
+//!    the bus here), reload on SIGHUP or a config-file edit, rebuild on a dead
+//!    signal source with exponential backoff, drain snapshot/sync request files,
+//!    and shut down cleanly on SIGINT/SIGTERM.
 //!
 //! # The request-file contract (ADR 0004, spec §11)
 //!
@@ -135,7 +133,12 @@ impl WatchIdentity {
     /// This watch's operation gate (op lock + journal) for the given directory,
     /// injected into the engine so every commit is bracketed under the op lock.
     fn op_gate(&self, journal_dir: &Path) -> JournalOpGate {
-        JournalOpGate::new(journal_dir, &self.identity, &self.journal_key, &self.lock_key)
+        JournalOpGate::new(
+            journal_dir,
+            &self.identity,
+            &self.journal_key,
+            &self.lock_key,
+        )
     }
 
     /// The set of journal keys across a slice of identities — the "which watches
