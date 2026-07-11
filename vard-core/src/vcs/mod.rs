@@ -194,11 +194,16 @@ pub trait VcsBackend {
     ///
     /// This does **not** hard-reset. It updates the branch and tree with safe
     /// checkout semantics (`git checkout -B <branch> <target>`), which git's own
-    /// index locking makes race-free: a locally-modified tracked file or an
-    /// untracked file that `target` would clobber makes the checkout **refuse**,
-    /// and this returns [`AdvanceOutcome::WouldClobber`] with the branch and tree
-    /// left exactly as they were. Non-conflicting local edits are carried over
-    /// unharmed. advance therefore never destroys uncommitted work, period — the
+    /// index locking makes race-free: a locally-modified tracked file, an
+    /// untracked file, **or a locally-gitignored file** that `target` would
+    /// clobber makes the checkout **refuse**, and this returns
+    /// [`AdvanceOutcome::WouldClobber`] with the branch and tree left exactly as
+    /// they were. (The ignored-file case is not git's default — the git backend
+    /// passes `--no-overwrite-ignore` so a remote commit adding a path that is a
+    /// local ignored file, never captured by the pre-sync snapshot, refuses
+    /// rather than silently destroying the local copy.) Non-conflicting local
+    /// edits are carried over unharmed. advance therefore never destroys
+    /// uncommitted or gitignored work, period — the
     /// engine's per-watch lock plus its pre-sync snapshot make the common path a
     /// clean fast-forward, and any residual local change refuses rather than
     /// vanishes.

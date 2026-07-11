@@ -744,10 +744,25 @@ impl VcsBackend for GitBackend {
         // clobbered, and carries non-conflicting local edits over unharmed. The
         // hooks pin keeps a user's post-checkout hook from running. Idempotent:
         // checking the branch out onto its own tip is a clean no-op.
+        //
+        // `--no-overwrite-ignore` extends that same refusal to a locally
+        // *gitignored* file (git's default `--overwrite-ignore` would silently
+        // clobber one): a remote commit adding a path that is a local ignored
+        // file (e.g. `.env`) is never captured by the pre-sync snapshot, so
+        // without this flag the checkout would destroy the only copy of that
+        // local file. With it, git refuses with the same "would be overwritten"
+        // message the other clobber cases produce (verified empirically), which
+        // the classification below maps to a non-destructive `WouldClobber`.
         let out = git_output(
             &self.path,
             &[CFG_NO_HOOKS],
-            ["checkout", "-B", self.branch.as_str(), target.as_str()],
+            [
+                "checkout",
+                "--no-overwrite-ignore",
+                "-B",
+                self.branch.as_str(),
+                target.as_str(),
+            ],
             false,
         )?;
         if out.status.success() {

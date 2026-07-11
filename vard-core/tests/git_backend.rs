@@ -1505,6 +1505,47 @@ fn advance_refuses_a_conflicting_untracked_file() {
 }
 
 #[test]
+fn advance_refuses_a_conflicting_gitignored_file() {
+    // Data-loss hole (finding 1): a remote commit adding a path that is a LOCAL
+    // gitignored file must not silently clobber the local copy. The pre-sync
+    // snapshot never captures an ignored file, so advance's `--no-overwrite-ignore`
+    // is the only guard — it must REFUSE (WouldClobber), leaving the local file
+    // intact, exactly like the untracked-file case.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), ".gitignore", ".env\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    // `second` adds a TRACKED `.env` (as a remote commit would). Force-add it so
+    // the ignore rule does not skip it.
+    write(tmp.path(), ".env", "from-commit\n");
+    git_ok(tmp.path(), &["add", "-f", ".env"]);
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // Go back to `first` (which has `.env` only as an ignored file)...
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    // ...leave a LOCAL gitignored `.env` with private content, and try to advance
+    // forward to `second`, which tracks `.env` — this would clobber the local file.
+    write(tmp.path(), ".env", "LOCAL_SECRET\n");
+    assert!(
+        porcelain(tmp.path()).is_empty(),
+        "the local .env is ignored, so the tree reads clean"
+    );
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::WouldClobber,
+        "advancing over a local gitignored file must refuse, not overwrite it"
+    );
+    // Branch unmoved and the local secret intact.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".env")).unwrap(),
+        "LOCAL_SECRET\n"
+    );
+}
+
+#[test]
 fn advance_carries_a_non_conflicting_dirty_file_over() {
     // A dirty file the target does NOT touch is carried over unharmed: advance
     // succeeds and the local edit survives.
