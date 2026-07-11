@@ -27,7 +27,7 @@
 //! acquirer that has already opened it.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use rustix::fs::{FlockOperation, flock};
 use rustix::io::Errno;
 
+use crate::flock::open_and_lock_exclusive;
 use crate::paths;
 
 /// How long a CLI/daemon acquirer sleeps between retries while a peer holds the
@@ -219,38 +220,21 @@ impl InstanceLock {
     /// tempdir instead of the real XDG state directory. Records `role` in the
     /// lock file and creates parent directories as needed.
     pub(crate) fn acquire_at(path: &Path, role: LockRole) -> Result<InstanceLock, LockError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LockError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        }
-
-        // Open read+write (not truncating): on contention we still want to read
-        // the incumbent's PID and role out of the file.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|source| LockError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
         // Retry a `WOULDBLOCK` a handful of times before trusting it: a notify
         // probe holds the shared lock for microseconds, so a transient block
         // clears within a couple of retries, while a genuine exclusive holder
         // blocks every attempt — and only then is its recorded role trustworthy
-        // (see [`PROBE_CONTENTION_RETRIES`]).
+        // (see [`PROBE_CONTENTION_RETRIES`]). The open+exclusive-flock core is the
+        // shared [`crate::flock`] primitive; the probe-contention retry and the
+        // holder-record read/write stay here (the instance lock's own machinery).
         let mut attempt = 0;
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => break,
-                // `EWOULDBLOCK` is `EAGAIN` on every platform rustix targets, so
-                // matching one covers contention.
-                Err(Errno::WOULDBLOCK) => {
+        let mut file = loop {
+            match open_and_lock_exclusive(path).map_err(|source| LockError::Io {
+                path: path.to_path_buf(),
+                source,
+            })? {
+                Some(file) => break file,
+                None => {
                     if attempt < PROBE_CONTENTION_RETRIES {
                         attempt += 1;
                         std::thread::sleep(PROBE_CONTENTION_INTERVAL);
@@ -263,14 +247,8 @@ impl InstanceLock {
                         role,
                     });
                 }
-                Err(errno) => {
-                    return Err(LockError::Io {
-                        path: path.to_path_buf(),
-                        source: errno.into(),
-                    });
-                }
             }
-        }
+        };
 
         // Lock is ours: replace any stale contents with our own PID and role.
         write_holder(&mut file, std::process::id(), role).map_err(|source| LockError::Io {
@@ -457,6 +435,7 @@ impl std::error::Error for LockError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::test_support::retry_until;
 
     fn temp_lock_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -543,15 +522,10 @@ mod tests {
         // transiently shares our still-open lock fd, holding the flock a
         // microsecond longer. Production never reacquires its own lock, so this
         // window is a pure test artifact. Retry briefly rather than flake.
-        let mut last = None;
-        for _ in 0..100 {
-            match InstanceLock::acquire_at(&path, LockRole::Daemon) {
-                Ok(_reacquired) => return,
-                Err(e) => last = Some(e),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("lock never became reacquirable after release: {last:?}");
+        assert!(
+            retry_until(|| InstanceLock::acquire_at(&path, LockRole::Daemon).is_ok()),
+            "lock never became reacquirable after release"
+        );
     }
 
     #[test]
@@ -648,9 +622,14 @@ mod tests {
         } // dropped: the flock is released, but "pid\ndaemon" remains in the file.
 
         // A peer `vard notify` probe is mid-flight, holding its *shared* lock on
-        // the same file (exactly what probe_daemon takes).
+        // the same file (exactly what probe_daemon takes). Retry the acquire to
+        // ride out the sibling-fork/exec window that can transiently hold the
+        // just-released exclusive fd (the same artifact the flock tests document).
         let peer = File::open(&path).unwrap();
-        flock(&peer, FlockOperation::NonBlockingLockShared).unwrap();
+        assert!(
+            retry_until(|| flock(&peer, FlockOperation::NonBlockingLockShared).is_ok()),
+            "the peer shared probe must ultimately acquire once the fork/exec race clears"
+        );
 
         // A second concurrent probe must still report NotRunning: shared locks
         // coexist, so it never falls into the stale-role read that an exclusive
@@ -676,13 +655,10 @@ mod tests {
         // test artifact (the same race `releasing_the_lock_allows_reacquire` and
         // `acquire_retries_past_a_transient_shared_probe_then_succeeds` ride out);
         // production `probe_daemon` is correct.
-        for _ in 0..100 {
-            if probe_daemon(&path).unwrap() == DaemonProbe::NotRunning {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("a free lock must ultimately probe as NotRunning");
+        assert!(
+            retry_until(|| probe_daemon(&path).unwrap() == DaemonProbe::NotRunning),
+            "a free lock must ultimately probe as NotRunning"
+        );
     }
 
     #[test]
