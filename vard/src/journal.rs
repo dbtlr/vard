@@ -323,10 +323,12 @@ impl Journal {
     /// (either [`recover`](Self::recover) just acquired it, or the orphan sweep
     /// holds it across read + recover, or [`JournalOpGate::admit`] holds it across
     /// its recover-then-`begin`). Holding the lock proves no vard writer is
-    /// mid-operation; the surviving gates — PID liveness, the ours-vs-foreign op
-    /// window, and the [`FOREIGN_LOCK_GRACE`] freshness floor that backstops a
-    /// live *foreign* lock — are the ones the op lock cannot supplant (see the
-    /// [module docs](self)).
+    /// mid-operation; the surviving gates — *foreign*-PID liveness, the
+    /// ours-vs-foreign op window, and the [`FOREIGN_LOCK_GRACE`] freshness floor
+    /// that backstops a live *foreign* lock — are the ones the op lock cannot
+    /// supplant (see the [module docs](self)). A recorded PID equal to this
+    /// process is treated as dead, not a live holder: holding the op lock proves
+    /// our own prior operation unwound (the proof relies on the `_witness`).
     fn recover_locked(&self, repo_path: &Path, _witness: &OpLock) -> RecoveryReport {
         let dangling = match self.read_dangling() {
             Ok(Some(record)) => record,
@@ -336,13 +338,25 @@ impl Journal {
 
         // Liveness gates everything, before any journal mutation. We hold the op
         // lock, so no *vard* writer is mid-op — but the crashed writer's PID can
-        // be reused by an unrelated live process, and a dangling `begin` whose
-        // recorded PID is (now) alive might sit in the pre-lock window (between our
-        // journal `begin` and git creating the lock). Compacting it — which the
-        // lock-Absent branch below does — would destroy the only recovery evidence
-        // a crash in that window leaves. So a live PID returns HolderAlive and
-        // nothing is touched; only a dead-owner record proceeds.
-        if pid_is_alive(dangling.pid) {
+        // be reused by an unrelated live *foreign* process, and a dangling `begin`
+        // whose recorded PID is (now) alive might sit in the pre-lock window
+        // (between our journal `begin` and git creating the lock). Compacting it —
+        // which the lock-Absent branch below does — would destroy the only recovery
+        // evidence a crash in that window leaves. So a live foreign PID returns
+        // HolderAlive and nothing is touched; only a dead-owner record proceeds.
+        //
+        // A recorded PID equal to THIS process is never a live holder here.
+        // Holding the op lock (the `_witness`) PROVES the prior own-PID operation
+        // fully unwound: its writer held this watch's op lock when it wrote `begin`,
+        // and the guard couples the lock to the blocking git work (F2) — the lock
+        // is released only after that work finishes or unwinds (the async backoff
+        // window holds the guard too), so we could not hold the lock now while that
+        // operation were still live. This claim is sound ONLY because the caller
+        // holds the op lock, which the `_witness` argument guarantees structurally.
+        // Falling through to the normal lock disposition also disarms a reused PID
+        // that happens to equal our own from wedging the sweep as an eternal
+        // HolderAlive.
+        if dangling.pid != std::process::id() && pid_is_alive(dangling.pid) {
             return RecoveryReport::HolderAlive {
                 op: dangling.op,
                 pid: dangling.pid,
@@ -1102,19 +1116,16 @@ impl JournalOpGate {
         // is actually present (the common clean case reads once and proceeds).
         if !matches!(journal.read_dangling(), Ok(None)) {
             let report = journal.recover_locked(&self.identity, &lock);
-            // Our OWN prior release-only drop (a panicked op in *this* process)
-            // leaves a dangling record with this process's still-live PID. We hold
-            // the op lock and are the writer, so it is ours to overwrite — deferring
-            // on it would wedge every post-panic retry in the same process. Any
-            // OTHER non-settled outcome leaves live evidence a later recovery needs
-            // (a stranded too-fresh/foreign lock, a *reused*-PID foreign holder, an
-            // unreadable journal, an I/O failure), so decline WITHOUT begin and
-            // release the op lock (drop `lock`) (R1).
-            let own_unwound = matches!(
-                &report,
-                RecoveryReport::HolderAlive { pid, .. } if *pid == std::process::id()
-            );
-            if !own_unwound && let Some(reason) = report.admit_deferral_reason() {
+            // Only a *settled* recovery makes the dangling record safe to
+            // overwrite. Any non-settled outcome leaves live evidence a later
+            // recovery needs (a stranded too-fresh/foreign lock, a *reused*-PID
+            // foreign holder, an unreadable journal, an I/O failure), so decline
+            // WITHOUT begin and release the op lock (drop `lock`) (R1). Our own
+            // prior unwound operation is not a special case here: the op lock we
+            // hold proves it dead, so `recover_locked` disposes of any stranded
+            // lock and settles (NoLockPresent / LockRemoved), and this same path
+            // then proceeds — the post-panic retry converges with no bypass.
+            if let Some(reason) = report.admit_deferral_reason() {
                 return Err(reason);
             }
         }
@@ -1653,6 +1664,34 @@ pub(crate) mod test_support {
         pid
     }
 
+    /// A live *foreign* PID: spawns a long-sleeping child whose PID is known to be
+    /// alive and is NOT this process (so the own-PID "proven dead by the op lock"
+    /// rule does not apply — this stands in for a genuine live foreign holder or a
+    /// reused-PID foreign process). The returned guard kills and reaps the child
+    /// on drop, so the PID must be read while the guard is in scope.
+    pub(crate) struct LivePid(std::process::Child);
+
+    impl LivePid {
+        pub(crate) fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for LivePid {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub(crate) fn live_pid() -> LivePid {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        LivePid(child)
+    }
+
     /// Ages `path`'s mtime far into the past via `touch -t` (POSIX-portable),
     /// returning the resulting mtime in unix seconds so a coherent journal `ts`
     /// can be written for it.
@@ -1732,7 +1771,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        age_far_past, dead_pid, plant_crashed, plant_crashed_fresh, retry_until,
+        age_far_past, dead_pid, live_pid, plant_crashed, plant_crashed_fresh, retry_until,
     };
     use super::*;
 
@@ -1862,11 +1901,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repo_with_lock(dir.path());
         let journal = Journal::for_repo_in_dir(dir.path(), &repo);
-        // Our own PID is alive, so the dangling begin still has a live owner: the
-        // PID-liveness gate (kept — the op lock cannot prove a reused PID dead)
-        // leaves the lock in place.
+        // A live FOREIGN PID owns the dangling begin: the PID-liveness gate (kept —
+        // the op lock cannot prove a reused foreign PID dead) leaves the lock in
+        // place. Own-PID is excluded because the op lock proves it dead, so a
+        // genuine live-holder test must use a foreign child's PID.
+        let holder = live_pid();
         let ts = mtime_secs(&lock_path(&repo));
-        write_dangling(&journal, "snapshot", std::process::id(), ts);
+        write_dangling(&journal, "snapshot", holder.pid(), ts);
 
         let report = journal.recover(&repo);
         assert!(
@@ -1884,8 +1925,9 @@ mod tests {
         let repo = dir.path().join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         let journal = Journal::for_repo_in_dir(dir.path(), &repo);
-        // Our own PID is alive.
-        write_dangling(&journal, "snapshot", std::process::id(), 0);
+        // A live FOREIGN PID (own-PID would be proven dead by the op lock).
+        let holder = live_pid();
+        write_dangling(&journal, "snapshot", holder.pid(), 0);
         let before = fs::read(journal.path()).unwrap();
 
         let report = journal.recover(&repo);
@@ -2404,23 +2446,25 @@ mod tests {
     #[test]
     fn sweep_defers_an_orphan_whose_holder_is_still_running() {
         // A watch removed during an in-flight snapshot leaves a path-bearing
-        // dangling begin recording THIS process (alive). Recovery returns
+        // dangling begin recording a live FOREIGN holder. Recovery returns
         // HolderAlive, so the sweep must classify it as *deferred* (settles on the
         // holder's own drain), not *retained* (manual cleanup), and leave the
-        // record untouched.
+        // record untouched. (Own-PID would be proven dead by the op lock, so a
+        // genuine live-holder deferral needs a foreign child's PID.)
         let dir = tempfile::tempdir().unwrap();
         let journal_dir = dir.path().join("journal");
         let repo = dir.path().join("live-repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(repo.join(".git").join("index.lock"), b"lock").unwrap();
 
+        let holder = live_pid();
         let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
         fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
         fs::write(
             journal.path(),
             format!(
                 "begin snapshot pid={} ts=1 path={}\n",
-                std::process::id(),
+                holder.pid(),
                 hex_encode(identity_path(&repo).as_os_str().as_bytes()),
             ),
         )
@@ -2700,6 +2744,135 @@ mod tests {
         assert!(
             !journal.is_clean(),
             "admit wrote its own fresh begin after recovering"
+        );
+        guard.complete();
+        assert!(journal.is_clean(), "complete compacts the fresh record");
+    }
+
+    #[test]
+    fn admit_settles_an_own_pid_dangling_with_an_aged_lock_then_proceeds() {
+        // R3: a same-process panic mid-git left a dangling `begin` recording THIS
+        // process plus a stranded, aged, in-window git lock. Holding the op lock
+        // proves that own-PID operation dead, so admit must DISPOSE of the stranded
+        // lock (LockRemoved) — not bypass recovery and truncate the evidence away —
+        // then write its own fresh record. Truncating instead would leave the
+        // stranded lock unprovable and wedge the watch forever.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = lock_path(&repo);
+        fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        write_dangling(&journal, "snapshot", std::process::id(), ts);
+
+        let gate = JournalOpGate::for_repo_in_dir(&journal_dir, &repo);
+        let guard = gate
+            .begin_blocking("snapshot", Duration::from_millis(500))
+            .unwrap()
+            .expect("acquires the free op lock and admits");
+        assert!(
+            !lock.exists(),
+            "admit must remove the own-PID operation's stranded, aged lock — acting on the \
+             evidence, not truncating it"
+        );
+        assert!(
+            !journal.is_clean(),
+            "admit wrote its own fresh begin after recovering"
+        );
+        guard.complete();
+        assert!(journal.is_clean(), "complete compacts the fresh record");
+    }
+
+    #[test]
+    fn admit_defers_an_own_pid_dangling_with_a_fresh_lock_then_converges() {
+        // R3: even for an OWN-PID dangling record, a stranded FRESH in-window lock
+        // may be a live foreign lock a user's own `git commit` created after the
+        // crash, so recovery retains it (LockTooFresh) and admit must DEFER — never
+        // truncate the record — until the lock ages past the freshness floor, then
+        // it settles (LockRemoved) and proceeds. The own-PID dangling record is not
+        // a bypass; the pending stranded lock still governs admission.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = lock_path(&repo);
+        fs::write(&lock, b"lock").unwrap();
+        let ts = mtime_secs(&lock);
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        write_dangling(&journal, "snapshot", std::process::id(), ts);
+        let record_before = fs::read(journal.path()).unwrap();
+        assert!(
+            matches!(journal.recover(&repo), RecoveryReport::LockTooFresh { .. }),
+            "precondition: a fresh in-window lock is retained as too-fresh even for own-PID"
+        );
+
+        // --- The fresh lock is pending: admit DEFERS, truncating nothing ---------
+        let gate = JournalOpGate::for_repo_in_dir(&journal_dir, &repo);
+        let err = match gate.begin_blocking("snapshot", Duration::from_millis(500)) {
+            Ok(Some(_)) => panic!("admit must NOT admit (and truncate) while the fresh lock pends"),
+            Ok(None) => panic!("evidence-pending is not the busy case — the op lock was free"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("being verified") && err.contains("retry"),
+            "the evidence-pending error must name the state: {err:?}"
+        );
+        assert!(
+            lock.exists(),
+            "admit must not remove a too-fresh lock (it may be a live foreign lock)"
+        );
+        assert_eq!(
+            fs::read(journal.path()).unwrap(),
+            record_before,
+            "admit must leave the own-PID dangling record byte-identical"
+        );
+
+        // --- The lock ages past the floor: admit settles and proceeds -----------
+        let aged_ts = age_far_past(&lock);
+        write_dangling(&journal, "snapshot", std::process::id(), aged_ts);
+        let guard = gate
+            .begin_blocking("snapshot", Duration::from_millis(500))
+            .unwrap()
+            .expect("once the lock ages past the floor, admit recovers and admits");
+        assert!(
+            !lock.exists(),
+            "the now-provably-stale lock is removed on the converging admission"
+        );
+        guard.complete();
+        assert!(journal.is_clean(), "complete compacts the fresh record");
+    }
+
+    #[test]
+    fn admit_proceeds_for_an_own_pid_dangling_with_no_lock() {
+        // R3: a same-process panic left a dangling own-PID `begin` but NO stranded
+        // git lock. Holding the op lock proves that operation dead, so recovery
+        // settles (NoLockPresent) and admit proceeds — the post-panic retry
+        // convergence the removed own-PID bypass was protecting, now delivered
+        // through the correct lock-disposition path.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        write_dangling(&journal, "snapshot", std::process::id(), 1);
+        assert!(
+            matches!(journal.recover(&repo), RecoveryReport::NoLockPresent { .. }),
+            "precondition: own-PID with no lock settles as NoLockPresent"
+        );
+
+        // recover() above compacted the settled record; re-plant it so admit runs
+        // its own recover-then-begin over live evidence, as a real retry would.
+        write_dangling(&journal, "snapshot", std::process::id(), 1);
+        let gate = JournalOpGate::for_repo_in_dir(&journal_dir, &repo);
+        let guard = gate
+            .begin_blocking("snapshot", Duration::from_millis(500))
+            .unwrap()
+            .expect("own-PID with no lock settles, so admit proceeds");
+        assert!(
+            !journal.is_clean(),
+            "admit wrote its own fresh begin record"
         );
         guard.complete();
         assert!(journal.is_clean(), "complete compacts the fresh record");
