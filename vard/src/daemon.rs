@@ -667,23 +667,49 @@ fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = 
 }
 
 /// Host-injects the out-of-tree reconcile scratch directory into every
-/// sync-enabled spec, so vard-core can actually run the sync cycle (it resolves
-/// no paths itself). The path is [`DaemonPaths::scratch_for`] — the *same*
-/// derivation [`recover_stale_locks`] prunes via [`GitSyncSettler`], so the
-/// engine reconciles in exactly the directory recovery cleans. A non-sync spec
-/// is returned unchanged, leaving its sync dormant.
+/// sync-enabled spec **whose repository actually has the configured remote**, so
+/// vard-core can run the sync cycle (it resolves no paths itself). The path is
+/// [`DaemonPaths::scratch_for`] — the *same* derivation [`recover_stale_locks`]
+/// prunes via [`GitSyncSettler`], so the engine reconciles in exactly the
+/// directory recovery cleans.
+///
+/// A non-sync spec is returned unchanged. A `sync = true` spec whose repository
+/// has **no** such remote is also returned unchanged (no scratch → sync stays
+/// disabled for it) with one clear log line, so a remote-less repo never latches
+/// a `SyncError` storm on doomed fetches. The remote check is a cheap,
+/// non-network config lookup ([`VcsBackend::has_remote`](vard_core::VcsBackend::has_remote)).
 fn inject_scratch_dirs(paths: &DaemonPaths, specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
     specs
         .into_iter()
         .map(|spec| {
-            if spec.sync() {
+            if !spec.sync() {
+                return spec;
+            }
+            if spec_has_remote(&spec) {
                 let scratch = paths.scratch_for(spec.path());
                 spec.with_scratch_dir(scratch)
             } else {
+                info!(
+                    watch = spec.name(),
+                    remote = spec.remote(),
+                    "sync is enabled but the repository has no such remote; sync disabled for this watch"
+                );
                 spec
             }
         })
         .collect()
+}
+
+/// Whether `spec`'s repository defines its configured remote — a cheap,
+/// non-network probe. A repository that cannot be opened, or whose remote lookup
+/// errors, counts as "no remote" (sync stays disabled) rather than risking a
+/// doomed sync cycle.
+fn spec_has_remote(spec: &WatchSpec) -> bool {
+    use vard_core::VcsBackend;
+    vard_core::open_git_backend(spec)
+        .ok()
+        .and_then(|backend| backend.has_remote().ok())
+        .unwrap_or(false)
 }
 
 /// Builds a [`SyncSettler`](journal::SyncSettler) for a syncing watch, or `None`
@@ -708,38 +734,16 @@ struct GitSyncSettler {
 }
 
 impl journal::SyncSettler for GitSyncSettler {
-    fn settle(&self, advance_target: Option<&str>) -> Result<(), String> {
+    fn settle(&self) -> Result<(), String> {
         use vard_core::VcsBackend;
-        // Pruning the vard-owned scratch worktree is always safe (never the
-        // user's files) and a no-op when absent.
+        // Recovery is never surgery on the user's files: prune the vard-owned
+        // scratch worktree (always safe, never the user's tree; a no-op when
+        // absent) and nothing else. A crashed advance leaves a fully-committed
+        // tree at worst mid-checkout, and the next sync cycle self-heals — its
+        // dirty check + pre-sync snapshot + fresh reconcile land the work
+        // properly. No advance is ever re-applied here.
         self.backend
             .prune_scratch(&self.scratch)
-            .map_err(|e| e.to_string())?;
-        let Some(target) = advance_target else {
-            return Ok(());
-        };
-        // Re-apply the advance only when it cannot destroy uncommitted work:
-        // the repository must be safe (on-branch, no operation in progress) and
-        // the tree clean. A dirty tree is left to the next sync cycle, which
-        // snapshots local-first before advancing. This upholds the constitution:
-        // no vard operation may destroy the only copy of anything.
-        if !matches!(
-            self.backend.is_safe_state().map_err(|e| e.to_string())?,
-            vard_core::SafeState::Safe
-        ) {
-            return Ok(());
-        }
-        let dirty = !self
-            .backend
-            .diff(&vard_core::VcsRef::new("HEAD"), None, None)
-            .map_err(|e| e.to_string())?
-            .trim()
-            .is_empty();
-        if dirty {
-            return Ok(());
-        }
-        self.backend
-            .advance(&vard_core::SnapshotId::new(target))
             .map_err(|e| e.to_string())
     }
 }
@@ -1599,70 +1603,41 @@ mod tests {
     }
 
     #[test]
-    fn git_sync_settler_reapplies_the_advance_on_a_clean_tree() {
+    fn git_sync_settler_prunes_the_scratch_and_never_touches_user_files() {
         use journal::SyncSettler;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         init_repo(&repo);
-        // Two commits; leave HEAD one behind the target (as a crash between
-        // reconcile and advance would).
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git_ok(&repo, &["add", "-A"]);
         git_ok(&repo, &["commit", "-m", "one"]);
-        let target = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        git_ok(&repo, &["reset", "--hard", "HEAD~1"]);
-        assert_eq!(commit_count(&repo), 1, "HEAD is one behind the target");
 
-        settler_for(&repo).settle(Some(&target)).unwrap();
+        // A leftover scratch worktree from a crashed reconcile, at the very path
+        // the settler prunes.
+        let scratch = repo.join(".vard-scratch");
+        git_ok(
+            &repo,
+            &["worktree", "add", "--detach", scratch.to_str().unwrap()],
+        );
+        assert!(scratch.exists(), "scratch worktree planted");
 
-        assert_eq!(commit_count(&repo), 2, "the advance target was re-applied");
-        assert!(repo.join("a.txt").exists());
-    }
+        // An uncommitted edit to a tracked file that recovery must NOT touch —
+        // recovery is never surgery on the user's files; it only prunes scratch.
+        std::fs::write(repo.join("a.txt"), "unsaved local work\n").unwrap();
+        let commits_before = commit_count(&repo);
 
-    #[test]
-    fn git_sync_settler_skips_the_advance_on_a_dirty_tree() {
-        use journal::SyncSettler;
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        init_repo(&repo);
-        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
-        git_ok(&repo, &["add", "-A"]);
-        git_ok(&repo, &["commit", "-m", "base"]);
-        std::fs::write(repo.join("base.txt"), "target\n").unwrap();
-        git_ok(&repo, &["add", "-A"]);
-        git_ok(&repo, &["commit", "-m", "target"]);
-        let target = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        git_ok(&repo, &["reset", "--hard", "HEAD~1"]);
-        assert_eq!(commit_count(&repo), 2, "HEAD is one behind the target");
-        // An uncommitted edit to a TRACKED file: re-advancing (reset --hard)
-        // would destroy it, so the settler must skip the advance.
-        std::fs::write(repo.join("base.txt"), "unsaved local work\n").unwrap();
+        settler_for(&repo).settle().unwrap();
 
-        settler_for(&repo).settle(Some(&target)).unwrap();
-
-        assert_eq!(commit_count(&repo), 2, "a dirty tree is not advanced");
+        assert!(!scratch.exists(), "the scratch worktree is pruned");
         assert_eq!(
-            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            commit_count(&repo),
+            commits_before,
+            "no advance is ever re-applied by recovery"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
             "unsaved local work\n",
-            "the uncommitted edit must survive"
+            "the uncommitted edit survives untouched"
         );
     }
 
