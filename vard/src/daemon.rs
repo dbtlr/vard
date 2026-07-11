@@ -34,8 +34,11 @@
 //!   [`EngineHandle::trigger`](vard_core::EngineHandle::trigger) — for the named
 //!   watch, or every watch when `watch` is omitted. An unknown watch is logged
 //!   and skipped.
-//! - `kind = "sync"` is accepted but not yet implemented (VRD-19); it is logged
-//!   and dropped.
+//! - `kind = "sync"` requests a manual sync cycle via
+//!   [`EngineHandle::request_sync`](vard_core::EngineHandle::request_sync) — for
+//!   the named watch, or every watch when `watch` is omitted. A watch that
+//!   cannot sync accepts the request and does nothing; an unknown watch is
+//!   logged and skipped.
 //!
 //! Every consumed file is deleted — including a malformed one, which is logged
 //! and removed so a single poison file cannot wedge the queue.
@@ -541,11 +544,14 @@ async fn run_daemon(
     if defined.is_empty() {
         return Err(StartupError::NoWatches);
     }
-    let specs: Vec<WatchSpec> = defined
-        .iter()
-        .filter(|w| !w.paused)
-        .map(|w| w.spec.clone())
-        .collect();
+    let specs: Vec<WatchSpec> = inject_scratch_dirs(
+        &paths,
+        defined
+            .iter()
+            .filter(|w| !w.paused)
+            .map(|w| w.spec.clone())
+            .collect(),
+    );
     if specs.is_empty() {
         info!("all configured watches are paused; starting idle (a resume will reload)");
     }
@@ -658,6 +664,26 @@ fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = 
             }
         }
     }
+}
+
+/// Host-injects the out-of-tree reconcile scratch directory into every
+/// sync-enabled spec, so vard-core can actually run the sync cycle (it resolves
+/// no paths itself). The path is [`DaemonPaths::scratch_for`] — the *same*
+/// derivation [`recover_stale_locks`] prunes via [`GitSyncSettler`], so the
+/// engine reconciles in exactly the directory recovery cleans. A non-sync spec
+/// is returned unchanged, leaving its sync dormant.
+fn inject_scratch_dirs(paths: &DaemonPaths, specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
+    specs
+        .into_iter()
+        .map(|spec| {
+            if spec.sync() {
+                let scratch = paths.scratch_for(spec.path());
+                spec.with_scratch_dir(scratch)
+            } else {
+                spec
+            }
+        })
+        .collect()
 }
 
 /// Builds a [`SyncSettler`](journal::SyncSettler) for a syncing watch, or `None`
@@ -831,11 +857,14 @@ async fn build_started_engine(
     // future sweep), so recovery below looks under the right path keys.
     reconcile_journals(paths, &defined);
 
-    let specs: Vec<WatchSpec> = defined
-        .iter()
-        .filter(|w| !w.paused)
-        .map(|w| w.spec.clone())
-        .collect();
+    let specs: Vec<WatchSpec> = inject_scratch_dirs(
+        paths,
+        defined
+            .iter()
+            .filter(|w| !w.paused)
+            .map(|w| w.spec.clone())
+            .collect(),
+    );
     if specs.is_empty() {
         info!("reload: all watches are paused; running idle");
     }
@@ -1410,9 +1439,10 @@ fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
     }
 }
 
-/// Applies one parsed request: a snapshot injects a manual trigger (for the
-/// named watch, or every watch when unnamed); a sync is logged and dropped
-/// pending VRD-19.
+/// Applies one parsed request: a snapshot injects a manual trigger and a sync a
+/// manual sync request — for the named watch, or every watch when unnamed. A
+/// watch that cannot sync accepts the request and does nothing (see
+/// [`EngineHandle::request_sync`]).
 fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdentity]) {
     match request.kind {
         RequestKind::Snapshot => match request.watch {
@@ -1433,9 +1463,24 @@ fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdenti
                 );
             }
         },
-        RequestKind::Sync => {
-            info!("sync requested but not yet implemented (VRD-19); dropping");
-        }
+        RequestKind::Sync => match request.watch {
+            Some(watch) => {
+                if handle.request_sync(&watch) {
+                    info!(%watch, "manual sync requested");
+                } else {
+                    warn!(%watch, "sync requested for an unknown watch; ignoring");
+                }
+            }
+            None => {
+                for watch in watches {
+                    handle.request_sync(&watch.name);
+                }
+                info!(
+                    count = watches.len(),
+                    "manual sync requested for all watches"
+                );
+            }
+        },
     }
 }
 
@@ -2046,6 +2091,130 @@ mod tests {
                 "watch {watch:?} journal must hold no dangling begin after a clean shutdown"
             );
         }
+    }
+
+    /// A bare repository usable as a file remote.
+    fn bare_origin(path: &Path) -> PathBuf {
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(path)
+            .output()
+            .expect("spawn git");
+        path.to_path_buf()
+    }
+
+    /// A working repo with `origin` set, a base commit, and `main` pushed.
+    fn synced_repo(repo: &Path, origin: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        git_ok(repo, &["init", "-b", "main"]);
+        git_ok(repo, &["config", "user.email", "vard-test@example.com"]);
+        git_ok(repo, &["config", "user.name", "Vard Test"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git_ok(repo, &["add", "-A"]);
+        git_ok(repo, &["commit", "-m", "base"]);
+        git_ok(repo, &["push", "-u", "origin", "main"]);
+    }
+
+    /// Commits reachable from the bare remote's `main`.
+    fn remote_commit_count(origin: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "refs/heads/main"])
+            .current_dir(origin)
+            .output()
+            .expect("failed to spawn git");
+        if !out.status.success() {
+            return 0;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_consumes_a_sync_request_and_pushes_to_the_remote() {
+        // A sync-enabled watch on an interval-only trigger (no watcher, no auto
+        // fire): the ONLY thing that drives a sync is the dropped request file.
+        // Proves the daemon injects the reconcile scratch dir (so the cycle can
+        // run at all) and routes a `kind = "sync"` request to `request_sync`.
+        let root = tempfile::tempdir().unwrap();
+        let origin = bare_origin(&root.path().join("origin.git"));
+        let notes = root.path().join("notes");
+        synced_repo(&notes, &origin);
+        // Uncommitted local work: the sync's pre-sync snapshot commits it, then
+        // the cycle pushes it — moving the remote from 1 commit to 2.
+        std::fs::write(notes.join("draft.txt"), "local work\n").unwrap();
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"notes\"\npath = {notes:?}\nsync = true\n\
+                 branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            ),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        assert_eq!(remote_commit_count(&origin), 1, "remote starts at the base");
+        request::write(
+            &paths.request_dir,
+            &request::Request::sync(Some("notes".to_string())),
+        )
+        .unwrap();
+
+        // The consumed request drives the cycle, which pushes the pre-sync commit.
+        let mut pushed = false;
+        for _ in 0..400 {
+            if remote_commit_count(&origin) >= 2 {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(pushed, "the sync request must push the pre-sync commit");
+        assert!(
+            head_message(&notes).contains("Vard-Trigger: pre-sync"),
+            "the pushed commit must be the pre-sync snapshot, got:\n{}",
+            head_message(&notes)
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+
+        let journal_path = Journal::for_repo_in_dir(&paths.journal_dir, &notes);
+        let len = std::fs::metadata(journal_path.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(len, 0, "a clean sync leaves no dangling journal record");
     }
 
     use crate::journal::test_support::{plant_crashed, retry_until};
