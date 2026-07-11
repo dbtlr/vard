@@ -1354,7 +1354,7 @@ fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdenti
 }
 
 /// Reads a file's content and returns its FNV-1a fingerprint, or `None` if the
-/// file is missing or unreadable — the same posture `file_mtime` used to have.
+/// file is missing or unreadable — the same posture the old mtime check had.
 /// The config file is tiny, so a read-and-hash on every poll tick is cheap
 /// enough to be the whole "did it change?" check; mtime alone can't be, since
 /// two back-to-back CLI writes can land in the same 1-second mtime tick and be
@@ -2252,8 +2252,9 @@ mod tests {
         std::fs::write(&config_file, &idle).unwrap();
         set_mtime(&config_file, same_tick);
 
-        // Give the debounce two more poll cycles to settle on the new content.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // Give the debounce two more poll cycles to settle on the new content,
+        // plus slack for the reload's drain-and-rebuild to finish.
+        tokio::time::sleep(Duration::from_millis(900)).await;
 
         // Prove the daemon really went idle again: a further write must NOT
         // produce a new commit. An mtime-only debounce would have missed edit
