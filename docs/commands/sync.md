@@ -5,7 +5,7 @@ description: Sync a watch with its remote now — fetch, reconcile, and push.
 
 # vard sync
 
-Reconcile a watch with its remote now: fetch the remote, reconcile local and remote history, and push. It is the on-demand counterpart to the daemon's automatic syncing — where the [daemon](run.md) syncs right after each snapshot (and re-attempts a failed sync on an exponential backoff), `vard sync` is a single explicit request. There is no fixed-interval "cadence" sync yet; automatic syncs are driven by snapshots and by failure-backoff retries. With no selector every sync-enabled watch is synced; with a `<name|path>` only that one is.
+Reconcile a watch with its remote now: fetch the remote, reconcile local and remote history, and push. It is the on-demand counterpart to the daemon's automatic syncing — where the [daemon](run.md) syncs right after each snapshot (and re-attempts a failed sync on an exponential backoff), `vard sync` is a single explicit request. There is no fixed-interval "cadence" sync yet; automatic syncs are driven by snapshots and by failure-backoff retries. With no selector every sync-enabled watch is acted on and reported (non-paused ones are synced; paused or remote-less ones get informational rows — see below); with a `<name|path>` only that one is.
 
 The reconcile happens **out of tree**: local history is rebased onto the fetched remote inside a scratch worktree, never the working tree. A sync can never destroy uncommitted work: any uncommitted local work is committed by a pre-sync snapshot before it can be moved, and the step that makes the reconciled history live **refuses and retries rather than overwriting** if a local change (or a commit raced onto the branch) would be clobbered. The working tree only ever moves between fully-committed states.
 
@@ -68,7 +68,7 @@ vard sync notes --format json
 | Code | Meaning |
 |---|---|
 | `0` | Every acted-on watch was synced or queued (including `up to date`), or was an informational no-selector row (`paused`, or `disabled` for a missing remote). |
-| `1` | Attention — a reconcile conflict latched a watch, or a watch asked for **by name** has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or its repository has no configured remote. |
+| `1` | Attention — a reconcile conflict latched a watch, or a watch asked for **by name** has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or its repository lacks the configured remote (the message names it). |
 | `2` | Operational error — a network or authentication failure, a repository that could not be opened, a sync that could not complete before the engine stopped (including a repository held by another operation throughout), or a selector that resolves to no watch. |
 
 ## See also

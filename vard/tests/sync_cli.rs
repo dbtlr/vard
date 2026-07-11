@@ -364,26 +364,9 @@ fn sync_named_paused_watch_refuses_with_a_daemon_running() {
     let repo = synced_repo(&env, "notes", &origin);
     env.write_config(&config_for(&paused_sync_watch("notes", &repo)));
 
-    let mut daemon = env
-        .command(&["run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn vard run");
-    // The daemon writes its health file once it is up and holding the lock.
-    let health = env.health_file();
-    for _ in 0..100 {
-        if health.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(health.exists(), "the daemon never started");
-
+    let daemon = env.spawn_daemon();
     let out = env.vard(&["sync", "notes"]);
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    drop(daemon);
 
     assert_eq!(
         code(&out),
@@ -479,21 +462,7 @@ fn sync_named_unopenable_repo_fails_with_and_without_a_daemon() {
     // exactly how via_request meets one — the user edited the config after
     // startup. The pre-check must classify it as the same real failure.
     env.write_config(&config_for(&sync_watch("notes", &notes)));
-    let mut daemon = env
-        .command(&["run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn vard run");
-    let health = env.health_file();
-    for _ in 0..100 {
-        if health.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(health.exists(), "the daemon never started");
+    let daemon = env.spawn_daemon();
     // The broken watch appears in the config only now, after daemon start.
     env.write_config(&config_for(&format!(
         "{}{}",
@@ -502,8 +471,7 @@ fn sync_named_unopenable_repo_fails_with_and_without_a_daemon() {
     )));
 
     let out = env.vard(&["sync", "broken"]);
-    let _ = daemon.kill();
-    let _ = daemon.wait();
+    drop(daemon);
 
     assert_eq!(
         code(&out),

@@ -65,6 +65,36 @@ const SYNC_DRAIN_TIMEOUT: Duration = Duration::from_secs(
 /// broken repository can only ever fail its own row.
 type Candidate = (ResolvedWatch, GitBackend);
 
+/// The disposition of a named sync target's repository — classified ONCE
+/// (open, then the remote probe) and rendered by both dispatch paths, so the
+/// in-process rows and the daemon-present refusals can never diverge on what a
+/// given repository state means.
+enum RepoDisposition {
+    /// The repository opened and defines the configured remote: runnable, with
+    /// the opened backend kept for injection.
+    Runnable(GitBackend),
+    /// The repository could not be opened at all — a real fault (exit 2).
+    Unopenable(vard_core::VcsError),
+    /// The repository opened but the remote probe itself failed (an unreadable
+    /// config) — also a real fault (exit 2), never masked as "no remote".
+    ProbeFailed(vard_core::VcsError),
+    /// The repository opened but does not define the configured remote — the
+    /// attention-class refusal (exit 1) for a named watch.
+    NoRemote,
+}
+
+/// Classifies a named target's repository (see [`RepoDisposition`]).
+fn classify_repo(spec: &WatchSpec) -> RepoDisposition {
+    match vard_core::open_git_backend(spec) {
+        Err(e) => RepoDisposition::Unopenable(e),
+        Ok(backend) => match backend.has_remote() {
+            Ok(true) => RepoDisposition::Runnable(backend),
+            Ok(false) => RepoDisposition::NoRemote,
+            Err(e) => RepoDisposition::ProbeFailed(e),
+        },
+    }
+}
+
 /// Entry point for `vard sync`.
 pub(crate) fn run(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     super::finish(run_inner(args, color, format))
@@ -125,17 +155,20 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
             } else if rw.paused {
                 (Vec::new(), vec![(paused_record(&name), 1)])
             } else {
-                match vard_core::open_git_backend(&rw.spec) {
-                    Err(e) => (Vec::new(), vec![(open_failed_record(&name, &e), 2)]),
-                    // A definite "no remote" refuses up front; a probe error
-                    // falls through to the cycle, whose own live gate reports
-                    // it as a real failure rather than masking it as
-                    // "no remote".
-                    Ok(backend) if matches!(backend.has_remote(), Ok(false)) => {
+                // One classification shared with the daemon-present path (see
+                // [`classify_repo`]): identical faults, identical wording.
+                match classify_repo(&rw.spec) {
+                    RepoDisposition::Runnable(backend) => (vec![(rw, backend)], Vec::new()),
+                    RepoDisposition::Unopenable(e) => {
+                        (Vec::new(), vec![(open_failed_record(&name, &e), 2)])
+                    }
+                    RepoDisposition::ProbeFailed(e) => {
+                        (Vec::new(), vec![(probe_failed_record(&name, &e), 2)])
+                    }
+                    RepoDisposition::NoRemote => {
                         let row = no_remote_record(&name, rw.spec.remote());
                         (Vec::new(), vec![(row, 1)])
                     }
-                    Ok(backend) => (vec![(rw, backend)], Vec::new()),
                 }
             }
         }
@@ -308,33 +341,30 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                     rw.spec.name()
                 )));
             }
-            // Distinguish the three repository dispositions honestly: an
-            // unopenable repository and a failing remote probe are real faults
-            // (exit 2, the same wording as the in-process failed row), while a
-            // genuinely missing remote is the attention-class refusal.
-            match vard_core::open_git_backend(&rw.spec) {
-                Err(e) => {
+            // One classification shared with the in-process path (see
+            // [`classify_repo`]): real faults exit 2, a missing remote is the
+            // attention-class refusal, with identical wording either way.
+            match classify_repo(&rw.spec) {
+                RepoDisposition::Runnable(_) => {}
+                RepoDisposition::Unopenable(e) => {
                     return Err(CmdError::err(format!(
                         "watch {}: cannot open repository: {e}",
                         rw.spec.name()
                     )));
                 }
-                Ok(backend) => match backend.has_remote() {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(CmdError::attention(format!(
-                            "sync is enabled for watch {} but {}",
-                            rw.spec.name(),
-                            sync_no_remote_reason(rw.spec.remote())
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(CmdError::err(format!(
-                            "watch {}: cannot probe the repository's remotes: {e}",
-                            rw.spec.name()
-                        )));
-                    }
-                },
+                RepoDisposition::ProbeFailed(e) => {
+                    return Err(CmdError::err(format!(
+                        "watch {}: cannot probe the repository's remotes: {e}",
+                        rw.spec.name()
+                    )));
+                }
+                RepoDisposition::NoRemote => {
+                    return Err(CmdError::attention(format!(
+                        "sync is enabled for watch {} but {}",
+                        rw.spec.name(),
+                        sync_no_remote_reason(rw.spec.remote())
+                    )));
+                }
             }
             Some(rw.spec.name().to_string())
         }
@@ -401,16 +431,7 @@ fn result_record(name: &str, remote: &str, outcome: &SyncOutcome, named: bool) -
         // pre-check and the cycle) is the same attention-class refusal the
         // pre-check makes — exit 1. On the no-selector path the row is
         // informational and does not force a non-zero exit.
-        SyncOutcome::NoRemote => (
-            record(
-                name,
-                "disabled",
-                Some(&sync_no_remote_reason(remote)),
-                None,
-                None,
-            ),
-            u8::from(named),
-        ),
+        SyncOutcome::NoRemote => (no_remote_record(name, remote), u8::from(named)),
         // The request never ran — the engine's drain gave up on a persistently
         // busy op gate, or the CLI's local no-answer cases (see `run_cycles`).
         SyncOutcome::NotRun(reason) => (record(name, "did not run", Some(reason), None, None), 2),
@@ -451,6 +472,19 @@ fn no_remote_record(name: &str, remote: &str) -> Record {
         name,
         "disabled",
         Some(&sync_no_remote_reason(remote)),
+        None,
+        None,
+    )
+}
+
+/// The row for a watch whose repository opened but whose remote probe failed
+/// (an unreadable config): a real failure (exit 2), the same classification
+/// the daemon-present path refuses with.
+fn probe_failed_record(name: &str, error: &vard_core::VcsError) -> Record {
+    record(
+        name,
+        "failed",
+        Some(&format!("cannot probe the repository's remotes: {error}")),
         None,
         None,
     )
