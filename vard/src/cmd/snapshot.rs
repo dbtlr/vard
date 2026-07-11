@@ -152,6 +152,9 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
             ),
             1,
         ),
+        // In-process snapshot is a sole vard actor, so `with_op_gate` never fails
+        // closed here; handle it defensively as an error rather than panicking.
+        Gated::LockFailed(detail) => (result_record(name, "error", Some(&detail), None, None), 2),
         Gated::Ran(Ok(Some(outcome))) => (committed_record(name, &outcome), 0),
         Gated::Ran(Ok(None)) => (result_record(name, "no changes", None, None, None), 0),
         Gated::Ran(Err(VcsError::UnsafeState(reason))) => (

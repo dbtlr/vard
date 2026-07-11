@@ -39,6 +39,14 @@
 //! If the op lock itself is held past the budget (a daemon worker mid-commit on
 //! this very watch), the restore reports a retryable "another operation holds the
 //! lock" attention outcome and changes nothing.
+//!
+//! The recoverable journal record is guaranteed on every real restore **except**
+//! one case: if the op gate cannot even be evaluated (op-lock or `begin`-write
+//! I/O trouble) *while a daemon is running*, the restore fails closed — it cannot
+//! prove exclusion against the daemon's worker, so it aborts with an attention
+//! outcome and changes nothing. With no daemon (the CLI is the sole vard actor)
+//! that same I/O trouble is non-fatal: git's own `index.lock` still serializes,
+//! so the restore proceeds and only the recovery record is missing.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -103,7 +111,8 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
     match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
             // No daemon: hold the instance lock (outer) across the restore; the op
-            // gate takes the op lock (inner) inside `real_restore`.
+            // gate takes the op lock (inner) inside `real_restore`. As the sole
+            // vard actor, an op-gate I/O error is non-fatal (git still serializes).
             let result = real_restore(
                 &paths,
                 &out,
@@ -112,13 +121,16 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
                 &rev,
                 file.as_deref(),
                 name,
+                super::OpGateActor::Sole,
             );
             drop(lock);
             result
         }
         // A daemon owns the repo. We do not hold the instance lock, but we still
         // op-lock + journal via the gate: the daemon's worker contends on the same
-        // op lock, so we serialize against it AND leave a recoverable record.
+        // op lock, so we serialize against it AND leave a recoverable record. If
+        // the op gate cannot even be evaluated here we fail closed (F3): we cannot
+        // prove exclusion against the daemon's worker.
         Ok(CliLock::DaemonHeld) => real_restore(
             &paths,
             &out,
@@ -127,6 +139,7 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
             &rev,
             file.as_deref(),
             name,
+            super::OpGateActor::DaemonCoexists,
         ),
         Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
             "another vard command is running; retry in a moment",
@@ -149,6 +162,7 @@ fn real_restore(
     rev: &VcsRef,
     file: Option<&Path>,
     name: &str,
+    actor: super::OpGateActor,
 ) -> CmdResult {
     // Protective snapshot first — a real restore may never destroy the only
     // copy of uncommitted work. The repo must be safe to commit into to protect
@@ -206,16 +220,31 @@ fn real_restore(
         Ok(protective)
     };
 
-    let protective = match super::with_op_gate(&paths.journal_dir, repo_path, name, "restore", flow)
-    {
+    let protective = match super::with_op_gate(
+        &paths.journal_dir,
+        repo_path,
+        name,
+        "restore",
+        actor,
+        flow,
+    ) {
         Gated::Ran(result) => result?,
-        // The daemon's worker (or another CLI) holds this watch's op lock; do not
-        // race it. Nothing was changed — no protective snapshot, no checkout.
+        // The daemon's worker (or another CLI) holds this watch's op lock; do
+        // not race it. Nothing was changed — no protective snapshot, no
+        // checkout.
         Gated::Busy => {
             return Err(CmdError::attention(
                 "another vard operation holds this watch's lock; retry in a moment — \
-                 nothing was changed",
+                     nothing was changed",
             ));
+        }
+        // The op gate could not be evaluated and a daemon coexists (F3): we
+        // cannot prove exclusion against its worker, so abort rather than
+        // restore unguarded. Nothing was changed.
+        Gated::LockFailed(detail) => {
+            return Err(CmdError::attention(format!(
+                "could not take {name:?}'s operation lock ({detail}); nothing was changed — retry"
+            )));
         }
     };
 

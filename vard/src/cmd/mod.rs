@@ -131,6 +131,27 @@ enum Gated<T> {
     Ran(T),
     /// Another operation held the op lock for the whole budget; nothing ran.
     Busy,
+    /// The op gate could not be evaluated (op-lock or `begin`-write I/O trouble)
+    /// while a **daemon coexists**, so we could not prove exclusion against its
+    /// worker. Fail closed: nothing ran. Only produced under
+    /// [`OpGateActor::DaemonCoexists`] — a sole CLI actor warns and proceeds
+    /// instead (git's own `index.lock` still serializes).
+    LockFailed(String),
+}
+
+/// Whether the CLI can prove itself the sole vard actor for this operation,
+/// which decides how an op-gate *error* is handled (F3).
+#[derive(Clone, Copy)]
+enum OpGateActor {
+    /// The CLI holds the instance lock (or no daemon runs): it is provably the
+    /// only vard process that could mutate this watch. An op-gate I/O error is
+    /// non-fatal — git's own `index.lock` still serializes — so warn and proceed
+    /// (matching the pre-VRD-37 "a journaling hiccup is non-fatal" behavior).
+    Sole,
+    /// A daemon owns the repositories (the CLI did not take the instance lock).
+    /// An op-gate error means we cannot prove exclusion against the daemon's
+    /// worker, so fail closed ([`Gated::LockFailed`]) — nothing is changed.
+    DaemonCoexists,
 }
 
 /// Runs `body` under the watch's operation gate: acquire the op lock (a bounded
@@ -146,11 +167,18 @@ enum Gated<T> {
 /// of the instance lock, so it protects the `restore`-under-a-daemon path too
 /// (the daemon's worker contends on the same op lock). The gate is keyed by the
 /// watch's repository path, so `watch_name` only words a diagnostic.
+///
+/// `actor` decides how an op-gate *error* is handled (F3): a
+/// [sole CLI actor](OpGateActor::Sole) warns and proceeds, but under a
+/// [coexisting daemon](OpGateActor::DaemonCoexists) an error fails closed
+/// ([`Gated::LockFailed`]) rather than mutate a watch the daemon's worker might
+/// be touching.
 fn with_op_gate<T>(
     journal_dir: &std::path::Path,
     repo_path: &std::path::Path,
     watch_name: &str,
     op: &str,
+    actor: OpGateActor,
     body: impl FnOnce() -> T,
 ) -> Gated<T> {
     let gate = JournalOpGate::for_repo_in_dir(journal_dir, repo_path);
@@ -161,14 +189,17 @@ fn with_op_gate<T>(
             Gated::Ran(result)
         }
         Ok(None) => Gated::Busy,
-        Err(err) => {
-            // Op-lock I/O trouble (e.g. the state dir is unwritable): warn and run
-            // WITHOUT the bracket, matching the pre-VRD-37 "a journaling hiccup is
-            // non-fatal" behavior. git's own index.lock still serializes the
-            // commands; only the recovery record is missing.
-            eprintln!("vard: op gate for {watch_name:?}: {err}");
-            Gated::Ran(body())
-        }
+        Err(err) => match actor {
+            // Sole vard actor: git's own index.lock still serializes, so warn and
+            // run WITHOUT the bracket (only the recovery record is missing).
+            OpGateActor::Sole => {
+                eprintln!("vard: op gate for {watch_name:?}: {err}");
+                Gated::Ran(body())
+            }
+            // A daemon coexists: we cannot prove exclusion against its worker, so
+            // fail closed — nothing runs.
+            OpGateActor::DaemonCoexists => Gated::LockFailed(err),
+        },
     }
 }
 
@@ -183,7 +214,14 @@ fn journaled_snapshot(
     backend: &GitBackend,
     req: &vard_core::SnapshotRequest,
 ) -> Gated<Result<Option<vard_core::SnapshotOutcome>, VcsError>> {
-    with_op_gate(journal_dir, repo_path, watch_name, "snapshot", || {
-        backend.snapshot(req)
-    })
+    // In-process `snapshot` runs only while holding the instance lock (no daemon),
+    // so the CLI is the sole vard actor — an op-gate error is non-fatal.
+    with_op_gate(
+        journal_dir,
+        repo_path,
+        watch_name,
+        "snapshot",
+        OpGateActor::Sole,
+        || backend.snapshot(req),
+    )
 }

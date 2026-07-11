@@ -67,11 +67,14 @@ restored notes to HEAD (protective snapshot 64268508b0b79c62716f868eb31a20c1843f
 
 If the [daemon](run.md) is running it keeps ownership of the repository; the restore still proceeds and the daemon snapshots the restored state afterward — by design. The restore takes the watch's per-watch operation lock across both the protective snapshot and the checkout, so it serializes against the daemon's own worker and records a recoverable journal entry **whether or not a daemon is running** — a crash mid-restore leaves a record the next daemon start (or a later `vard watch remove`) uses to prove any leftover git lock stale and clean it. If a daemon's worker is mid-commit on that same watch, the restore reports that another operation holds the lock and changes nothing; retry in a moment. Restoring a path that does not exist at the chosen reference reports a friendly error naming the path and the reference.
 
+The recoverable journal record is guaranteed on every real restore **except** one case: if the operation lock itself cannot be taken (an op-lock or journal I/O failure) *while a daemon is running*, the restore fails closed — it cannot prove exclusion against the daemon's worker, so it changes nothing and reports that it could not take the watch's operation lock (retry). With no daemon running the CLI is the sole writer, so the same I/O trouble is non-fatal: the restore proceeds under git's own index lock and only the recovery record is missing.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | The restore (or dry-run) completed. |
+| `1` | Nothing was changed and the watch needs attention — the repository is not in a safe state, another operation holds the watch's lock (retry), or, under a running daemon, the operation lock could not be taken. |
 | `2` | Operational error — an unresolved reference or path, both `--ref` and `--at` given, or an unparseable `--at`. |
 
 ## See also
