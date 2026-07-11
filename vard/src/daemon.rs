@@ -667,17 +667,18 @@ fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = 
 }
 
 /// Host-injects the out-of-tree reconcile scratch directory into every
-/// sync-enabled spec **whose repository actually has the configured remote**, so
-/// vard-core can run the sync cycle (it resolves no paths itself). The path is
-/// [`DaemonPaths::scratch_for`] — the *same* derivation [`recover_stale_locks`]
-/// prunes via [`GitSyncSettler`], so the engine reconciles in exactly the
-/// directory recovery cleans.
+/// sync-enabled spec, so vard-core can run the sync cycle (it resolves no paths
+/// itself). The path is [`DaemonPaths::scratch_for`] — the *same* derivation
+/// [`recover_stale_locks`] prunes via [`GitSyncSettler`], so the engine
+/// reconciles in exactly the directory recovery cleans.
 ///
-/// A non-sync spec is returned unchanged. A `sync = true` spec whose repository
-/// has **no** such remote is also returned unchanged (no scratch → sync stays
-/// disabled for it) with one clear log line, so a remote-less repo never latches
-/// a `SyncError` storm on doomed fetches. The remote check is a cheap,
-/// non-network config lookup ([`VcsBackend::has_remote`](vard_core::VcsBackend::has_remote)).
+/// Scratch injection depends ONLY on `sync = true`; it does **not** probe the
+/// remote (findings 4/5). The remote gate is LIVE inside the engine's sync cycle
+/// ([`VcsBackend::has_remote`](vard_core::VcsBackend::has_remote) at cycle
+/// start), so a remote added after the daemon started is picked up on the next
+/// request with no restart, and a request on a remote-less watch is answered
+/// honestly (an `Event::SyncSkipped` the daemon logs) rather than silently
+/// dropped. A non-sync spec is returned unchanged.
 fn inject_scratch_dirs(paths: &DaemonPaths, specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
     specs
         .into_iter()
@@ -685,31 +686,10 @@ fn inject_scratch_dirs(paths: &DaemonPaths, specs: Vec<WatchSpec>) -> Vec<WatchS
             if !spec.sync() {
                 return spec;
             }
-            if spec_has_remote(&spec) {
-                let scratch = paths.scratch_for(spec.path());
-                spec.with_scratch_dir(scratch)
-            } else {
-                info!(
-                    watch = spec.name(),
-                    remote = spec.remote(),
-                    "sync is enabled but the repository has no such remote; sync disabled for this watch"
-                );
-                spec
-            }
+            let scratch = paths.scratch_for(spec.path());
+            spec.with_scratch_dir(scratch)
         })
         .collect()
-}
-
-/// Whether `spec`'s repository defines its configured remote — a cheap,
-/// non-network probe. A repository that cannot be opened, or whose remote lookup
-/// errors, counts as "no remote" (sync stays disabled) rather than risking a
-/// doomed sync cycle.
-fn spec_has_remote(spec: &WatchSpec) -> bool {
-    use vard_core::VcsBackend;
-    vard_core::open_git_backend(spec)
-        .ok()
-        .and_then(|backend| backend.has_remote().ok())
-        .unwrap_or(false)
 }
 
 /// Builds a [`SyncSettler`](journal::SyncSettler) for a syncing watch, or `None`
@@ -1328,6 +1308,9 @@ fn log_event(event: &Event) {
             info!(event = name, %watch, %resolver, "sync conflict resolved");
         }
         Event::SyncFailed { watch, error } => warn!(event = name, %watch, %error, "sync failed"),
+        Event::SyncSkipped { watch, reason } => {
+            info!(event = name, %watch, %reason, "sync skipped")
+        }
         Event::RestoreCompleted {
             watch,
             restored_to,
@@ -2190,6 +2173,90 @@ mod tests {
             .map(|meta| meta.len())
             .unwrap_or(0);
         assert_eq!(len, 0, "a clean sync leaves no dangling journal record");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_added_after_daemon_start_is_picked_up_on_the_next_sync() {
+        // Findings 4/5: the remote gate is LIVE in the sync cycle, not a
+        // startup-only probe. A sync-enabled watch whose repo has no remote
+        // *configured* when the daemon starts still gets its scratch injected;
+        // once the remote is added (no daemon restart) a queued sync runs and
+        // pushes to it.
+        let root = tempfile::tempdir().unwrap();
+        let origin = bare_origin(&root.path().join("origin.git"));
+        let notes = root.path().join("notes");
+        // A normal synced repo (origin has `main`), but the remote is then
+        // REMOVED so the watch starts with no configured remote.
+        synced_repo(&notes, &origin);
+        git_ok(&notes, &["remote", "remove", "origin"]);
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"notes\"\npath = {notes:?}\nsync = true\n\
+                 branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            ),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // The remote is added AFTER the daemon started (and some local work made).
+        git_ok(
+            &notes,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        std::fs::write(notes.join("draft.txt"), "local work\n").unwrap();
+        request::write(
+            &paths.request_dir,
+            &request::Request::sync(Some("notes".to_string())),
+        )
+        .unwrap();
+
+        // The live gate now sees the remote, so the queued sync runs and pushes.
+        // The remote starts at the base (1 commit); the drained sync pushes the
+        // pre-sync commit, moving it to 2.
+        let mut pushed = false;
+        for _ in 0..400 {
+            if remote_commit_count(&origin) >= 2 {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            pushed,
+            "a remote added after daemon start must be picked up with no restart"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
     }
 
     use crate::journal::test_support::{plant_crashed, retry_until};

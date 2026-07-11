@@ -9,7 +9,9 @@ Reconcile a watch with its remote now: fetch the remote, reconcile local and rem
 
 The reconcile happens **out of tree**: local history is rebased onto the fetched remote inside a scratch worktree, never the working tree. A sync can never destroy uncommitted work: any uncommitted local work is committed by a pre-sync snapshot before it can be moved, and the step that makes the reconciled history live **refuses and retries rather than overwriting** if a local change (or a commit raced onto the branch) would be clobbered. The working tree only ever moves between fully-committed states.
 
-Syncing must be enabled for the watch — its `sync` key (or `defaults.sync`) must be on, with a `branch` and `remote` configured — and its repository must actually have that remote. A watch without syncing enabled, or whose repository has no such remote, is reported and skipped; asking for one by name exits `1`.
+Syncing must be enabled for the watch — its `sync` key (or `defaults.sync`) must be on, with a `branch` and `remote` configured — and its repository must actually have that remote. The remote is checked **live**, when the cycle runs (a cheap, non-network config lookup), not once at startup: a remote added after the daemon started is picked up on the next sync with no restart, and a request on a remote-less watch is answered honestly rather than silently dropped.
+
+With **no selector**, every sync-enabled watch is acted on and reported: one whose repository has no configured remote appears as an informational `disabled` row (its `detail` says so) and does **not** by itself make the command fail. Asking for a watch **by name** that has syncing disabled, is paused, or whose repository has no such remote is reported and exits `1`.
 
 ## Examples
 
@@ -35,7 +37,7 @@ vard sync --format json
 - **If the daemon is running**, it owns the repositories, so the sync is handed to it as a request and runs asynchronously. The command reports that the request was *queued*, not the cycle result.
 - **With no daemon running**, one cycle runs in-process under the single-instance lock — the same engine cycle the daemon drives — and the result is reported per watch.
 
-A cycle **fetches first**, then — inside a single locked window — commits any uncommitted local work (a pre-sync snapshot, tagged with a `Vard-Host` trailer naming the machine), reconciles out of tree, and advances; it then pushes. The advance never overwrites uncommitted work or a commit raced onto the branch: it refuses and the cycle is re-attempted (the next cycle's pre-sync snapshot commits the new work and reconciles it properly). A reconcile that hits a conflict git cannot resolve **latches** the watch `conflicted` and stops automatic syncing for it until the conflict is resolved; the command reports it and exits `1`. A network or authentication failure is reported and exits `2`.
+A cycle **fetches first**, then — inside a single locked window — commits any uncommitted local work (a pre-sync snapshot, tagged with a `Vard-Host` trailer naming the machine), reconciles out of tree, and advances; it then pushes. The advance never overwrites uncommitted work, a commit raced onto the branch, or a local **gitignored** file a remote change would clobber: it refuses and the cycle is re-attempted (the next cycle's pre-sync snapshot commits the new work and reconciles it properly). That re-attempt is **bounded** — a path being rewritten continuously so the advance keeps refusing terminates as a failure rather than looping forever. A reconcile that hits a conflict git cannot resolve **latches** the watch `conflicted` and stops automatic syncing for it until the conflict is resolved; the command reports it and exits `1`. A network or authentication failure is reported and exits `2`.
 
 ## Output
 
@@ -65,8 +67,8 @@ vard sync notes --format json
 
 | Code | Meaning |
 |---|---|
-| `0` | Every named watch was synced or queued (including `up to date`). |
-| `1` | Attention — a reconcile conflict latched a watch, or a named watch has syncing disabled (or its repository has no configured remote). |
+| `0` | Every acted-on watch was synced or queued (including `up to date`), or was an informational no-selector `disabled`/no-remote row. |
+| `1` | Attention — a reconcile conflict latched a watch, or a watch asked for **by name** has syncing disabled, is paused (the daemon will not sync it), or its repository has no configured remote. |
 | `2` | Operational error — a network or authentication failure, a sync that could not complete before the engine stopped, or a selector that resolves to no watch. |
 
 ## See also

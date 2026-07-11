@@ -86,6 +86,18 @@ fn mover_pushes(env: &Env, origin: &Path, file: &str, contents: &str) {
     std::fs::remove_dir_all(&dest).unwrap();
 }
 
+/// A sync-enabled repo whose config names `origin` but whose repository has NO
+/// such remote configured — the live remote gate must catch it.
+fn repo_missing_remote(env: &Env, name: &str) -> PathBuf {
+    let path = env.root.path().join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    git_ok(env, &path, &["init", "-b", "main"]);
+    std::fs::write(path.join("base.txt"), "base\n").unwrap();
+    git_ok(env, &path, &["add", "-A"]);
+    git_ok(env, &path, &["commit", "-m", "base"]);
+    std::fs::canonicalize(&path).unwrap()
+}
+
 fn config_for(watches: &str) -> String {
     format!("version = 1\n{watches}")
 }
@@ -199,6 +211,49 @@ fn sync_conflict_reports_and_exits_one() {
         "got: {}",
         stdout(&out)
     );
+}
+
+#[test]
+fn sync_all_shows_a_remote_less_watch_as_a_row_and_still_exits_zero() {
+    // Finding 5: with NO selector, a sync-enabled watch whose repository has no
+    // configured remote is NOT filtered out — it appears as an informational
+    // disabled/no-remote row that does NOT force a non-zero exit, while the other
+    // sync-enabled watch is synced normally.
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let notes = synced_repo(&env, "notes", &origin);
+    let solo = repo_missing_remote(&env, "solo");
+
+    let watches = format!(
+        "{}{}",
+        sync_watch("notes", &notes),
+        sync_watch("solo", &solo)
+    );
+    env.write_config(&config_for(&watches));
+
+    let out = env.vard(&["--format", "records", "sync"]);
+    assert_eq!(
+        code(&out),
+        0,
+        "an informational no-remote row must not force a non-zero exit; stderr: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    // Both watches get a row.
+    assert!(text.contains("name     notes"), "notes row missing: {text}");
+    assert!(text.contains("name     solo"), "solo row missing: {text}");
+    // The remote-less watch is shown disabled with a no-remote reason.
+    assert!(
+        text.contains("status   disabled") && text.contains("no configured remote"),
+        "solo should show a disabled/no-remote row: {text}"
+    );
+    // The remote-having watch actually synced (nothing to do here).
+    assert!(
+        text.contains("status   up to date"),
+        "notes not synced: {text}"
+    );
+    assert_journals_clean(&env);
 }
 
 #[test]

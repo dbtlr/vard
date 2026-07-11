@@ -89,10 +89,16 @@ fn run_inner(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> 
 fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
     let config = load_config(&paths.config_file)?;
 
-    // Resolve targets. A named target that exists but cannot sync — syncing
-    // disabled, or the repository has no configured remote — is reported as a
-    // disabled row (attention); with no selector we sync every sync-enabled watch
-    // whose repo has the remote and simply skip the rest.
+    // Resolve targets.
+    //
+    // * A NAMED target that exists but has syncing disabled, or (as a fast-path
+    //   UX check) whose repository has no configured remote, is reported as a
+    //   disabled row and exits 1 — the user asked for that one watch explicitly.
+    // * With NO selector we run every sync-enabled watch and do NOT pre-filter on
+    //   the remote (finding 5): the engine's live remote gate answers a
+    //   remote-less watch with a `NoRemote` outcome, which renders as an
+    //   informational disabled row that does NOT force a non-zero exit — so every
+    //   sync-enabled watch gets a row and the remote-having ones still sync.
     let (syncable, mut disabled_rows) = match &args.target {
         Some(t) => {
             let rw = select_one(&config, t)?;
@@ -107,10 +113,8 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
         }
         None => {
             let all = resolve_all(&config)?;
-            let syncable: Vec<ResolvedWatch> = all
-                .into_iter()
-                .filter(|rw| rw.spec.sync() && spec_has_remote(&rw.spec))
-                .collect();
+            let syncable: Vec<ResolvedWatch> =
+                all.into_iter().filter(|rw| rw.spec.sync()).collect();
             (syncable, Vec::new())
         }
     };
@@ -329,6 +333,20 @@ fn result_record(name: &str, outcome: &Outcome) -> (Record, u8) {
         Outcome::Ran(SyncOutcome::Disabled) => (
             record(name, "disabled", Some("sync is not enabled"), None, None),
             1,
+        ),
+        // The live remote gate found no configured remote. On the no-selector
+        // path this is an informational row (the watch was not named), so it does
+        // NOT force a non-zero exit — a named remote-less watch is already caught
+        // by the fast-path pre-check and never reaches here.
+        Outcome::Ran(SyncOutcome::NoRemote) => (
+            record(
+                name,
+                "disabled",
+                Some("the repository has no configured remote"),
+                None,
+                None,
+            ),
+            0,
         ),
         Outcome::NotRun(reason) => (record(name, "did not run", Some(reason), None, None), 2),
     }
