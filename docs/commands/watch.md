@@ -45,6 +45,8 @@ vard watch remove notes
 
 Register a directory as a watch. The directory must be a git repository; if it is not, `vard watch add` offers to run `git init` — on a terminal it prompts, non-interactively it declines unless `--init` is passed. The watch is recorded by its canonicalized path (symlinks resolved) plus a stable name (`--name`, or the directory's own name by default). Re-adding an existing name at a new path relinks that watch to the new location, keeping its metadata — the recovery path for a directory that moved.
 
+A running daemon resolves and caches each watch's canonical path once, at startup and on each config reload. If a watched path is a **symlink that you retarget to a different repository while the daemon is running**, the daemon keeps keying that watch's operation lock by the old target until it is **restarted** (or reloads). A CLI operation resolves the path freshly, so across that window the two could take different locks and not fully exclude each other — restart the daemon after retargeting a watched symlink if strict cross-process exclusion matters. Moving or relinking a directory the ordinary way (`vard watch add` at the new path, then reload) is unaffected.
+
 Adding also seeds the repository's private `.git/info/exclude` (never your tracked `.gitignore`) with vard's default excludes: dependency and build directories, OS cruft, and well-known secret shapes such as `.env`, `*.pem`, and `id_rsa*`. The write is idempotent — re-adding never duplicates lines and leaves your own exclude entries untouched.
 
 | Flag | Effect |

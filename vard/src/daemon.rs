@@ -95,6 +95,22 @@ use crate::request::{self, Request, RequestKind};
 /// keeps a bus event's `begin`/`complete` addressing the same journal file even
 /// if the directory is removed mid-operation, and spares a canonicalize syscall
 /// per event and per reload membership check (see [`journal::identity_path`]).
+///
+/// # Cached key vs. fresh canonicalize (retargeted symlinks) — F9
+///
+/// The op-lock and journal keys are canonicalized **once** here and cached for
+/// the life of this identity (one engine generation). That is deliberate — a key
+/// that stayed stable is exactly what lets a `begin` and its `complete` address
+/// one file even after the directory vanishes. The trade-off: if a watch's path
+/// is a symlink and it is **retargeted to a different repository** while the
+/// daemon runs, this identity keeps keying by the *old* canonical target until
+/// the daemon is **restarted** (or the engine generation is rebuilt). A CLI
+/// operation, which canonicalizes freshly, would key by the *new* target, so the
+/// two would take *different* op locks and not exclude each other across that
+/// window. Strict cross-process exclusion after a symlink retarget therefore
+/// requires a daemon restart. In practice `vard watch add` stores the already-
+/// canonical path and repositories are not moved under a live daemon, so the two
+/// forms coincide; this note records the residual for the symlink-retarget case.
 #[derive(Debug, Clone)]
 struct WatchIdentity {
     name: String,
@@ -1794,7 +1810,7 @@ mod tests {
         }
     }
 
-    use crate::journal::test_support::plant_crashed;
+    use crate::journal::test_support::{plant_crashed, retry_until};
 
     fn id(name: &str, path: &Path) -> WatchIdentity {
         WatchIdentity::new(name.to_string(), path.to_path_buf())
@@ -1886,10 +1902,7 @@ mod tests {
             .expect("op-lock I/O")
             .expect("the op lock is initially free");
         let journal = identity.journal(&journal_dir);
-        assert!(
-            journal.path().metadata().unwrap().len() > 0,
-            "the old worker's begin is recorded"
-        );
+        assert!(!journal.is_clean(), "the old worker's begin is recorded");
 
         // New worker (a fresh gate for the same watch) is refused: busy.
         let new_gate = identity.op_gate(&journal_dir);
@@ -1899,13 +1912,9 @@ mod tests {
              double-journal or double-commit onto the same watch"
         );
 
-        // The old worker completes: journal compacted exactly once, lock released.
+        // The old worker completes: journal compacted, lock released.
         old_guard.complete();
-        assert_eq!(
-            journal.path().metadata().unwrap().len(),
-            0,
-            "complete compacts the shared journal exactly once"
-        );
+        assert!(journal.is_clean(), "complete compacts the shared journal");
 
         // Only now can the new worker proceed. Retry briefly: a *sibling* test's
         // `Command::spawn` forks this process, and between the fork and the
@@ -1914,13 +1923,13 @@ mod tests {
         // window is a pure test artifact (production never reacquires like this);
         // instance.rs documents the same race.
         let mut new_guard: Option<Box<dyn OpGuard>> = None;
-        for _ in 0..100 {
-            if let Some(guard) = new_gate.begin("snapshot").expect("op-lock I/O") {
+        retry_until(|| match new_gate.begin("snapshot").expect("op-lock I/O") {
+            Some(guard) => {
                 new_guard = Some(guard);
-                break;
+                true
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            None => false,
+        });
         new_guard
             .expect("with the old op done, the new worker must be able to proceed")
             .complete();
