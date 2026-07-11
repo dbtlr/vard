@@ -1353,14 +1353,22 @@ fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdenti
     }
 }
 
-/// Reads a file's content and returns its FNV-1a fingerprint, or `None` if the
-/// file is missing or unreadable — the same posture the old mtime check had.
-/// The config file is tiny, so a read-and-hash on every poll tick is cheap
-/// enough to be the whole "did it change?" check; mtime alone can't be, since
-/// two back-to-back CLI writes can land in the same 1-second mtime tick and be
-/// indistinguishable by timestamp (VRD-35).
-fn config_fingerprint(path: &Path) -> Option<u64> {
-    std::fs::read(path).ok().map(|bytes| journal::fnv1a(&bytes))
+/// The config file's change-detection key: its byte length plus the FNV-1a
+/// hash of its content. The length is a free strict reduction of the (already
+/// tiny) hash-collision risk, since most real edits change the file's size.
+type ConfigFingerprint = (u64, u64);
+
+/// Reads a file's content and returns its [`ConfigFingerprint`], or `None` if
+/// the file is missing or unreadable — the same posture the old mtime check
+/// had (an empty file is `Some`, distinct from a missing one). The config file
+/// is tiny, so a read-and-hash on every poll tick is cheap enough to be the
+/// whole "did it change?" check; mtime alone can't be, since two back-to-back
+/// CLI writes can land in the same 1-second mtime tick and be indistinguishable
+/// by timestamp (VRD-35).
+fn config_fingerprint(path: &Path) -> Option<ConfigFingerprint> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| (bytes.len() as u64, journal::fnv1a(&bytes)))
 }
 
 /// A one-cycle debounce over the config file's content fingerprint: it reports
@@ -1369,14 +1377,14 @@ fn config_fingerprint(path: &Path) -> Option<u64> {
 /// collapses into a single settled signal rather than a rebuild per write.
 struct ConfigDebounce {
     /// The last fingerprint we reported as settled.
-    stable: Option<u64>,
+    stable: Option<ConfigFingerprint>,
     /// A new fingerprint seen once, awaiting a second confirming poll.
-    pending: Option<u64>,
+    pending: Option<ConfigFingerprint>,
 }
 
 impl ConfigDebounce {
     /// Starts from an initial (settled) fingerprint.
-    fn new(initial: Option<u64>) -> ConfigDebounce {
+    fn new(initial: Option<ConfigFingerprint>) -> ConfigDebounce {
         ConfigDebounce {
             stable: initial,
             pending: None,
@@ -1385,7 +1393,7 @@ impl ConfigDebounce {
 
     /// Feeds the current fingerprint; returns `true` exactly when a settled
     /// change is detected (a new value seen on two consecutive polls).
-    fn poll(&mut self, current: Option<u64>) -> bool {
+    fn poll(&mut self, current: Option<ConfigFingerprint>) -> bool {
         if current == self.stable {
             // Back to (or still at) the settled value: cancel any pending change.
             self.pending = None;
@@ -1550,8 +1558,8 @@ mod tests {
 
     #[test]
     fn config_debounce_needs_two_stable_polls_to_fire() {
-        let h0: u64 = 0;
-        let h1: u64 = 1;
+        let h0: ConfigFingerprint = (0, 0);
+        let h1: ConfigFingerprint = (0, 1);
         let mut d = ConfigDebounce::new(Some(h0));
 
         // No change: never fires.
@@ -1566,8 +1574,8 @@ mod tests {
 
     #[test]
     fn config_debounce_cancels_a_reverted_change() {
-        let h0: u64 = 0;
-        let h1: u64 = 1;
+        let h0: ConfigFingerprint = (0, 0);
+        let h1: ConfigFingerprint = (0, 1);
         let mut d = ConfigDebounce::new(Some(h0));
 
         // A flicker to h1 then back to h0 before confirming: no fire.
@@ -1602,10 +1610,25 @@ mod tests {
     }
 
     #[test]
-    fn config_fingerprint_is_none_for_a_missing_file() {
+    fn config_fingerprint_distinguishes_missing_empty_and_length() {
         let dir = tempfile::tempdir().unwrap();
+
+        // Missing file: `None`, matching the old mtime check's posture.
         let missing = dir.path().join("nope.toml");
         assert_eq!(config_fingerprint(&missing), None);
+
+        // Empty file: `Some`, distinct from missing.
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, b"").unwrap();
+        let empty_fp = config_fingerprint(&empty).expect("empty file fingerprints as Some");
+        assert_eq!(empty_fp.0, 0, "empty file has length 0");
+
+        // The length component alone separates same-hash-risk inputs of
+        // different sizes.
+        let short = dir.path().join("short.toml");
+        std::fs::write(&short, b"a").unwrap();
+        assert_eq!(config_fingerprint(&short).unwrap().0, 1);
+        assert_ne!(config_fingerprint(&short), Some(empty_fp));
     }
 
     // --- source-died backoff -------------------------------------------------
