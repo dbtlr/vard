@@ -47,16 +47,19 @@
 //! everything else in place, so a request mid-write is never half-read or
 //! deleted.
 //!
-//! # Config and request watching: mtime polling, not a notifier
+//! # Config and request watching: polling, not a notifier
 //!
-//! Both the config file and the request directory are watched by a lightweight
-//! mtime poll (default every [`DEFAULT_POLL_INTERVAL`]), not by arming a
+//! Both the config file and the request directory are watched by polling on a
+//! fixed interval (default every [`DEFAULT_POLL_INTERVAL`]), not by arming a
 //! `vard-core` [`Watcher`](vard_core::Watcher) on them. Polling is simpler and
 //! avoids a feedback loop on the request directory (the daemon itself deletes
 //! files there, which a notifier would report back as activity); a couple of
-//! seconds of latency on a control-plane path is immaterial. Config edits are
-//! debounced (see [`MtimeDebounce`]) so an editor writing several times in a row
-//! collapses into a single rebuild.
+//! seconds of latency on a control-plane path is immaterial. Config change
+//! detection keys off a content fingerprint rather than mtime: on filesystems
+//! with 1-second mtime granularity, two back-to-back CLI writes can land in the
+//! same tick and be indistinguishable by timestamp alone (VRD-35). The
+//! fingerprint is debounced (see [`ConfigDebounce`]) so an editor writing
+//! several times in a row still collapses into a single rebuild.
 //!
 //! # Testability
 //!
@@ -191,7 +194,7 @@ impl std::ops::Deref for WatchSet {
     }
 }
 
-/// How often the supervisor polls the config file's mtime and drains the
+/// How often the supervisor polls the config file's content and drains the
 /// request directory. A control-plane cadence: fast enough that a manual
 /// snapshot request feels responsive, slow enough to be negligible overhead.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -966,7 +969,7 @@ async fn supervise(
 ) {
     let mut poll = tokio::time::interval(poll_interval);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut config_mtime = MtimeDebounce::new(file_mtime(&paths.config_file));
+    let mut config_debounce = ConfigDebounce::new(config_fingerprint(&paths.config_file));
     let mut backoff = SourceDiedBackoff::new();
     // When set, a source-died rebuild is due at this deadline.
     let mut rebuild_at: Option<TokioInstant> = None;
@@ -1000,7 +1003,7 @@ async fn supervise(
             }
             _ = poll.tick() => {
                 process_requests(&paths, &handle, &watches);
-                if config_mtime.poll(file_mtime(&paths.config_file)) {
+                if config_debounce.poll(config_fingerprint(&paths.config_file)) {
                     info!("config file changed; reloading");
                     Action::Reload
                 } else {
@@ -1350,36 +1353,39 @@ fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdenti
     }
 }
 
-/// Reads a file's modification time, or `None` if it is missing or unreadable.
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
+/// Reads a file's content and returns its FNV-1a fingerprint, or `None` if the
+/// file is missing or unreadable — the same posture `file_mtime` used to have.
+/// The config file is tiny, so a read-and-hash on every poll tick is cheap
+/// enough to be the whole "did it change?" check; mtime alone can't be, since
+/// two back-to-back CLI writes can land in the same 1-second mtime tick and be
+/// indistinguishable by timestamp (VRD-35).
+fn config_fingerprint(path: &Path) -> Option<u64> {
+    std::fs::read(path).ok().map(|bytes| journal::fnv1a(&bytes))
 }
 
-/// A one-cycle debounce over a file's mtime: it reports a change only once the
-/// mtime has held steady at a new value across two consecutive polls, so a burst
-/// of writes (an editor saving repeatedly) collapses into a single settled
-/// signal rather than a rebuild per write.
-struct MtimeDebounce {
-    /// The last mtime we reported as settled.
-    stable: Option<SystemTime>,
-    /// A new mtime seen once, awaiting a second confirming poll.
-    pending: Option<SystemTime>,
+/// A one-cycle debounce over the config file's content fingerprint: it reports
+/// a change only once the fingerprint has held steady at a new value across two
+/// consecutive polls, so a burst of writes (an editor saving repeatedly)
+/// collapses into a single settled signal rather than a rebuild per write.
+struct ConfigDebounce {
+    /// The last fingerprint we reported as settled.
+    stable: Option<u64>,
+    /// A new fingerprint seen once, awaiting a second confirming poll.
+    pending: Option<u64>,
 }
 
-impl MtimeDebounce {
-    /// Starts from an initial (settled) mtime.
-    fn new(initial: Option<SystemTime>) -> MtimeDebounce {
-        MtimeDebounce {
+impl ConfigDebounce {
+    /// Starts from an initial (settled) fingerprint.
+    fn new(initial: Option<u64>) -> ConfigDebounce {
+        ConfigDebounce {
             stable: initial,
             pending: None,
         }
     }
 
-    /// Feeds the current mtime; returns `true` exactly when a settled change is
-    /// detected (a new value seen on two consecutive polls).
-    fn poll(&mut self, current: Option<SystemTime>) -> bool {
+    /// Feeds the current fingerprint; returns `true` exactly when a settled
+    /// change is detected (a new value seen on two consecutive polls).
+    fn poll(&mut self, current: Option<u64>) -> bool {
         if current == self.stable {
             // Back to (or still at) the settled value: cancel any pending change.
             self.pending = None;
@@ -1540,34 +1546,66 @@ mod tests {
         assert_eq!(log_level_to_tracing(LogLevel::Trace), tracing::Level::TRACE);
     }
 
-    // --- mtime debounce ------------------------------------------------------
+    // --- config debounce ------------------------------------------------------
 
     #[test]
-    fn mtime_debounce_needs_two_stable_polls_to_fire() {
-        let t0 = SystemTime::UNIX_EPOCH;
-        let t1 = t0 + Duration::from_secs(1);
-        let mut d = MtimeDebounce::new(Some(t0));
+    fn config_debounce_needs_two_stable_polls_to_fire() {
+        let h0: u64 = 0;
+        let h1: u64 = 1;
+        let mut d = ConfigDebounce::new(Some(h0));
 
         // No change: never fires.
-        assert!(!d.poll(Some(t0)));
+        assert!(!d.poll(Some(h0)));
         // First sighting of the new value: still debouncing.
-        assert!(!d.poll(Some(t1)));
+        assert!(!d.poll(Some(h1)));
         // Second, confirming poll at the same value: fires once.
-        assert!(d.poll(Some(t1)));
+        assert!(d.poll(Some(h1)));
         // Settled; no re-fire without a further change.
-        assert!(!d.poll(Some(t1)));
+        assert!(!d.poll(Some(h1)));
     }
 
     #[test]
-    fn mtime_debounce_cancels_a_reverted_change() {
-        let t0 = SystemTime::UNIX_EPOCH;
-        let t1 = t0 + Duration::from_secs(1);
-        let mut d = MtimeDebounce::new(Some(t0));
+    fn config_debounce_cancels_a_reverted_change() {
+        let h0: u64 = 0;
+        let h1: u64 = 1;
+        let mut d = ConfigDebounce::new(Some(h0));
 
-        // A flicker to t1 then back to t0 before confirming: no fire.
-        assert!(!d.poll(Some(t1)));
-        assert!(!d.poll(Some(t0)));
-        assert!(!d.poll(Some(t0)));
+        // A flicker to h1 then back to h0 before confirming: no fire.
+        assert!(!d.poll(Some(h1)));
+        assert!(!d.poll(Some(h0)));
+        assert!(!d.poll(Some(h0)));
+    }
+
+    // --- config fingerprint (VRD-35) -------------------------------------------
+
+    #[test]
+    fn config_fingerprint_ignores_mtime_and_keys_off_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, b"version = 1\n").unwrap();
+        let unchanged = config_fingerprint(&config);
+
+        // Bump mtime with no content change: the fingerprint — and therefore
+        // the debounce fed by it — must not see a change. This is the
+        // behavior improvement over a pure mtime check: a hash-equal file
+        // never triggers a reload no matter how its mtime moves.
+        set_mtime(&config, SystemTime::now() + Duration::from_secs(120));
+        assert_eq!(
+            config_fingerprint(&config),
+            unchanged,
+            "identical content must fingerprint identically regardless of mtime"
+        );
+
+        let mut debounce = ConfigDebounce::new(unchanged);
+        assert!(!debounce.poll(config_fingerprint(&config)));
+        assert!(!debounce.poll(config_fingerprint(&config)));
+    }
+
+    #[test]
+    fn config_fingerprint_is_none_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert_eq!(config_fingerprint(&missing), None);
     }
 
     // --- source-died backoff -------------------------------------------------
@@ -1665,6 +1703,18 @@ mod tests {
         git_ok(repo, &["config", "commit.gpgsign", "false"]);
         git_ok(repo, &["commit", "--allow-empty", "-m", "root"]);
         assert_eq!(commit_count(repo), 1);
+    }
+
+    /// Forces a file's mtime to an exact value, standing in for a coarse
+    /// (1-second granularity) filesystem where two quick writes can land in
+    /// the same tick (VRD-35).
+    fn set_mtime(path: &Path, time: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
     }
 
     /// Polls until `repo` has at least `at_least` commits, occasionally
@@ -2132,6 +2182,90 @@ mod tests {
         assert!(
             !daemon.is_finished(),
             "daemon must stay running after pausing its last watch"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_detects_a_second_same_tick_config_edit_by_content() {
+        // VRD-15's review: an mtime-only debounce can settle on a value and
+        // then silently ignore a later edit that happens to land on the exact
+        // same (coarse, 1-second) mtime. Pin two content-different writes to
+        // the identical mtime and confirm the second is still detected —
+        // proof the poll's "did it change?" predicate now keys off content.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        let idle = format!(
+            "version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"200ms\"\npaused = true\n",
+        );
+        std::fs::write(&config_file, &idle).unwrap();
+
+        let paths = DaemonPaths {
+            config_file: config_file.clone(),
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths,
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // Let startup settle into the idle engine.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Edit A activates the watch. Pin its mtime to a fixed instant.
+        let same_tick = SystemTime::now();
+        let active = format!(
+            "version = 1\n\n[[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"200ms\"\npaused = false\n",
+        );
+        std::fs::write(&config_file, &active).unwrap();
+        set_mtime(&config_file, same_tick);
+
+        // The one-cycle debounce settles over two poll ticks and the watch
+        // goes live; a write now reaches a commit.
+        let note = repo.join("note.md");
+        std::fs::write(&note, b"first").unwrap();
+        wait_for_commits(&repo, 2, Some(&note)).await;
+
+        // Edit B re-pauses the watch: different content, but pinned to the
+        // SAME mtime as edit A — simulating two back-to-back CLI writes
+        // landing in one mtime tick on a coarse filesystem.
+        std::fs::write(&config_file, &idle).unwrap();
+        set_mtime(&config_file, same_tick);
+
+        // Give the debounce two more poll cycles to settle on the new content.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Prove the daemon really went idle again: a further write must NOT
+        // produce a new commit. An mtime-only debounce would have missed edit
+        // B (same mtime as the already-settled edit A) and kept snapshotting.
+        let before = commit_count(&repo);
+        std::fs::write(&note, b"second").unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            commit_count(&repo),
+            before,
+            "edit B (same mtime as edit A, different content) must still be \
+             detected and re-pause the watch"
         );
 
         shutdown.notify_one();
