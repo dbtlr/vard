@@ -327,12 +327,41 @@ impl fmt::Display for WatchState {
 /// `SourceDied` by rebuilding the engine (the watch is otherwise permanently
 /// silent); it need not react to `Degraded` the same way. `#[non_exhaustive]`
 /// so finer kinds can be added later without a breaking change.
+///
+/// # Latching vs self-clearing
+///
+/// [`WatchState::Attention`] means "needs attention — never silently
+/// resolved." What resolves it splits into two shapes, and [`latches`](Self::latches)
+/// is the classification:
+///
+/// - **Self-clearing** (`latches() == false`): the *same worker*'s next
+///   successful pass (a commit or a skip-to-clean) is proof the condition is
+///   gone, so the engine reflects that proof back to `Ok` itself. This is
+///   right for a fault in the snapshotting mechanism — a hard backend error,
+///   a panic — where nothing about the fault needs a human's judgment and a
+///   successful pass on this exact watch is direct evidence it recovered.
+/// - **Latching** (`latches() == true`): a successful pass on this worker
+///   proves *nothing* about the condition, so the engine must never guess
+///   `Ok` on its own. That covers two different shapes for the same reason:
+///   a human-decision condition (moving a secret out of a snapshot,
+///   acknowledging a moved directory — none exist in this codebase yet) where
+///   only an explicit operator action may resolve it, and [`SourceDied`](TroubleKind::SourceDied),
+///   where only the daemon replacing this worker outright proves the signal
+///   source is alive again — a commit this same (dying) worker manages to
+///   make in the meantime says nothing about that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TroubleKind {
     /// The watcher's or scheduler's per-watch task ended abnormally (panicked
     /// or exited unexpectedly) and is no longer producing signals for this
     /// watch.
+    ///
+    /// Latching: a daemon supervisor reacts by rebuilding the engine (the
+    /// watch is otherwise permanently silent), and only that rebuild — a
+    /// fresh worker starting at `Ok` — proves the source is alive again. A
+    /// successful pass squeezed out of *this* worker in the meantime (a
+    /// manual trigger, a leftover pending change) proves nothing about the
+    /// dead source, so it must not self-clear this condition.
     SourceDied,
     /// Snapshots are failing for this watch: a hard [`snapshot`](crate::VcsBackend::snapshot)
     /// error, or a failed [`is_safe_state`](crate::VcsBackend::is_safe_state)
@@ -343,9 +372,15 @@ pub enum TroubleKind {
     /// state — not merely a one-off [`Event::SnapshotFailed`] — is what lets
     /// health/status projections see the product's core silent-data-loss case:
     /// a repository whose snapshots are quietly not landing.
+    ///
+    /// Self-clearing: this watch's own next successful pass clears it.
     SnapshotsFailing,
     /// Any other condition needing attention: a channel overflow, a panicked
     /// backend call, and so on. The signal source itself is still alive.
+    ///
+    /// Self-clearing: this watch's own next successful pass clears it — a
+    /// subsequent successful snapshot proves the watch healthy again, panic
+    /// included.
     Degraded,
 }
 
@@ -357,6 +392,29 @@ impl fmt::Display for TroubleKind {
             TroubleKind::Degraded => "degraded",
         };
         f.write_str(s)
+    }
+}
+
+impl TroubleKind {
+    /// Whether this trouble condition **latches**: once set, it stays in
+    /// [`WatchState::Attention`] until something other than this watch's own
+    /// next successful pass resolves it — an explicit operator action, or (for
+    /// [`SourceDied`](TroubleKind::SourceDied)) the daemon replacing this
+    /// worker outright. `false` means the opposite: the worker's own next
+    /// successful pass is direct proof the condition is gone, so the engine
+    /// clears it automatically. See the type-level docs for the full
+    /// contract and why `SourceDied` latches despite being failure-class, not
+    /// a human decision.
+    ///
+    /// Deliberately exhaustive with no wildcard arm: adding a kind without
+    /// updating this method fails to compile, so the next author is forced to
+    /// choose a side rather than inherit a default.
+    pub fn latches(self) -> bool {
+        match self {
+            TroubleKind::SourceDied => true,
+            TroubleKind::SnapshotsFailing => false,
+            TroubleKind::Degraded => false,
+        }
     }
 }
 
@@ -675,5 +733,24 @@ mod tests {
             SkipReason::RetryStillFailing.to_string(),
             "retry-still-failing"
         );
+    }
+
+    #[test]
+    fn snapshot_failures_and_backend_panics_self_clear() {
+        // Both are faults in the snapshotting mechanism: this watch's own
+        // next successful pass is direct proof they are gone.
+        assert!(!TroubleKind::SnapshotsFailing.latches());
+        assert!(!TroubleKind::Degraded.latches());
+    }
+
+    #[test]
+    fn source_died_latches_because_only_a_rebuild_proves_it_resolved() {
+        // A successful pass squeezed out of the dying worker itself (a manual
+        // trigger, a leftover pending change) proves nothing about whether the
+        // signal source is alive again — only the daemon's engine rebuild
+        // does. No human-decision kind exists yet, but this is a real,
+        // shipping latching kind, for a different reason: not "a human must
+        // decide", but "this worker cannot prove it".
+        assert!(TroubleKind::SourceDied.latches());
     }
 }
