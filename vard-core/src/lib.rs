@@ -31,8 +31,9 @@ pub use config::{
 };
 pub use engine::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE, DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
-    DEFAULT_UNSAFE_REPOLL_INTERVAL, DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder,
-    EngineError, EngineHandle, SharedBackend, WatchStatus, open_git_backend,
+    DEFAULT_SYNC_NETWORK_TIMEOUT, DEFAULT_UNSAFE_REPOLL_INTERVAL,
+    DEFAULT_UNSAFE_REPOLL_MAX_ATTEMPTS, Engine, EngineBuilder, EngineError, EngineHandle,
+    SYNC_MAX_ATTEMPTS, SharedBackend, SyncOutcome, WatchStatus, open_git_backend,
 };
 pub use event::{
     DEFAULT_CAPACITY, Event, EventBus, EventReceiver, RecvError, Resolver, SkipReason, Trigger,
@@ -42,9 +43,9 @@ pub use gate::{NoOpGate, OpGate, OpGateError, OpGuard, SharedGate};
 pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
 pub use vcs::git::GitBackend;
 pub use vcs::{
-    ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
-    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, UnsafeReason,
-    VcsBackend, VcsError, VcsRef,
+    AdvanceOutcome, ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome,
+    RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest,
+    UnsafeReason, VcsBackend, VcsError, VcsRef,
 };
 pub use watcher::{
     ArmMode, DEFAULT_POLL_INTERVAL, MuteGuard, WatchHandle, Watcher, WatcherError, WatcherRx,

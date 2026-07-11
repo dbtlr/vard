@@ -49,9 +49,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::{
-    ChangeSummary, LogFilter, PushOutcome, ReconcileOutcome, RemoteState, RestoreTarget, SafeState,
-    Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, TRAILER_KEY, UnsafeReason, VcsBackend,
-    VcsError, VcsRef, trigger_from_str,
+    AdvanceOutcome, ChangeSummary, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
+    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, TRAILER_KEY,
+    UnsafeReason, VcsBackend, VcsError, VcsRef, trigger_from_str,
 };
 use crate::config::DEFAULT_REMOTE;
 use crate::vcs::CommitMessage;
@@ -364,7 +364,7 @@ impl GitBackend {
     fn worktree_remove(&self, scratch: &Path) -> Result<(), VcsError> {
         let out = git_output(
             &self.path,
-            &[],
+            &[CFG_NO_HOOKS],
             [
                 OsStr::new("worktree"),
                 OsStr::new("remove"),
@@ -621,7 +621,7 @@ impl VcsBackend for GitBackend {
         );
         let out = git_output_timed(
             &self.path,
-            &[],
+            &[CFG_NO_HOOKS],
             ["fetch", self.remote.as_str(), refspec.as_str()],
             "fetch",
             timeout,
@@ -679,10 +679,12 @@ impl VcsBackend for GitBackend {
         // branch positional is the SHORT name: `git worktree add --detach`
         // checks the branch's commit out detached, leaving the branch itself
         // unmoved. Branch names cannot begin with `-`, so it cannot inject a
-        // flag.
+        // flag. The hooks pin keeps the checkout `worktree add` performs from
+        // firing a user's post-checkout hook (arbitrary code from a background
+        // daemon; it could hang or break the sync).
         let add = git_output(
             &self.path,
-            &[],
+            &[CFG_NO_HOOKS],
             [
                 OsStr::new("worktree"),
                 OsStr::new("add"),
@@ -706,7 +708,11 @@ impl VcsBackend for GitBackend {
         outcome
     }
 
-    fn advance(&self, target: &SnapshotId) -> Result<(), VcsError> {
+    fn advance(
+        &self,
+        target: &SnapshotId,
+        expected_tip: &SnapshotId,
+    ) -> Result<AdvanceOutcome, VcsError> {
         self.ensure_safe()?;
 
         // Verify the target exists before touching the tree, so a bad id fails
@@ -719,13 +725,61 @@ impl VcsBackend for GitBackend {
             });
         }
 
-        // Move the branch and work tree to `target`. Idempotent: git exits 0
-        // resetting to the current HEAD, changing nothing. The hooks pin keeps
-        // a user's post-checkout hook from running; signing does not apply to a
-        // reset. Preconditions (clean, committed tree) are the caller's to
-        // uphold — see the trait docs.
-        self.run(&[CFG_NO_HOOKS], ["reset", "--hard", target.as_str()])?;
-        Ok(())
+        // Guard the BRANCH REF: `checkout -B` moves the branch to `target`, so a
+        // commit the user landed on the branch after the reconcile captured its
+        // tip must not be silently stranded. Refuse when the tip no longer equals
+        // what the reconcile consumed. Read immediately before the checkout; the
+        // residual check-to-checkout race is documented on the trait (the op lock
+        // excludes vard writers, so only a user racing their own commit is
+        // exposed, and that is reflog-recoverable).
+        let branch_ref = format!("refs/heads/{}", self.branch);
+        let current_tip = self.rev_of(&branch_ref)?;
+        if current_tip.as_deref() != Some(expected_tip.as_str()) {
+            return Ok(AdvanceOutcome::WouldClobber);
+        }
+
+        // Move the branch and tree to `target` with SAFE checkout semantics:
+        // `checkout -B <branch> <target>` refuses (non-zero, nothing changed)
+        // when a locally-modified tracked file or an untracked file would be
+        // clobbered, and carries non-conflicting local edits over unharmed. The
+        // hooks pin keeps a user's post-checkout hook from running. Idempotent:
+        // checking the branch out onto its own tip is a clean no-op.
+        let out = git_output(
+            &self.path,
+            &[CFG_NO_HOOKS],
+            ["checkout", "-B", self.branch.as_str(), target.as_str()],
+            false,
+        )?;
+        if out.status.success() {
+            return Ok(AdvanceOutcome::Advanced);
+        }
+        // git's checkout refusal messages for the clobber cases. Classify them as
+        // a WouldClobber refusal (never destructive); anything else is a real
+        // failure (a held lock, a broken repo).
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("would be overwritten")
+            || stderr.contains("Please commit your changes or stash them")
+            || stderr.contains("Please move or remove them before you switch branches")
+        {
+            return Ok(AdvanceOutcome::WouldClobber);
+        }
+        Err(classify_failure("checkout", &out))
+    }
+
+    fn has_remote(&self) -> Result<bool, VcsError> {
+        // A cheap, non-network config lookup: `git config remote.<name>.url`
+        // exits 0 with the URL when the remote is defined and exit 1 (no output)
+        // when it is not. Never contacts the remote.
+        let key = format!("remote.{}.url", self.remote);
+        let out = git_output(&self.path, &[], ["config", "--get", key.as_str()], false)?;
+        if out.status.success() {
+            return Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
+        }
+        if out.status.code() == Some(1) {
+            // `--get` exits 1 for a key that is not set.
+            return Ok(false);
+        }
+        Err(classify_failure("config", &out))
     }
 
     fn prune_scratch(&self, scratch: &Path) -> Result<(), VcsError> {
@@ -734,7 +788,7 @@ impl VcsBackend for GitBackend {
         self.worktree_remove(scratch)?;
         // ...then reap metadata for a worktree whose directory a crash deleted
         // out from under git but whose administrative entry remains.
-        let prune = git_output(&self.path, &[], ["worktree", "prune"], false)?;
+        let prune = git_output(&self.path, &[CFG_NO_HOOKS], ["worktree", "prune"], false)?;
         if !prune.status.success() {
             return Err(classify_failure("worktree prune", &prune));
         }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use vard_core::vcs::git::GitBackend;
 use vard_core::{
-    LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState, SnapshotId,
+    AdvanceOutcome, LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState, SnapshotId,
     SnapshotOutcome, SnapshotRequest, Trigger, UnsafeReason, VcsBackend, VcsError, VcsRef,
 };
 
@@ -1146,7 +1146,11 @@ fn reconcile_out_of_tree_then_advance_lands_both_sides() {
     assert!(!scr.exists(), "scratch worktree removed");
 
     // Advance lands it: branch and tree move to the rebased tip, still clean.
-    fx.a.advance(&new_head).unwrap();
+    // The expected tip is the branch tip the reconcile consumed (a_local).
+    assert_eq!(
+        fx.a.advance(&new_head, &a_local).unwrap(),
+        AdvanceOutcome::Advanced
+    );
     assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), new_head.as_str());
     assert!(
         porcelain(fx.a_tmp.path()).is_empty(),
@@ -1241,6 +1245,49 @@ fn reconcile_with_a_broken_signer_still_rebases() {
 }
 
 #[test]
+fn reconcile_and_advance_ignore_a_failing_post_checkout_hook() {
+    // A user's post-checkout hook must never run under vard's automated sync:
+    // `worktree add` (reconcile) and `checkout -B` (advance) both pin
+    // core.hooksPath=/dev/null, so a hook that would fail (or run arbitrary code
+    // from a background daemon) cannot break the cycle.
+    let fx = remote_fixture();
+    // A diverging remote so reconcile actually rebases, and a local commit.
+    write(&fx.b_path, "other.txt", "b-only\n");
+    snap(&fx.b, Trigger::Manual);
+    fx.b.push(TEST_TIMEOUT).unwrap();
+    write(fx.a_tmp.path(), "mine.txt", "a-only\n");
+    let a_local = snap_id(&fx.a, Trigger::Manual);
+
+    // Install a post-checkout hook that always fails. Hooks live under the shared
+    // git dir, so this covers the linked scratch worktree too.
+    let hooks = git_dir(fx.a_tmp.path()).join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    fs::write(&hook, "#!/bin/sh\necho 'hook ran' >&2\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    let new_head = match fx.a.reconcile(&scr).unwrap() {
+        ReconcileOutcome::Rebased { new_head } => new_head,
+        other => panic!("expected Rebased despite the hook, got {other:?}"),
+    };
+    assert!(!scr.exists());
+    // Advance lands cleanly despite the failing hook.
+    assert_eq!(
+        fx.a.advance(&new_head, &a_local).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), new_head.as_str());
+    assert!(porcelain(fx.a_tmp.path()).is_empty());
+    assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
+}
+
+#[test]
 fn reconcile_leaves_a_dirty_main_tree_untouched() {
     // The out-of-tree rebase runs in a clean scratch worktree, so a dirty main
     // tree is neither stashed, popped, nor clobbered — even with autostash on,
@@ -1315,14 +1362,20 @@ fn advance_is_idempotent_to_current_head() {
     write(tmp.path(), "f", "x\n");
     let head = snap_id(&backend, Trigger::Manual);
 
-    // Advancing to the current HEAD is a clean no-op.
-    backend.advance(&head).unwrap();
+    // Advancing to the current tip (expected == current) is a clean no-op.
+    assert_eq!(
+        backend.advance(&head, &head).unwrap(),
+        AdvanceOutcome::Advanced
+    );
     assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
     assert_eq!(rev(tmp.path(), "refs/heads/main"), head.as_str());
     assert!(porcelain(tmp.path()).is_empty());
 
     // Still a no-op on a second call.
-    backend.advance(&head).unwrap();
+    assert_eq!(
+        backend.advance(&head, &head).unwrap(),
+        AdvanceOutcome::Advanced
+    );
     assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
 }
 
@@ -1334,13 +1387,21 @@ fn advance_moves_the_branch_and_tree_forward() {
     write(tmp.path(), "f", "two\n");
     let second = snap_id(&backend, Trigger::Manual);
 
-    // Roll the branch/tree back to the first commit, then forward again.
-    backend.advance(&first).unwrap();
+    // Roll the branch/tree back to the first commit (expected tip is `second`),
+    // then forward again (expected tip is now `first`). A clean tree is never a
+    // clobber.
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
     assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
     assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "one\n");
     assert!(porcelain(tmp.path()).is_empty());
 
-    backend.advance(&second).unwrap();
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::Advanced
+    );
     assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
     assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "two\n");
 }
@@ -1352,23 +1413,27 @@ fn advance_rejects_a_missing_target() {
     let head = snap_id(&backend, Trigger::Manual);
 
     let bogus = SnapshotId::new("0".repeat(40));
-    match backend.advance(&bogus) {
+    match backend.advance(&bogus, &head) {
         Err(VcsError::CommandFailed { op, .. }) => assert_eq!(op, "advance"),
         other => panic!("expected CommandFailed for a missing target, got {other:?}"),
     }
-    // Nothing moved: the target was verified before any reset.
+    // Nothing moved: the target was verified before anything was checked out.
     assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
 }
 
 #[test]
 fn advance_reports_lock_contention() {
     let (tmp, backend) = new_repo();
-    write(tmp.path(), "f", "x\n");
-    let head = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n");
+    let second = snap_id(&backend, Trigger::Manual);
 
+    // A held index.lock makes the checkout that would move the tree back to
+    // `first` fail as lock contention (attributed to the checkout).
     fs::write(git_dir(tmp.path()).join("index.lock"), "").unwrap();
-    match backend.advance(&head) {
-        Err(VcsError::LockContended { op }) => assert_eq!(op, "reset"),
+    match backend.advance(&first, &second) {
+        Err(VcsError::LockContended { op }) => assert_eq!(op, "checkout"),
         other => panic!("expected LockContended, got {other:?}"),
     }
     assert!(git_dir(tmp.path()).join("index.lock").exists());
@@ -1380,10 +1445,130 @@ fn advance_refuses_an_unsafe_repo() {
     write(tmp.path(), "f", "x\n");
     let head = snap_id(&backend, Trigger::Manual);
     fs::write(git_dir(tmp.path()).join("MERGE_HEAD"), "sentinel\n").unwrap();
-    match backend.advance(&head) {
+    match backend.advance(&head, &head) {
         Err(VcsError::UnsafeState(UnsafeReason::MergeInProgress)) => {}
         other => panic!("expected UnsafeState(MergeInProgress), got {other:?}"),
     }
+}
+
+#[test]
+fn advance_refuses_a_conflicting_tracked_modification() {
+    // A tracked file locally modified where the target also changed it: advance
+    // must REFUSE (WouldClobber) rather than destroy the uncommitted edit.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n");
+    let second = snap_id(&backend, Trigger::Manual); // branch tip
+
+    // Uncommitted local change to the same file the target (`first`) differs on.
+    write(tmp.path(), "f", "dirty-local\n");
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    // Tree and branch are exactly as they were; the edit survives.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("f")).unwrap(),
+        "dirty-local\n"
+    );
+}
+
+#[test]
+fn advance_refuses_a_conflicting_untracked_file() {
+    // An untracked file the target would introduce: advance must REFUSE rather
+    // than overwrite the user's untracked file.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "keep", "x\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    // `second` adds `extra`, so rolling forward to it would create that path.
+    write(tmp.path(), "extra", "from-commit\n");
+    let second = snap_id(&backend, Trigger::Manual);
+    // Go back to `first` (which lacks `extra`)...
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    // ...then leave an UNTRACKED `extra` and try to advance forward to `second`,
+    // which would overwrite it.
+    write(tmp.path(), "extra", "my-untracked\n");
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("extra")).unwrap(),
+        "my-untracked\n"
+    );
+}
+
+#[test]
+fn advance_carries_a_non_conflicting_dirty_file_over() {
+    // A dirty file the target does NOT touch is carried over unharmed: advance
+    // succeeds and the local edit survives.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    write(tmp.path(), "other", "base\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n"); // only `f` changes between first and second
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // Uncommitted edit to `other`, which neither commit differs on.
+    write(tmp.path(), "other", "dirty-but-safe\n");
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "one\n");
+    // The non-conflicting edit was carried over.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("other")).unwrap(),
+        "dirty-but-safe\n"
+    );
+}
+
+#[test]
+fn advance_refuses_when_the_branch_tip_moved() {
+    // The addendum guard: a commit the user landed on the branch after the
+    // reconcile read its tip must not be stranded. advance refuses when the
+    // current branch tip no longer equals the expected tip.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "g", "two\n");
+    let second = snap_id(&backend, Trigger::Manual); // the user's raced commit
+
+    // Reconcile "consumed" `first` as the expected tip, but the branch is now at
+    // `second`. Advancing to some target with the stale expectation refuses.
+    assert_eq!(
+        backend.advance(&first, &first).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    // The user's commit is intact on the branch.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
+    assert!(commit_exists(tmp.path(), second.as_str()));
+}
+
+#[test]
+fn has_remote_reflects_the_configured_remote() {
+    let origin = bare_origin();
+    let (tmp, _backend) = new_repo();
+    // No remote configured yet.
+    let backend = GitBackend::open(tmp.path(), "main", "origin").unwrap();
+    assert!(!backend.has_remote().unwrap(), "no remote configured");
+
+    git_ok(
+        tmp.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    assert!(backend.has_remote().unwrap(), "remote now present");
+
+    // A backend configured for a *different* remote name still reports absent.
+    let other = GitBackend::open(tmp.path(), "main", "upstream").unwrap();
+    assert!(!other.has_remote().unwrap(), "different remote name absent");
 }
 
 // --- scratch-worktree pruning (crash recovery) -----------------------------

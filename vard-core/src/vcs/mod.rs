@@ -185,25 +185,59 @@ pub trait VcsBackend {
     /// residual check-to-act window as [`snapshot`](Self::snapshot) applies.
     fn reconcile(&self, scratch: &Path) -> Result<ReconcileOutcome, VcsError>;
 
-    /// Advances the user's tree and the configured branch to `target`
-    /// (`git reset --hard`) — the single move that makes a
-    /// [`reconcile`](Self::reconcile) result live.
+    /// Advances the user's tree and the configured branch to `target` — the
+    /// single move that makes a [`reconcile`](Self::reconcile) result live —
+    /// **without ever destroying uncommitted or unmerged work**, reporting
+    /// whether it advanced or refused (see [`AdvanceOutcome`]).
     ///
-    /// # No dirty tree, ever — preconditions
+    /// # No dirty tree, ever — safe by construction
     ///
-    /// This is a hard reset: it overwrites the working tree to match `target`.
-    /// It is only safe when the tree is clean and fully committed. The sync
-    /// engine guarantees that under its per-watch lock (a pre-sync snapshot
-    /// commits everything first), so the user's tree only ever moves between
-    /// fully-committed states. Called on a *dirty* tree this would discard
-    /// uncommitted work, so callers MUST uphold that precondition; the backend
-    /// does not re-verify tree cleanliness.
+    /// This does **not** hard-reset. It updates the branch and tree with safe
+    /// checkout semantics (`git checkout -B <branch> <target>`), which git's own
+    /// index locking makes race-free: a locally-modified tracked file or an
+    /// untracked file that `target` would clobber makes the checkout **refuse**,
+    /// and this returns [`AdvanceOutcome::WouldClobber`] with the branch and tree
+    /// left exactly as they were. Non-conflicting local edits are carried over
+    /// unharmed. advance therefore never destroys uncommitted work, period — the
+    /// engine's per-watch lock plus its pre-sync snapshot make the common path a
+    /// clean fast-forward, and any residual local change refuses rather than
+    /// vanishes.
     ///
-    /// `target` is verified to exist before anything is reset, so a bad id
-    /// fails cleanly ([`VcsError::CommandFailed`]) with nothing changed.
-    /// Idempotent: advancing to the current `HEAD` is a clean no-op. Re-checks
+    /// `expected_tip` guards the **branch ref** the checkout would overwrite:
+    /// `-B` moves the branch to `target`, so a commit the user landed on the
+    /// branch after the reconcile read its tip would be stranded. This refuses
+    /// with [`AdvanceOutcome::WouldClobber`] when the branch tip no longer equals
+    /// `expected_tip` (the pre-reconcile tip the caller captured). The check runs
+    /// immediately before the checkout inside the same call; a millisecond race
+    /// between the check and the checkout remains, but the engine's op lock
+    /// excludes all *vard* writers, so only a user racing their own commit into
+    /// that window is exposed — a self-inflicted, reflog-recoverable case. The
+    /// real exposure the guard closes is the seconds-long reconcile window.
+    ///
+    /// `target` is verified to exist before anything moves, so a bad id fails
+    /// cleanly ([`VcsError::CommandFailed`]) with nothing changed. Idempotent:
+    /// advancing to the current tip (with `expected_tip` equal to it) is a clean
+    /// [`AdvanceOutcome::Advanced`] no-op. Re-checks
     /// [`is_safe_state`](Self::is_safe_state) first.
-    fn advance(&self, target: &SnapshotId) -> Result<(), VcsError>;
+    fn advance(
+        &self,
+        target: &SnapshotId,
+        expected_tip: &SnapshotId,
+    ) -> Result<AdvanceOutcome, VcsError>;
+
+    /// Reports whether the backend's configured remote is defined in this
+    /// repository, as a cheap **non-network** config lookup
+    /// (`git config remote.<name>.url`) — it never contacts the remote.
+    ///
+    /// The sync engine's host probes this at build/injection time so a
+    /// `sync = true` watch whose repository has no such remote is left with sync
+    /// disabled (one log line, no state change) rather than latching a
+    /// [`VcsError`]/`SyncError` storm on every doomed fetch. The default returns
+    /// `Ok(true)` for backends with no notion of a remote (test doubles); the git
+    /// backend performs the real lookup.
+    fn has_remote(&self) -> Result<bool, VcsError> {
+        Ok(true)
+    }
 
     /// Force-removes a leftover scratch worktree at `scratch` and prunes stale
     /// worktree metadata (`git worktree remove --force` then
@@ -462,6 +496,21 @@ pub enum ReconcileOutcome {
     /// The rebase hit a conflict and was aborted; the branch is unchanged and
     /// the tree contains no conflict markers.
     Conflict,
+}
+
+/// The result of a [`VcsBackend::advance`]: either the branch and tree advanced,
+/// or the move was **refused** because it would have overwritten uncommitted or
+/// unmerged work (a locally-modified or untracked file the target would clobber,
+/// or a branch tip that moved out from under the reconcile). A refusal leaves the
+/// repository exactly as it was; it is never an error, and the sync engine treats
+/// it as "abandon this cycle and retry", not as a sync failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdvanceOutcome {
+    /// The branch and work tree now point at the reconcile target.
+    Advanced,
+    /// The move was refused to protect uncommitted work or a moved branch tip;
+    /// nothing changed.
+    WouldClobber,
 }
 
 /// The result of a [`VcsBackend::push`].
