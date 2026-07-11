@@ -69,6 +69,13 @@ type Candidate = (ResolvedWatch, GitBackend);
 /// (open, then the remote probe) and rendered by both dispatch paths, so the
 /// in-process rows and the daemon-present refusals can never diverge on what a
 /// given repository state means.
+///
+/// The one deliberate asymmetry is [`ProbeFailed`](Self::ProbeFailed): the
+/// in-process path treats it as runnable — the engine's own live remote probe
+/// is the authority, so a transient classify-time error (e.g. `.git/config`
+/// contention) gets a real sync attempt and only a persistent error fails the
+/// cycle honestly — while the daemon-request path refuses up front, because a
+/// fire-and-forget request has no cycle row to fall through to.
 enum RepoDisposition {
     /// The repository opened and defines the configured remote: runnable, with
     /// the opened backend kept for injection.
@@ -76,8 +83,15 @@ enum RepoDisposition {
     /// The repository could not be opened at all — a real fault (exit 2).
     Unopenable(vard_core::VcsError),
     /// The repository opened but the remote probe itself failed (an unreadable
-    /// config) — also a real fault (exit 2), never masked as "no remote".
-    ProbeFailed(vard_core::VcsError),
+    /// config). Never masked as "no remote"; see the type docs for the
+    /// per-path handling asymmetry. Carries the opened backend so the
+    /// in-process path can still run the cycle on it.
+    ProbeFailed {
+        /// The opened backend (usable; only the probe failed).
+        backend: GitBackend,
+        /// The probe's error, for the daemon-request refusal message.
+        error: vard_core::VcsError,
+    },
     /// The repository opened but does not define the configured remote — the
     /// attention-class refusal (exit 1) for a named watch.
     NoRemote,
@@ -90,8 +104,31 @@ fn classify_repo(spec: &WatchSpec) -> RepoDisposition {
         Ok(backend) => match backend.has_remote() {
             Ok(true) => RepoDisposition::Runnable(backend),
             Ok(false) => RepoDisposition::NoRemote,
-            Err(e) => RepoDisposition::ProbeFailed(e),
+            Err(error) => RepoDisposition::ProbeFailed { backend, error },
         },
+    }
+}
+
+/// Routes a named target's [`RepoDisposition`] on the IN-PROCESS path: either
+/// a runnable candidate or a pre-decided row with its exit-code contribution.
+/// [`ProbeFailed`](RepoDisposition::ProbeFailed) becomes a candidate — the
+/// cycle's own live probe is the authority (see the disposition's docs) — so a
+/// transient probe error never yields a definitive failed row without a sync
+/// even being attempted.
+fn route_named(
+    rw: ResolvedWatch,
+    disposition: RepoDisposition,
+) -> (Vec<Candidate>, Vec<(Record, u8)>) {
+    let name = rw.spec.name().to_string();
+    match disposition {
+        RepoDisposition::Runnable(backend) | RepoDisposition::ProbeFailed { backend, .. } => {
+            (vec![(rw, backend)], Vec::new())
+        }
+        RepoDisposition::Unopenable(e) => (Vec::new(), vec![(open_failed_record(&name, &e), 2)]),
+        RepoDisposition::NoRemote => {
+            let row = no_remote_record(&name, rw.spec.remote());
+            (Vec::new(), vec![(row, 1)])
+        }
     }
 }
 
@@ -156,20 +193,9 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                 (Vec::new(), vec![(paused_record(&name), 1)])
             } else {
                 // One classification shared with the daemon-present path (see
-                // [`classify_repo`]): identical faults, identical wording.
-                match classify_repo(&rw.spec) {
-                    RepoDisposition::Runnable(backend) => (vec![(rw, backend)], Vec::new()),
-                    RepoDisposition::Unopenable(e) => {
-                        (Vec::new(), vec![(open_failed_record(&name, &e), 2)])
-                    }
-                    RepoDisposition::ProbeFailed(e) => {
-                        (Vec::new(), vec![(probe_failed_record(&name, &e), 2)])
-                    }
-                    RepoDisposition::NoRemote => {
-                        let row = no_remote_record(&name, rw.spec.remote());
-                        (Vec::new(), vec![(row, 1)])
-                    }
-                }
+                // [`classify_repo`]); [`route_named`] renders it for this path.
+                let disposition = classify_repo(&rw.spec);
+                route_named(rw, disposition)
             }
         }
         None => {
@@ -352,9 +378,11 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                         rw.spec.name()
                     )));
                 }
-                RepoDisposition::ProbeFailed(e) => {
+                // Fire-and-forget has no cycle row to fall through to (the
+                // asymmetry documented on [`RepoDisposition`]): refuse up front.
+                RepoDisposition::ProbeFailed { error, .. } => {
                     return Err(CmdError::err(format!(
-                        "watch {}: cannot probe the repository's remotes: {e}",
+                        "watch {}: cannot probe the repository's remotes: {error}",
                         rw.spec.name()
                     )));
                 }
@@ -477,19 +505,6 @@ fn no_remote_record(name: &str, remote: &str) -> Record {
     )
 }
 
-/// The row for a watch whose repository opened but whose remote probe failed
-/// (an unreadable config): a real failure (exit 2), the same classification
-/// the daemon-present path refuses with.
-fn probe_failed_record(name: &str, error: &vard_core::VcsError) -> Record {
-    record(
-        name,
-        "failed",
-        Some(&format!("cannot probe the repository's remotes: {error}")),
-        None,
-        None,
-    )
-}
-
 /// The row for a watch whose repository could not be opened at all: a real
 /// failure (exit 2), isolated per watch so one broken repository never blocks
 /// the others from syncing.
@@ -561,6 +576,45 @@ mod tests {
             rendered.contains("did not run") && rendered.contains("the gate stayed busy"),
             "got: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_probe_error_falls_through_to_the_cycle_in_process() {
+        // Finding 3 (round 6): a transient classify-time probe error must not
+        // yield a definitive failed row with no sync even attempted — the
+        // in-process path routes ProbeFailed as a runnable candidate, and the
+        // engine's own live probe (the authority) decides honestly inside the
+        // cycle. (The daemon-request path still refuses up front: fire-and-forget
+        // has no cycle row to fall through to.)
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let backend = vard_core::GitBackend::init(&repo, Some("main")).unwrap();
+        let spec = vard_core::WatchSpec::builder("w", &repo)
+            .trigger(vard_core::TriggerMode::Interval)
+            .interval(std::time::Duration::from_secs(3600))
+            .sync(true)
+            .build()
+            .unwrap();
+        let rw = ResolvedWatch {
+            spec,
+            paused: false,
+        };
+        let disposition = RepoDisposition::ProbeFailed {
+            backend,
+            error: vard_core::VcsError::CommandFailed {
+                op: "config".into(),
+                status: Some(128),
+                stderr: "transient contention".into(),
+            },
+        };
+        let (candidates, rows) = route_named(rw, disposition);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a probe error is routed to the cycle, not a pre-decided row"
+        );
+        assert!(rows.is_empty(), "no failed row without a sync attempt");
     }
 
     #[test]
