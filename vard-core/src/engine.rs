@@ -1913,15 +1913,29 @@ mod tests {
             unimplemented!("restore is out of scope for the snapshot engine")
         }
 
-        fn fetch(&self) -> Result<crate::vcs::RemoteState, VcsError> {
+        fn fetch(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::vcs::RemoteState, VcsError> {
             unimplemented!("fetch is out of scope for the snapshot engine")
         }
 
-        fn reconcile(&self) -> Result<crate::vcs::ReconcileOutcome, VcsError> {
+        fn reconcile(
+            &self,
+            _scratch: &std::path::Path,
+        ) -> Result<crate::vcs::ReconcileOutcome, VcsError> {
             unimplemented!("reconcile is out of scope for the snapshot engine")
         }
 
-        fn push(&self) -> Result<crate::vcs::PushOutcome, VcsError> {
+        fn advance(&self, _target: &crate::vcs::SnapshotId) -> Result<(), VcsError> {
+            unimplemented!("advance is out of scope for the snapshot engine")
+        }
+
+        fn prune_scratch(&self, _scratch: &std::path::Path) -> Result<(), VcsError> {
+            unimplemented!("prune_scratch is out of scope for the snapshot engine")
+        }
+
+        fn push(&self, _timeout: std::time::Duration) -> Result<crate::vcs::PushOutcome, VcsError> {
             unimplemented!("push is out of scope for the snapshot engine")
         }
     }

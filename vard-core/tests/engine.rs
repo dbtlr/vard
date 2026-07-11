@@ -113,15 +113,23 @@ impl VcsBackend for FakeBackend {
         unimplemented!("restore is out of scope for the snapshot engine")
     }
 
-    fn fetch(&self) -> Result<RemoteState, VcsError> {
+    fn fetch(&self, _timeout: Duration) -> Result<RemoteState, VcsError> {
         unimplemented!("fetch is out of scope for the snapshot engine")
     }
 
-    fn reconcile(&self) -> Result<ReconcileOutcome, VcsError> {
+    fn reconcile(&self, _scratch: &Path) -> Result<ReconcileOutcome, VcsError> {
         unimplemented!("reconcile is out of scope for the snapshot engine")
     }
 
-    fn push(&self) -> Result<PushOutcome, VcsError> {
+    fn advance(&self, _target: &SnapshotId) -> Result<(), VcsError> {
+        unimplemented!("advance is out of scope for the snapshot engine")
+    }
+
+    fn prune_scratch(&self, _scratch: &Path) -> Result<(), VcsError> {
+        unimplemented!("prune_scratch is out of scope for the snapshot engine")
+    }
+
+    fn push(&self, _timeout: Duration) -> Result<PushOutcome, VcsError> {
         unimplemented!("push is out of scope for the snapshot engine")
     }
 }
@@ -310,15 +318,23 @@ impl VcsBackend for GatedBackend {
         unimplemented!("restore is out of scope for the snapshot engine")
     }
 
-    fn fetch(&self) -> Result<RemoteState, VcsError> {
+    fn fetch(&self, _timeout: Duration) -> Result<RemoteState, VcsError> {
         unimplemented!("fetch is out of scope for the snapshot engine")
     }
 
-    fn reconcile(&self) -> Result<ReconcileOutcome, VcsError> {
+    fn reconcile(&self, _scratch: &Path) -> Result<ReconcileOutcome, VcsError> {
         unimplemented!("reconcile is out of scope for the snapshot engine")
     }
 
-    fn push(&self) -> Result<PushOutcome, VcsError> {
+    fn advance(&self, _target: &SnapshotId) -> Result<(), VcsError> {
+        unimplemented!("advance is out of scope for the snapshot engine")
+    }
+
+    fn prune_scratch(&self, _scratch: &Path) -> Result<(), VcsError> {
+        unimplemented!("prune_scratch is out of scope for the snapshot engine")
+    }
+
+    fn push(&self, _timeout: Duration) -> Result<PushOutcome, VcsError> {
         unimplemented!("push is out of scope for the snapshot engine")
     }
 }

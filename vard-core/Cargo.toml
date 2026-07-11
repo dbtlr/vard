@@ -16,6 +16,11 @@ repository.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 notify = { workspace = true }
 ignore = { workspace = true }
+# On unix, a timed-out `fetch`/`push` kills the git child's whole process group
+# (`kill_process_group`) so an ssh transport's children die with it rather than
+# leaking. Reuses the workspace `rustix` already pulled in for the daemon's
+# `flock`/liveness probes; only the `process` feature is needed here.
+rustix = { workspace = true }
 
 [dev-dependencies]
 # `macros` + `test-util` drive the watcher's deterministic tests: paused-time

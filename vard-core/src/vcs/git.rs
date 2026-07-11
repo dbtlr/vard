@@ -23,10 +23,16 @@
 //! signer mid-rebase would otherwise masquerade as a conflict, and autostash
 //! can pop conflict markers into a tree the caller was told is clean.
 //!
-//! There are **no command timeouts** day one. A hung git process (for example a
-//! network operation against an unreachable host that ignores
-//! `GIT_TERMINAL_PROMPT`) will block its calling thread; the engine runs these
-//! on `spawn_blocking` threads and owns any timeout policy.
+//! Only the two network-facing methods are time-bounded: [`fetch`] and
+//! [`push`] take a caller-supplied `Duration` and, on expiry, kill the git
+//! child — and, on unix, its whole process group, so an ssh transport's
+//! children die with it — returning [`VcsError::Timeout`]. A host that ignores
+//! `GIT_TERMINAL_PROMPT` and hangs therefore cannot block a worker forever.
+//! Every other (local-only) operation stays unbounded; the engine runs all of
+//! these on `spawn_blocking` threads.
+//!
+//! [`fetch`]: VcsBackend::fetch
+//! [`push`]: VcsBackend::push
 //!
 //! # What this layer deliberately does not do
 //!
@@ -39,8 +45,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{Duration, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::{
     ChangeSummary, LogFilter, PushOutcome, ReconcileOutcome, RemoteState, RestoreTarget, SafeState,
@@ -316,6 +322,70 @@ impl GitBackend {
             SafeState::Unsafe(reason) => Err(VcsError::UnsafeState(reason)),
         }
     }
+
+    /// Rebases the scratch worktree's detached `HEAD` (checked out at the branch
+    /// tip `pre`) onto the fetched upstream ref, classifying the outcome. Runs
+    /// entirely with `-C scratch`, so the branch ref and the user's tree are
+    /// untouched; the returned [`ReconcileOutcome::Rebased`] tip is a commit in
+    /// the shared object store. The caller removes the scratch worktree.
+    fn rebase_in_scratch(&self, scratch: &Path, pre: &str) -> Result<ReconcileOutcome, VcsError> {
+        let upstream = format!("{}/{}", self.remote, self.branch);
+        let rebase_cfg = &[CFG_NO_SIGN, CFG_NO_HOOKS, CFG_NO_AUTOSTASH, CFG_NO_RERERE];
+        let out = git_output(scratch, rebase_cfg, ["rebase", upstream.as_str()], false)?;
+
+        if out.status.success() {
+            let post = head_of(scratch)?;
+            if post == pre {
+                // Upstream was already contained: nothing replayed.
+                Ok(ReconcileOutcome::AlreadyUpToDate)
+            } else {
+                Ok(ReconcileOutcome::Rebased {
+                    new_head: SnapshotId::new(post),
+                })
+            }
+        } else if rebase_in_progress(&absolute_git_dir(scratch)?) {
+            // A conflict left a rebase in progress in the scratch worktree.
+            // Abort it for tidiness; the subsequent `worktree remove --force`
+            // erases the worktree (and any residual rebase state) regardless,
+            // so the abort is best-effort and its failure need not surface —
+            // nothing mid-rebase can reach the user's repository.
+            let _ = git_output(scratch, rebase_cfg, ["rebase", "--abort"], false);
+            Ok(ReconcileOutcome::Conflict)
+        } else {
+            // Non-zero exit without a rebase in progress: a real failure (an
+            // unknown upstream, a held lock), not a conflict.
+            Err(classify_failure("rebase", &out))
+        }
+    }
+
+    /// Removes the linked worktree at `scratch`, treating a `scratch` that is
+    /// not (or is no longer) a registered worktree as a clean no-op. `--force`
+    /// removes it even when dirty, locked, or mid-rebase.
+    fn worktree_remove(&self, scratch: &Path) -> Result<(), VcsError> {
+        let out = git_output(
+            &self.path,
+            &[],
+            [
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                scratch.as_os_str(),
+            ],
+            false,
+        )?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Nothing to remove: git spells the "not a registered worktree" case
+        // "is not a working tree", and a vanished path "No such file or
+        // directory". Either way there is nothing left to clean up here.
+        if stderr.contains("is not a working tree") || stderr.contains("No such file or directory")
+        {
+            return Ok(());
+        }
+        Err(classify_failure("worktree remove", &out))
+    }
 }
 
 impl VcsBackend for GitBackend {
@@ -527,7 +597,7 @@ impl VcsBackend for GitBackend {
         Ok(())
     }
 
-    fn fetch(&self) -> Result<RemoteState, VcsError> {
+    fn fetch(&self, timeout: Duration) -> Result<RemoteState, VcsError> {
         let tracking = format!("refs/remotes/{}/{}", self.remote, self.branch);
         let before = self.rev_of(&tracking)?;
 
@@ -539,11 +609,12 @@ impl VcsBackend for GitBackend {
             b = self.branch,
             r = self.remote
         );
-        let out = git_output(
+        let out = git_output_timed(
             &self.path,
             &[],
             ["fetch", self.remote.as_str(), refspec.as_str()],
-            true,
+            "fetch",
+            timeout,
         )?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -581,7 +652,7 @@ impl VcsBackend for GitBackend {
         })
     }
 
-    fn reconcile(&self) -> Result<ReconcileOutcome, VcsError> {
+    fn reconcile(&self, scratch: &Path) -> Result<ReconcileOutcome, VcsError> {
         self.ensure_safe()?;
 
         let branch_ref = format!("refs/heads/{}", self.branch);
@@ -591,62 +662,76 @@ impl VcsBackend for GitBackend {
                 self.branch
             ))
         })?;
-        let upstream = format!("{}/{}", self.remote, self.branch);
 
-        // Rebase the configured branch onto the already-fetched upstream ref;
-        // local refs only, so this is not a network op. The branch positional
-        // is the SHORT name deliberately: `refs/heads/<branch>` here makes git
-        // check out the ref detached and leave the branch itself unmoved
-        // (verified empirically). Branch names cannot begin with `-` (git
-        // refuses to create them), so the short form cannot inject a flag.
-        let rebase_cfg = &[CFG_NO_SIGN, CFG_NO_HOOKS, CFG_NO_AUTOSTASH, CFG_NO_RERERE];
-        let out = git_output(
+        // Create a vard-owned detached-HEAD linked worktree at the branch tip.
+        // The rebase — and any conflict abort — happen entirely inside it, so
+        // the branch ref and the user's working tree never move here. The
+        // branch positional is the SHORT name: `git worktree add --detach`
+        // checks the branch's commit out detached, leaving the branch itself
+        // unmoved. Branch names cannot begin with `-`, so it cannot inject a
+        // flag.
+        let add = git_output(
             &self.path,
-            rebase_cfg,
-            ["rebase", upstream.as_str(), self.branch.as_str()],
+            &[],
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--detach"),
+                scratch.as_os_str(),
+                OsStr::new(self.branch.as_str()),
+            ],
             false,
         )?;
-
-        if out.status.success() {
-            let post = self.rev_of(&branch_ref)?.ok_or_else(|| {
-                VcsError::Parse("branch vanished after a successful rebase".to_string())
-            })?;
-            if post == pre {
-                Ok(ReconcileOutcome::AlreadyUpToDate)
-            } else {
-                Ok(ReconcileOutcome::Rebased {
-                    new_head: SnapshotId::new(post),
-                })
-            }
-        } else if rebase_in_progress(&self.git_dir()?) {
-            // A conflict left a rebase in progress. Abort it; the branch and
-            // work tree return to exactly their pre-rebase state, so no
-            // conflict markers remain. If the abort itself fails, the repo is
-            // left mid-rebase — surface that loudly rather than as a generic
-            // failure.
-            let abort = git_output(&self.path, rebase_cfg, ["rebase", "--abort"], false)?;
-            if !abort.status.success() {
-                return Err(VcsError::RepoLeftInRebase {
-                    source: Box::new(classify_failure("rebase --abort", &abort)),
-                });
-            }
-            let post = self.rev_of(&branch_ref)?.ok_or_else(|| {
-                VcsError::Parse("branch vanished after aborting a rebase".to_string())
-            })?;
-            if post != pre {
-                return Err(VcsError::Parse(format!(
-                    "rebase --abort did not restore the branch (was {pre}, now {post})"
-                )));
-            }
-            Ok(ReconcileOutcome::Conflict)
-        } else {
-            // Non-zero exit without a rebase in progress: a real failure (an
-            // unknown upstream, a dirty tree, a held lock), not a conflict.
-            Err(classify_failure("rebase", &out))
+        if !add.status.success() {
+            return Err(classify_failure("worktree add", &add));
         }
+
+        // From here the scratch worktree exists, so it must be removed on every
+        // path. Cleanup is best-effort: reconcile's outcome (or its error) is
+        // authoritative, and a cleanup that somehow fails leaves only a scratch
+        // worktree that `prune_scratch` reclaims — never anything in the user's
+        // tree.
+        let outcome = self.rebase_in_scratch(scratch, &pre);
+        let _ = self.worktree_remove(scratch);
+        outcome
     }
 
-    fn push(&self) -> Result<PushOutcome, VcsError> {
+    fn advance(&self, target: &SnapshotId) -> Result<(), VcsError> {
+        self.ensure_safe()?;
+
+        // Verify the target exists before touching the tree, so a bad id fails
+        // cleanly with nothing changed. `verify_ref` peels to a commit.
+        if !self.verify_ref(&VcsRef::from(target))? {
+            return Err(VcsError::CommandFailed {
+                op: "advance".to_string(),
+                status: None,
+                stderr: format!("target commit {target} does not exist"),
+            });
+        }
+
+        // Move the branch and work tree to `target`. Idempotent: git exits 0
+        // resetting to the current HEAD, changing nothing. The hooks pin keeps
+        // a user's post-checkout hook from running; signing does not apply to a
+        // reset. Preconditions (clean, committed tree) are the caller's to
+        // uphold — see the trait docs.
+        self.run(&[CFG_NO_HOOKS], ["reset", "--hard", target.as_str()])?;
+        Ok(())
+    }
+
+    fn prune_scratch(&self, scratch: &Path) -> Result<(), VcsError> {
+        // Force-remove the scratch worktree if it is still registered (this
+        // erases any mid-rebase state living under .git/worktrees/<name>)...
+        self.worktree_remove(scratch)?;
+        // ...then reap metadata for a worktree whose directory a crash deleted
+        // out from under git but whose administrative entry remains.
+        let prune = git_output(&self.path, &[], ["worktree", "prune"], false)?;
+        if !prune.status.success() {
+            return Err(classify_failure("worktree prune", &prune));
+        }
+        Ok(())
+    }
+
+    fn push(&self, timeout: Duration) -> Result<PushOutcome, VcsError> {
         // `--porcelain` gives a machine-readable per-ref status line on
         // stdout, so classification does not depend on human-oriented stderr
         // phrasing. Shape (verified empirically):
@@ -657,7 +742,7 @@ impl VcsBackend for GitBackend {
         //
         // where flag is `=` (up to date), `*` (new ref), ` ` (fast-forward),
         // `+` (forced), or `!` (rejected).
-        let out = git_output(
+        let out = git_output_timed(
             &self.path,
             &[CFG_NO_HOOKS],
             [
@@ -666,7 +751,8 @@ impl VcsBackend for GitBackend {
                 self.remote.as_str(),
                 self.branch.as_str(),
             ],
-            true,
+            "push",
+            timeout,
         )?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         for line in stdout.lines() {
@@ -919,6 +1005,137 @@ where
         .map_err(VcsError::Io)?;
 
     child.wait_with_output().map_err(VcsError::Io)
+}
+
+/// Resolves `HEAD` to its full hash in `repo` (used for the scratch worktree,
+/// where `self.rev_of` — bound to the main path — does not apply).
+fn head_of(repo: &Path) -> Result<String, VcsError> {
+    let out = git_output(repo, &[], ["rev-parse", "HEAD"], false)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(classify_failure("rev-parse", &out))
+    }
+}
+
+/// The absolute git directory for `repo`. In a linked worktree this is that
+/// worktree's private directory (`.git/worktrees/<name>`), where its
+/// in-progress-operation markers live.
+fn absolute_git_dir(repo: &Path) -> Result<PathBuf, VcsError> {
+    let out = git_output(repo, &[], ["rev-parse", "--absolute-git-dir"], false)?;
+    if out.status.success() {
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
+    } else {
+        Err(classify_failure("rev-parse", &out))
+    }
+}
+
+/// How often [`git_output_timed`] polls a running git child for completion.
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Runs a network git command under a wall-clock `timeout`.
+///
+/// On expiry the child is killed — and, on unix, its whole process group, so an
+/// ssh transport's own children die with it rather than leaking as zombies —
+/// and [`VcsError::Timeout`] is returned. The child is put in its own process
+/// group up front (`process_group(0)`) so the group signal targets exactly its
+/// descendants. stdout and stderr are drained on background threads so a chatty
+/// git that fills a pipe buffer cannot deadlock against our own wait.
+fn git_output_timed<I, S>(
+    repo: &Path,
+    configs: &[&str],
+    args: I,
+    op: &str,
+    timeout: Duration,
+) -> Result<Output, VcsError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = git_command(repo, configs, args, true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New process group led by the child, so a group-directed kill reaches
+        // the whole transport subtree and nothing else.
+        cmd.process_group(0);
+    }
+
+    let start = Instant::now();
+    let mut child = cmd.spawn().map_err(map_spawn_error)?;
+
+    // Drain both pipes concurrently; otherwise a full pipe buffer would wedge
+    // git while we poll for its exit.
+    let mut child_stdout = child.stdout.take().expect("stdout was piped");
+    let mut child_stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = child_stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = loop {
+        match child.try_wait().map_err(VcsError::Io)? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= timeout {
+                    let elapsed = start.elapsed();
+                    kill_process_tree(&mut child);
+                    // Reap the child so no zombie is left; the kill makes this
+                    // return promptly. The readers see EOF once the pipes close.
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(VcsError::Timeout {
+                        op: op.to_string(),
+                        elapsed,
+                    });
+                }
+                std::thread::sleep(KILL_POLL_INTERVAL);
+            }
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Kills a timed-out git child and, on unix, its whole process group (the child
+/// leads its own group, set via `process_group(0)` in [`git_output_timed`]), so
+/// transport helpers such as ssh die with it. On non-unix only the child itself
+/// is killed (there is no portable process-group signal), so a transport it
+/// spawned may briefly outlive it.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Signal the process group led by the child (pgid == child pid).
+        // Best-effort: if the group is already gone the error is irrelevant.
+        let _ = rustix::process::kill_process_group(
+            rustix::process::Pid::from_child(child),
+            rustix::process::Signal::KILL,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
 }
 
 /// Runs a git command expected to succeed, returning its stdout as a string.

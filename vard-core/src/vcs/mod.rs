@@ -28,8 +28,8 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::event::Trigger;
 
@@ -131,25 +131,80 @@ pub trait VcsBackend {
     /// A branch that does not exist on the remote yet (nothing has been pushed)
     /// is a normal state, not an error: it reports as not-moved, zero behind,
     /// and ahead by however many local commits exist.
-    fn fetch(&self) -> Result<RemoteState, VcsError>;
+    ///
+    /// `timeout` bounds the wall-clock time the fetch may take: on expiry the
+    /// git child (and, on unix, its whole process group, so an ssh transport's
+    /// children die with it) is killed and [`VcsError::Timeout`] is returned.
+    /// The caller owns the policy — a hung network operation cannot block a
+    /// worker forever. This is the only network-facing method here besides
+    /// [`push`](Self::push); non-network operations stay unbounded.
+    fn fetch(&self, timeout: Duration) -> Result<RemoteState, VcsError>;
 
-    /// Makes a single attempt to rebase the configured branch onto the
-    /// already-fetched remote ref (see [`ReconcileOutcome`]).
+    /// Reconciles the configured branch with the already-fetched upstream by
+    /// rebasing **out of tree**, reporting the outcome (see
+    /// [`ReconcileOutcome`]). Exactly one attempt; retry, backoff, and
+    /// watch-state transitions are the sync engine's concern.
     ///
-    /// On conflict the rebase is aborted, restoring the branch and work tree
-    /// to exactly their pre-rebase state, so no conflict markers remain. That
-    /// guarantee has one failure mode: if the abort *itself* fails, the
-    /// repository is left mid-rebase with markers on disk and the error is
-    /// [`VcsError::RepoLeftInRebase`], which needs human (or doctor-tool)
-    /// attention. This performs exactly one attempt: retry, backoff, and
-    /// watch-state transitions are the sync engine's concern, not the
-    /// backend's.
+    /// # No dirty tree, ever
     ///
-    /// The backend re-checks [`is_safe_state`](Self::is_safe_state) first and
-    /// returns [`VcsError::UnsafeState`] if the repository is not safe; the
-    /// same residual check-to-act window as [`snapshot`](Self::snapshot)
-    /// applies.
-    fn reconcile(&self) -> Result<ReconcileOutcome, VcsError>;
+    /// This never touches the user's working tree and never moves the branch
+    /// ref. It creates a vard-owned detached-`HEAD` linked worktree at
+    /// `scratch` (`git worktree add --detach`), replays the branch's commits
+    /// onto the upstream ref *inside that scratch worktree*, and returns
+    /// [`ReconcileOutcome::Rebased`] carrying the rebased tip — a commit in the
+    /// shared object store that the caller makes live with
+    /// [`advance`](Self::advance). The branch and the user's tree stay
+    /// bit-for-bit unchanged on every path.
+    ///
+    /// On conflict the scratch rebase is aborted and the scratch worktree
+    /// removed, and [`ReconcileOutcome::Conflict`] is returned: because the
+    /// rebase only ever ran inside the scratch worktree, the user's repository
+    /// is provably untouched and no conflict markers can reach it. On
+    /// [`ReconcileOutcome::AlreadyUpToDate`] nothing was replayed.
+    ///
+    /// `scratch` must be a path that does not yet exist; vard-core creates the
+    /// linked worktree there and removes it before returning on every path
+    /// (success, conflict, and error). vard-core resolves no paths itself —
+    /// the caller owns where scratch lives (tests use a tempdir). A *crash*
+    /// mid-reconcile can still leave a scratch worktree behind, possibly
+    /// mid-rebase; [`prune_scratch`](Self::prune_scratch) reclaims it.
+    ///
+    /// Re-checks [`is_safe_state`](Self::is_safe_state) first and returns
+    /// [`VcsError::UnsafeState`] if the repository is not safe; the same
+    /// residual check-to-act window as [`snapshot`](Self::snapshot) applies.
+    fn reconcile(&self, scratch: &Path) -> Result<ReconcileOutcome, VcsError>;
+
+    /// Advances the user's tree and the configured branch to `target`
+    /// (`git reset --hard`) — the single move that makes a
+    /// [`reconcile`](Self::reconcile) result live.
+    ///
+    /// # No dirty tree, ever — preconditions
+    ///
+    /// This is a hard reset: it overwrites the working tree to match `target`.
+    /// It is only safe when the tree is clean and fully committed. The sync
+    /// engine guarantees that under its per-watch lock (a pre-sync snapshot
+    /// commits everything first), so the user's tree only ever moves between
+    /// fully-committed states. Called on a *dirty* tree this would discard
+    /// uncommitted work, so callers MUST uphold that precondition; the backend
+    /// does not re-verify tree cleanliness.
+    ///
+    /// `target` is verified to exist before anything is reset, so a bad id
+    /// fails cleanly ([`VcsError::CommandFailed`]) with nothing changed.
+    /// Idempotent: advancing to the current `HEAD` is a clean no-op. Re-checks
+    /// [`is_safe_state`](Self::is_safe_state) first.
+    fn advance(&self, target: &SnapshotId) -> Result<(), VcsError>;
+
+    /// Force-removes a leftover scratch worktree at `scratch` and prunes stale
+    /// worktree metadata (`git worktree remove --force` then
+    /// `git worktree prune`).
+    ///
+    /// This is crash recovery. [`reconcile`](Self::reconcile) removes its
+    /// scratch worktree on every normal path, but a crash mid-reconcile can
+    /// leave one behind (possibly mid-rebase, its dir on disk or already gone).
+    /// Calling this is always safe: a `scratch` that is not — or is no longer —
+    /// a registered worktree is a clean no-op. It operates only on vard's
+    /// scratch worktree, never on the user's files.
+    fn prune_scratch(&self, scratch: &Path) -> Result<(), VcsError>;
 
     /// Pushes the configured branch to the configured remote (see
     /// [`PushOutcome`]).
@@ -158,7 +213,11 @@ pub trait VcsBackend {
     /// result, not an error; resolving the race is the sync engine's job. Any
     /// other rejection (for example the remote refusing an update to a
     /// checked-out branch) is a [`VcsError::CommandFailed`].
-    fn push(&self) -> Result<PushOutcome, VcsError>;
+    ///
+    /// `timeout` bounds the push exactly as it bounds [`fetch`](Self::fetch):
+    /// on expiry the git child and its process group are killed and
+    /// [`VcsError::Timeout`] is returned.
+    fn push(&self, timeout: Duration) -> Result<PushOutcome, VcsError>;
 }
 
 /// What [`VcsBackend::snapshot`] should commit: why, with what optional user
@@ -613,6 +672,19 @@ pub enum VcsError {
         /// Why `rebase --abort` failed.
         source: Box<VcsError>,
     },
+    /// A network operation (a [`fetch`](VcsBackend::fetch) or
+    /// [`push`](VcsBackend::push)) exceeded its caller-supplied timeout and its
+    /// git child — along with its whole process group on unix, so an ssh
+    /// transport's children die with it — was killed. Distinct from
+    /// [`CommandFailed`](Self::CommandFailed) so a hung endpoint is retried on
+    /// its own schedule rather than treated as a hard git error.
+    Timeout {
+        /// A short label for the operation that timed out (`"fetch"` or
+        /// `"push"`).
+        op: String,
+        /// How long the operation ran before it was killed.
+        elapsed: Duration,
+    },
     /// An I/O error occurred spawning or communicating with git.
     Io(std::io::Error),
     /// Git's output could not be parsed as expected.
@@ -653,6 +725,10 @@ impl fmt::Display for VcsError {
                 f,
                 "a conflicted rebase could not be aborted and the repository \
                  is left mid-rebase; manual attention required: {source}"
+            ),
+            VcsError::Timeout { op, elapsed } => write!(
+                f,
+                "git {op} exceeded its timeout after {elapsed:.1?} and was killed"
             ),
             VcsError::Io(e) => write!(f, "git I/O error: {e}"),
             VcsError::Parse(msg) => write!(f, "could not parse git output: {msg}"),
