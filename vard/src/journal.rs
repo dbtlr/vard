@@ -1581,8 +1581,10 @@ fn reconcile_orphan(path: &Path, sweep: SweepOpts, report: &mut ReconcileReport)
 }
 
 /// 64-bit FNV-1a over `bytes`; a fixed, documented algorithm rather than a
-/// toolchain-dependent one.
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// toolchain-dependent one. `pub(crate)` so the daemon's config-reload poll
+/// (VRD-35) can reuse it as a content fingerprint instead of pulling in a hash
+/// crate.
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     bytes.iter().fold(OFFSET_BASIS, |hash, &b| {

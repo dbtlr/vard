@@ -27,7 +27,7 @@ anstyle = { workspace = true }
 terminal_size = { workspace = true }
 # The daemon shell (`vard run`) drives the async engine, so it needs a
 # multi-thread runtime, `macros` for `#[tokio::main]`/`select!`, `signal` for
-# SIGINT/SIGTERM/SIGHUP, and `time` for the mtime-poll and backoff timers on top
+# SIGINT/SIGTERM/SIGHUP, and `time` for the config-poll and backoff timers on top
 # of the workspace `sync` channels.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tracing = { workspace = true }
