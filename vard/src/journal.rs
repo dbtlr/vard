@@ -543,6 +543,16 @@ impl Journal {
             if line.is_empty() {
                 continue;
             }
+            // Benign legacy: an intermediate VRD-19 build wrote `advance <sha>`
+            // progress lines into the sync journal. They are not `begin` records
+            // and were never part of the durable format; skip them rather than
+            // treating them as Corrupt, which would wedge recovery for a watch
+            // whose journal an upgrade inherited (stale lock never removed, sync
+            // scratch never settled). This is the ONLY tolerated non-`begin`
+            // line; everything else stays strictly Corrupt.
+            if line.split_whitespace().next() == Some("advance") {
+                continue;
+            }
             let record =
                 parse_begin(line).ok_or_else(|| format!("unparseable journal line: {line:?}"))?;
             // Serial operations mean one live record; keep the last if several.
@@ -2155,6 +2165,41 @@ mod tests {
         assert!(
             lock_path(&repo).exists(),
             "a corrupt journal must never remove a lock"
+        );
+    }
+
+    #[test]
+    fn a_legacy_advance_line_is_skipped_and_recovery_still_settles() {
+        // Finding 8: an intermediate VRD-19 build wrote `advance <sha>` progress
+        // lines into the sync journal. A journal an upgrade inherited with such a
+        // line alongside its `begin sync` must NOT be treated as Corrupt (which
+        // would wedge recovery: stale lock never removed, scratch never settled).
+        // The `advance` line is skipped as benign legacy, so recovery proceeds:
+        // the stale git lock is removed, the settler prunes the scratch, and the
+        // journal is compacted.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo);
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        // Append a legacy `advance <sha>` line after the `begin sync` record.
+        let mut content = fs::read_to_string(journal.path()).unwrap();
+        content.push_str("advance 0123456789abcdef0123456789abcdef01234567\n");
+        fs::write(journal.path(), content).unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockRemoved { .. }),
+            "the legacy advance line must not wedge recovery, got {report:?}"
+        );
+        assert!(!lock.exists(), "the stale git lock was removed");
+        assert_eq!(settler.call_count(), 1, "the scratch worktree was settled");
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().len(),
+            0,
+            "the journal was compacted once recovery settled"
         );
     }
 
