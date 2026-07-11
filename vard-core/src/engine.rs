@@ -90,7 +90,9 @@
 //! Trouble from either signal source ([`WatcherSignal::Trouble`],
 //! [`SchedulerSignal::Trouble`]), and a panicked backend call, move the watch to
 //! [`WatchState::Attention`](crate::WatchState) and are surfaced on the bus, so
-//! nothing dies silently.
+//! nothing dies silently. Whether that `Attention` clears itself once a later
+//! pass succeeds, or stays until an operator resolves it, is decided per
+//! [`crate::TroubleKind`] — see [`crate::TroubleKind::latches`].
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -856,6 +858,13 @@ impl Worker {
     /// Returns the watch to [`WatchState::Ok`] after a pass proves it healthy — a
     /// committed snapshot or a skip-to-clean. Idempotent via `set_state`, so a
     /// watch already `Ok` (the common case) emits nothing.
+    ///
+    /// A watch parked in `Attention` on a **latching** ([`TroubleKind::latches`])
+    /// trouble kind is left alone: `set_state` itself refuses the transition
+    /// (see its docs), since a successful pass proving the *mechanism*
+    /// recovered proves nothing about a latching kind's own condition. Every
+    /// other case — healthy already, `Paused`, or `Attention` on a
+    /// self-clearing kind — recovers to `Ok` here.
     fn recover_to_ok(&mut self) {
         self.set_state(
             WatchState::Ok,
@@ -933,12 +942,26 @@ impl Worker {
     /// must emit — the daemon's dead-source rebuild triggers on the SourceDied
     /// event. A reason-only refresh updates the shared cell (so queries stay
     /// accurate) without bumping `entered_at` or emitting.
+    ///
+    /// This is also the single choke point for the latching contract
+    /// ([`TroubleKind::latches`]): once the watch's current trouble latches,
+    /// every attempt to move it to a different `(state, trouble)` is refused,
+    /// no matter which caller drives it — an unsafe pause, a fresh failure, a
+    /// panic, or a recovery. Enforcing it here rather than only at the
+    /// recovery call site means a latching condition can never be silently
+    /// clobbered by an unrelated later transition; nothing currently resolves
+    /// it (no explicit-resolve path exists yet), so it stays until whatever
+    /// external action a future one provides — for `SourceDied` that is the
+    /// daemon replacing this worker outright, not a transition on it.
     fn set_state(&mut self, to: WatchState, trouble: Option<TroubleKind>, reason: Option<String>) {
         if self.state == to && self.trouble == trouble {
             let mut shared = self.status.lock().unwrap_or_else(PoisonError::into_inner);
             if shared.reason != reason {
                 shared.reason = reason;
             }
+            return;
+        }
+        if self.trouble.is_some_and(TroubleKind::latches) {
             return;
         }
         let from = self.state;
@@ -3033,6 +3056,139 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn panic_attention_self_clears_on_the_next_successful_pass() {
+        // VRD-39: `Degraded` (the panic kind) is failure-class — the watch must
+        // return to `Ok` the moment a subsequent pass proves it healthy again,
+        // not stay parked in Attention until a daemon restart.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Panic, Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        // Drain the panic's failure + Attention transition.
+        let mut saw_attention = false;
+        for _ in 0..2 {
+            if let Event::WatchStateChanged {
+                to: WatchState::Attention,
+                trouble: Some(TroubleKind::Degraded),
+                ..
+            } = advance_until_event(&mut events, Duration::from_secs(1)).await
+            {
+                saw_attention = true;
+            }
+        }
+        assert!(saw_attention, "the panic must move the watch to Attention");
+
+        // A later trigger snapshots successfully: the watch must self-clear
+        // back to Ok, not stay latched in Attention.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let mut saw_completed = false;
+        let mut saw_recovery = false;
+        for _ in 0..2 {
+            match advance_until_event(&mut events, Duration::from_secs(1)).await {
+                Event::SnapshotCompleted { .. } => saw_completed = true,
+                Event::WatchStateChanged {
+                    from: WatchState::Attention,
+                    to: WatchState::Ok,
+                    trouble: None,
+                    ..
+                } => saw_recovery = true,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_completed,
+            "the recovering trigger must actually snapshot"
+        );
+        assert!(
+            saw_recovery,
+            "a successful pass after a panic must clear Attention back to Ok"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latching_trouble_does_not_clear_on_a_successful_pass() {
+        // VRD-39: `SourceDied` latches — a successful pass squeezed out of
+        // this same (dying) worker proves nothing about whether the signal
+        // source is alive again, only the daemon's engine rebuild does. A
+        // successful pass here must NOT silently clear it back to Ok, unlike
+        // a failure-class kind (SnapshotsFailing/Degraded).
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trouble {
+            kind: TroubleKind::SourceDied,
+            detail: "watch task ended abnormally".into(),
+        })
+        .unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match ev {
+            Event::WatchStateChanged {
+                to: WatchState::Attention,
+                trouble: Some(TroubleKind::SourceDied),
+                ..
+            } => {}
+            other => panic!("expected the latching Attention transition, got {other:?}"),
+        }
+
+        // A trigger snapshots successfully, but the latching trouble must
+        // stay: no WatchStateChanged follows the commit.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "the trigger must still snapshot successfully, got {ev:?}"
+        );
+        let followup = recv_no_advance(&mut events).await;
+        assert!(
+            followup.is_none(),
+            "a latching trouble must not self-clear on a successful pass, got {followup:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latching_trouble_survives_an_unrelated_transition_attempt_too() {
+        // The latch is enforced centrally in `set_state`, not only at the
+        // recovery call site: an unrelated transition attempt (here, an
+        // unsafe-repo pause) must not silently clobber a latched trouble
+        // either, or the human/rebuild-only condition it records would be
+        // lost the moment anything else happens to the watch.
+        let backend = FakeBackend::new();
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trouble {
+            kind: TroubleKind::SourceDied,
+            detail: "watch task ended abnormally".into(),
+        })
+        .unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                ev,
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SourceDied),
+                    ..
+                }
+            ),
+            "expected the latching Attention transition, got {ev:?}"
+        );
+
+        // The repo goes unsafe and a trigger drives a pass into it: normally
+        // this pauses the watch (see `enter_unsafe`), but the latch must
+        // refuse the overwrite.
+        backend.set_safe(SafeState::Unsafe(UnsafeReason::MergeInProgress));
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let followup = recv_no_advance(&mut events).await;
+        assert!(
+            followup.is_none(),
+            "an unrelated unsafe-pause attempt must not clobber a latched trouble, got {followup:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn always_committing_backend_does_not_livelock_under_the_mute() {
         // A backend that never reports a clean tree must not livelock the post-op
         // re-check while holding the mute: the re-check is bounded to one sweep,
@@ -3618,6 +3774,34 @@ mod tests {
         .await;
 
         // The retry converges and the projection returns to Ok.
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Ok && s.trouble.is_none()
+        })
+        .await;
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_states_projects_a_panic_then_its_recovery() {
+        // VRD-39, through the same host-facing seam as the failing-snapshot
+        // case above: a panicked backend call projects as Attention/Degraded,
+        // and the next successful pass projects back to Ok — the health
+        // projection is regenerated from engine truth, not a sticky flag.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Panic, Scripted::Commit(1)]);
+        let handle = start_interval_engine(Arc::clone(&backend)).await;
+
+        let start = handle.watch_states();
+        assert_eq!(start[0].state, WatchState::Ok);
+
+        handle.trigger("w");
+        wait_status(&handle, "w", |s| {
+            s.state == WatchState::Attention && s.trouble == Some(TroubleKind::Degraded)
+        })
+        .await;
+
+        handle.trigger("w");
         wait_status(&handle, "w", |s| {
             s.state == WatchState::Ok && s.trouble.is_none()
         })
