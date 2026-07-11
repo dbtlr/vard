@@ -65,7 +65,7 @@ A real restore reports the protective snapshot it took first:
 restored notes to HEAD (protective snapshot 64268508b0b79c62716f868eb31a20c1843f5a7d)
 ```
 
-If the [daemon](run.md) is running it keeps ownership of the repository; the restore still proceeds (git's own index lock serializes it against the daemon), and the daemon snapshots the restored state afterward — by design. In that daemon-running case the restore is **not** journaled (only the lock holder journals), so if the command crashes mid-restore a leftover git lock may need clearing by hand. Restoring a path that does not exist at the chosen reference reports a friendly error naming the path and the reference.
+If the [daemon](run.md) is running it keeps ownership of the repository; the restore still proceeds and the daemon snapshots the restored state afterward — by design. The restore takes the watch's per-watch operation lock across both the protective snapshot and the checkout, so it serializes against the daemon's own worker and records a recoverable journal entry **whether or not a daemon is running** — a crash mid-restore leaves a record the next daemon start (or a later `vard watch remove`) uses to prove any leftover git lock stale and clean it. If a daemon's worker is mid-commit on that same watch, the restore reports that another operation holds the lock and changes nothing; retry in a moment. Restoring a path that does not exist at the chosen reference reports a friendly error naming the path and the reference.
 
 ## Exit codes
 

@@ -13,30 +13,32 @@
 //! any protective snapshot, so a typo'd `--ref` fails cleanly with nothing
 //! changed — and the dry-run and real paths reject bad input identically.
 //!
-//! # The journal single-writer invariant
+//! # The single-writer invariant (per-watch op lock, VRD-37)
 //!
-//! The per-watch operation journal has exactly one writer: whoever holds the
-//! instance lock. The daemon holds it for its lifetime; an in-process CLI holds
-//! it for the duration of its operation. Restore honors this by *trying* to
-//! acquire the instance lock and branching on who holds it:
+//! A watch has exactly one mutator at a time, enforced structurally by its
+//! per-watch **operation lock** — a `flock` the restore holds across BOTH the
+//! protective snapshot and the checkout, bracketing the pair as one
+//! `begin("restore")`→`complete` journal record. A crash mid-restore leaves one
+//! recoverable dangling record, and the next daemon start (or the CLI drain)
+//! proves the abandoned `index.lock` stale and cleans it.
 //!
-//! * **We acquire it** (no daemon): we hold it across BOTH the protective
-//!   snapshot and the checkout, journaling the pair as one
-//!   `begin("restore")`→`complete` bracket, so a crash mid-restore leaves one
-//!   recoverable record. This is the common, fully-protected case.
-//! * **A daemon holds it**: the daemon is the journal's writer, so we must NOT
-//!   write it. We proceed without journaling — git's own `index.lock`
-//!   serializes our two git commands against the daemon's, so the worst case is
-//!   a [`VcsError::LockContended`], surfaced as a retryable "attention"
-//!   outcome, never data loss. The residual risk is narrow: if *this* process
-//!   crashes between the protective snapshot's `git add`/`commit` and its
-//!   completion, no journal record names the abandoned `index.lock`, so the
-//!   next daemon start cannot prove it stale and clean it — a human (or the
-//!   tracked doctor-tool follow-up) must remove it. This is the honest cost of
-//!   not owning the lock; it is documented rather than papered over with ad-hoc
-//!   locking.
-//! * **A peer CLI holds it**: we wait a bounded spell and then report honestly
-//!   that another command is running, rather than racing it.
+//! This holds **whether or not a daemon runs** — the op lock, not the instance
+//! lock, is what serializes the restore against a daemon's worker — which closes
+//! the earlier gap where a daemon-held restore ran unjournaled and could strand a
+//! lock no record named. The instance lock is still consulted, but only for
+//! *dispatch* (who should do the work):
+//!
+//! * **We acquire the instance lock** (no daemon): we hold it (outer) across the
+//!   restore while the op gate takes the op lock (inner).
+//! * **A daemon holds the instance lock**: we proceed without it, but still take
+//!   the op lock and journal; the daemon's worker contends on that same op lock,
+//!   so we serialize against it and leave a recoverable record either way.
+//! * **A peer CLI holds the instance lock**: we wait a bounded spell and then
+//!   report honestly that another command is running, rather than racing it.
+//!
+//! If the op lock itself is held past the budget (a daemon worker mid-commit on
+//! this very watch), the restore reports a retryable "another operation holds the
+//! lock" attention outcome and changes nothing.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -49,8 +51,8 @@ use vard_core::{
 
 use super::timefmt::{format_rfc3339_utc, parse_at};
 use super::{
-    CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_raw_paged, load_config, open_backend,
-    select_one,
+    CmdError, CmdPaths, CmdResult, Gated, OutCtx, emit_action, emit_raw_paged, load_config,
+    open_backend, select_one,
 };
 use crate::cli::{ColorWhen, OutputFormat, RestoreArgs};
 use crate::instance::{CliLock, InstanceLock};
@@ -94,36 +96,24 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
         return dry_run(&out, &backend, &rev, file.as_deref(), name);
     }
 
-    // A real restore journals only while holding the instance lock (the
-    // single-writer invariant). Branch on who holds it.
+    // Instance-lock dispatch is unchanged (who SHOULD do the work); journaling is
+    // now the per-watch op lock's job (who MAY mutate), so BOTH branches journal
+    // under the op gate — including the daemon-running case, closing the VRD-16
+    // residual where a daemon-held restore ran unjournaled.
     match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
-            let result = real_restore(
-                &paths,
-                &out,
-                &backend,
-                repo_path,
-                &rev,
-                file.as_deref(),
-                name,
-                true,
-            );
-            // Hold the lock across the whole restore; drop it only now.
+            // No daemon: hold the instance lock (outer) across the restore; the op
+            // gate takes the op lock (inner) inside `real_restore`.
+            let result = real_restore(&paths, &out, &backend, repo_path, &rev, file.as_deref(), name);
             drop(lock);
             result
         }
-        // A daemon owns the repo; git's index.lock serializes us against it, so
-        // restore WITHOUT journaling (we are not the journal's writer).
-        Ok(CliLock::DaemonHeld) => real_restore(
-            &paths,
-            &out,
-            &backend,
-            repo_path,
-            &rev,
-            file.as_deref(),
-            name,
-            false,
-        ),
+        // A daemon owns the repo. We do not hold the instance lock, but we still
+        // op-lock + journal via the gate: the daemon's worker contends on the same
+        // op lock, so we serialize against it AND leave a recoverable record.
+        Ok(CliLock::DaemonHeld) => {
+            real_restore(&paths, &out, &backend, repo_path, &rev, file.as_deref(), name)
+        }
         Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
             "another vard command is running; retry in a moment",
         )),
@@ -131,10 +121,11 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
     }
 }
 
-/// Performs a real restore: protective snapshot, then checkout. When `journaled`
-/// (we hold the instance lock), both are bracketed as one `begin("restore")`→
-/// `complete` operation; otherwise (a daemon holds the lock) they run
-/// unjournaled — see the [module docs](self) for why.
+/// Performs a real restore: protective snapshot, then checkout, bracketed as one
+/// `begin("restore")`→`complete` operation under the watch's op lock (see
+/// [`with_op_gate`](super::with_op_gate)). The op lock — not the instance lock —
+/// is what serializes this against a running daemon's worker and leaves a
+/// recoverable record, so this path is identical whether or not a daemon runs.
 #[allow(clippy::too_many_arguments)]
 fn real_restore(
     paths: &CmdPaths,
@@ -144,7 +135,6 @@ fn real_restore(
     rev: &VcsRef,
     file: Option<&Path>,
     name: &str,
-    journaled: bool,
 ) -> CmdResult {
     // Protective snapshot first — a real restore may never destroy the only
     // copy of uncommitted work. The repo must be safe to commit into to protect
@@ -202,11 +192,18 @@ fn real_restore(
         Ok(protective)
     };
 
-    let protective = if journaled {
-        super::journaled(&paths.journal_dir, repo_path, name, "restore", flow)
-    } else {
-        flow()
-    }?;
+    let protective = match super::with_op_gate(&paths.journal_dir, repo_path, name, "restore", flow)
+    {
+        Gated::Ran(result) => result?,
+        // The daemon's worker (or another CLI) holds this watch's op lock; do not
+        // race it. Nothing was changed — no protective snapshot, no checkout.
+        Gated::Busy => {
+            return Err(CmdError::attention(
+                "another vard operation holds this watch's lock; retry in a moment — \
+                 nothing was changed",
+            ));
+        }
+    };
 
     let protective_id = protective.map(|o| o.id.as_str().to_string());
     let scope = file

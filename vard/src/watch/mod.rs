@@ -527,11 +527,12 @@ fn drain_removed_watch(paths: &WatchPaths, repo_path: &Path, name: &str) -> bool
     }
 }
 
-/// Drops vard's per-watch metadata (its operation journal, keyed by repo path)
-/// for a removed watch, returning whether it actually deleted the file.
+/// Drops vard's per-watch metadata (its operation journal and sibling op-lock
+/// file, keyed by repo path) for a removed watch, returning whether it actually
+/// deleted the journal.
 ///
 /// It deletes the journal only when doing so cannot destroy live recovery
-/// evidence: either this CLI already `drained` it (took the lock and ran
+/// evidence: either this CLI already `drained` it (took the op lock and ran
 /// recovery), or the journal is provably clean (no dangling `begin`). If a
 /// daemon or peer CLI holds the lock *and* the journal still records an open
 /// operation, the file is left for the daemon's reload-drain or the next
@@ -543,6 +544,9 @@ fn purge_metadata(paths: &WatchPaths, repo_path: &Path, drained: bool) -> Result
     if !drained && !journal.is_clean() {
         return Ok(false);
     }
+    // Drop the sibling op-lock file too (best-effort): purged metadata must leave
+    // nothing behind, and the orphan sweep only scans `.journal` files.
+    let _ = std::fs::remove_file(journal.lock_path());
     match std::fs::remove_file(journal.path()) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),

@@ -228,6 +228,13 @@ impl Journal {
         &self.path
     }
 
+    /// This watch's sibling operation-lock file path. Used by `watch remove
+    /// --purge` to drop the `.lock` alongside the `.journal` so purged metadata
+    /// leaves nothing behind.
+    pub(crate) fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
     /// Records the start of daemon operation `op` (e.g. `"snapshot"`),
     /// truncating any prior contents. Call before the operation begins; call
     /// [`complete`](Self::complete) after it finishes cleanly.
@@ -2275,6 +2282,58 @@ mod tests {
     }
 
     // --- op lock -------------------------------------------------------------
+
+    #[test]
+    fn op_guard_complete_compacts_while_drop_leaves_a_dangling_begin() {
+        // The load-bearing guard contract: `complete` records the clean close
+        // (compacts) and releases; a plain drop is release-only — it MUST NOT
+        // compact, leaving the dangling `begin` as recovery evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let gate = JournalOpGate::for_repo_in_dir(dir.path(), &repo);
+        let journal = Journal::for_repo_in_dir(dir.path(), &repo);
+        let short = Duration::from_millis(200);
+
+        // begin writes a record; while the guard lives, the op lock is busy.
+        let guard = gate
+            .begin_blocking("snapshot", short)
+            .unwrap()
+            .expect("acquires the free op lock");
+        assert!(
+            journal.path().metadata().unwrap().len() > 0,
+            "begin must record a dangling `begin`"
+        );
+        assert!(
+            gate.begin_blocking("snapshot", short).unwrap().is_none(),
+            "a second acquire is busy while the guard holds the op lock"
+        );
+
+        // complete compacts and releases.
+        guard.complete();
+        assert_eq!(
+            journal.path().metadata().unwrap().len(),
+            0,
+            "complete must compact the journal"
+        );
+
+        // A fresh begin, then a plain DROP (no complete): release-only.
+        let guard = gate
+            .begin_blocking("snapshot", short)
+            .unwrap()
+            .expect("reacquires after complete released the lock");
+        assert!(journal.path().metadata().unwrap().len() > 0);
+        drop(guard); // release-only — must NOT compact
+        assert!(
+            journal.path().metadata().unwrap().len() > 0,
+            "drop without complete must leave the dangling begin as recovery evidence"
+        );
+        // ...but the op lock IS released, so recovery can proceed (or a re-acquire).
+        gate.begin_blocking("snapshot", short)
+            .unwrap()
+            .expect("drop released the op lock")
+            .complete();
+    }
 
     #[test]
     fn op_lock_two_openers_contend_even_in_one_process() {

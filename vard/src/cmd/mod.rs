@@ -8,20 +8,23 @@
 //! * **Backends** are opened through [`vard_core::open_git_backend`], the same
 //!   branch policy the engine applies, so a command commits to (and restores
 //!   from) exactly the branch the daemon uses.
-//! * **In-process snapshots** ([`snapshot`] and [`restore`]'s protective
-//!   snapshot) bracket the backend call in the per-watch operation
-//!   [`Journal`] — `begin` before, `complete` after
-//!   every outcome — mirroring the daemon's event bracket so a crash
-//!   mid-operation leaves a recoverable journal record.
+//! * **In-process mutations** ([`snapshot`] and [`restore`]'s protective
+//!   snapshot + checkout) run under the watch's per-watch **operation lock**
+//!   via [`with_op_gate`] — acquire the op lock, `begin`, run, `complete` — the
+//!   same structural one-writer-per-watch invariant the engine worker holds
+//!   (VRD-37). This serializes a CLI mutation against a running daemon's worker
+//!   on that watch and leaves a recoverable journal record either way, so a crash
+//!   mid-operation is recoverable whether or not a daemon runs.
 //! * **Dispatch** for `snapshot` uses the single-instance flock as a race-free
-//!   discriminator: if the CLI can take the lock, no daemon is running and it
-//!   snapshots in-process while holding the lock; if the lock is held, a daemon
-//!   owns the repositories and the CLI hands it a request file instead (see
-//!   [`crate::daemon`]).
+//!   discriminator of *who should do the work*: if the CLI can take the instance
+//!   lock, no daemon is running and it snapshots in-process; if the lock is held,
+//!   a daemon owns the repositories and the CLI hands it a request file instead
+//!   (see [`crate::daemon`]). This is separate from the op lock, which is *who
+//!   may mutate*.
 //!
-//! `restore` cannot take the instance lock (a running daemon holds it), so it
-//! proceeds without it and documents the interaction honestly — see
-//! [`restore`].
+//! `restore` consults the instance lock for the same dispatch decision but no
+//! longer depends on holding it to journal — the op lock covers the daemon-running
+//! case too. See [`restore`].
 
 pub(crate) mod diff;
 pub(crate) mod log;
@@ -36,10 +39,12 @@ pub(crate) use vard_core::timefmt;
 use std::io;
 use std::path::PathBuf;
 
+use std::time::Duration;
+
 use vard_core::{GitBackend, VcsBackend, VcsError, WatchSpec};
 
 use crate::config::{Config, ConfigError, ResolvedWatch};
-use crate::journal::Journal;
+use crate::journal::JournalOpGate;
 use crate::paths::{self, HomeNotFound};
 use crate::watch::select;
 
@@ -110,49 +115,75 @@ fn open_backend(spec: &WatchSpec) -> Result<GitBackend, CmdError> {
         .map_err(|e| CmdError::err(format!("opening watch {:?}: {e}", spec.name())))
 }
 
-/// Runs `body` bracketed in the per-watch operation journal: `begin(op)`
-/// before, `complete` after — on every outcome, success or failure — exactly as
-/// the daemon's event handler brackets a commit window. A crash mid-operation
-/// therefore leaves one recoverable dangling record and a clean exit leaves
-/// none. Journal I/O trouble is warned, never fatal (matching the daemon), so a
-/// journaling hiccup cannot block a manual operation.
+/// How long a CLI operation waits for a watch's per-watch **operation lock**
+/// before conceding another operation holds it. When no daemon runs (the common
+/// in-process case) the lock is free — the instance lock already serialized any
+/// peer CLI — so this only bites when a daemon's worker is mid-commit on the same
+/// watch (a `restore` under a running daemon), where a brief wait then a
+/// "retry" is the honest answer.
+const OP_GATE_BUDGET: Duration = Duration::from_secs(10);
+
+/// The result of running a mutating CLI operation under a watch's op-lock +
+/// journal bracket (VRD-37): the op lock makes one-writer-per-watch structural,
+/// so a CLI operation that cannot get it must not mutate.
+enum Gated<T> {
+    /// The op lock was acquired; the body ran under a `begin`→`complete` bracket.
+    Ran(T),
+    /// Another operation held the op lock for the whole budget; nothing ran.
+    Busy,
+}
+
+/// Runs `body` under the watch's operation gate: acquire the op lock (a bounded
+/// blocking wait), write the journal `begin`, run `body`, then `complete`
+/// (compact + release) on every outcome. A crash mid-operation therefore leaves
+/// one recoverable dangling record; a clean exit leaves none. Op-lock contention
+/// past [`OP_GATE_BUDGET`] returns [`Gated::Busy`] so the caller reports "retry"
+/// rather than mutating without the lock.
 ///
-/// The one journal-bracket helper the CLI paths share (`snapshot`'s in-process
-/// commit, `restore`'s protective-snapshot-plus-checkout). Only ever called
-/// while this process holds the instance lock — the journal's single-writer
-/// invariant.
-///
-/// The journal is keyed by the watch's repository path (its durable identity),
-/// so `watch_name` is used only to word a diagnostic.
-fn journaled<T>(
+/// This is the single op-gate bracket helper the CLI paths share (`snapshot`'s
+/// in-process commit, `restore`'s protective-snapshot-plus-checkout). It holds
+/// the per-watch op lock — the structural single-writer invariant — independently
+/// of the instance lock, so it protects the `restore`-under-a-daemon path too
+/// (the daemon's worker contends on the same op lock). The gate is keyed by the
+/// watch's repository path, so `watch_name` only words a diagnostic.
+fn with_op_gate<T>(
     journal_dir: &std::path::Path,
     repo_path: &std::path::Path,
     watch_name: &str,
     op: &str,
     body: impl FnOnce() -> T,
-) -> T {
-    let journal = Journal::for_repo_in_dir(journal_dir, repo_path);
-    if let Err(err) = journal.begin(op) {
-        eprintln!("vard: journal begin for {watch_name:?}: {err}");
+) -> Gated<T> {
+    let gate = JournalOpGate::for_repo_in_dir(journal_dir, repo_path);
+    match gate.begin_blocking(op, OP_GATE_BUDGET) {
+        Ok(Some(guard)) => {
+            let result = body();
+            guard.complete();
+            Gated::Ran(result)
+        }
+        Ok(None) => Gated::Busy,
+        Err(err) => {
+            // Op-lock I/O trouble (e.g. the state dir is unwritable): warn and run
+            // WITHOUT the bracket, matching the pre-VRD-37 "a journaling hiccup is
+            // non-fatal" behavior. git's own index.lock still serializes the
+            // commands; only the recovery record is missing.
+            eprintln!("vard: op gate for {watch_name:?}: {err}");
+            Gated::Ran(body())
+        }
     }
-    let result = body();
-    if let Err(err) = journal.complete() {
-        eprintln!("vard: journal complete for {watch_name:?}: {err}");
-    }
-    result
 }
 
-/// Takes one in-process snapshot for the watch rooted at `repo_path`, bracketed
-/// in the per-watch operation journal via [`journaled`]. Returns the backend's
-/// own result untouched; the caller maps it to exit semantics.
+/// Takes one in-process snapshot for the watch rooted at `repo_path` under the
+/// op-lock + journal bracket via [`with_op_gate`]. Returns the backend's own
+/// result untouched inside [`Gated`]; the caller maps it (and the busy case) to
+/// exit semantics.
 fn journaled_snapshot(
     journal_dir: &std::path::Path,
     repo_path: &std::path::Path,
     watch_name: &str,
     backend: &GitBackend,
     req: &vard_core::SnapshotRequest,
-) -> Result<Option<vard_core::SnapshotOutcome>, VcsError> {
-    journaled(journal_dir, repo_path, watch_name, "snapshot", || {
+) -> Gated<Result<Option<vard_core::SnapshotOutcome>, VcsError>> {
+    with_op_gate(journal_dir, repo_path, watch_name, "snapshot", || {
         backend.snapshot(req)
     })
 }
