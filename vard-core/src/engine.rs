@@ -790,6 +790,11 @@ impl Worker {
                     // A successful commit clears a snapshots-failing (or blocked)
                     // state: the watch is demonstrably healthy again.
                     self.recover_to_ok();
+                    // New local history is worth propagating: fire an automatic
+                    // sync so the commit reaches the remote without waiting for a
+                    // timer. A no-op unless the watch syncs, and self-suppressed
+                    // while Conflicted/latched (see `run_sync_cycle`).
+                    self.enqueue_auto_sync();
                     if committed_in_pass {
                         // A second commit under the mute is a genuine
                         // mute-window write. Requeue it (carrying this pass's
@@ -1192,6 +1197,19 @@ impl Worker {
     /// fast-forward race; on a conflict the watch latches
     /// [`Conflicted`](WatchState::Conflicted); on a network failure it enters
     /// [`SyncError`](WatchState::SyncError) with exponential backoff.
+    /// Enqueues an **automatic** sync request for this watch (the post-snapshot
+    /// trigger). A no-op on a watch that cannot sync. Coalesces with any pending
+    /// request without downgrading a manual one to automatic — manual wins on
+    /// intent, exactly as [`apply`](Self::apply) coalesces an inbound request.
+    /// The [`run`](Self::run) loop runs the enqueued cycle once the pass returns.
+    fn enqueue_auto_sync(&mut self) {
+        if !self.sync_enabled {
+            return;
+        }
+        let was_manual = self.sync_pending.unwrap_or(false);
+        self.sync_pending = Some(was_manual);
+    }
+
     async fn run_sync_cycle(&mut self) {
         let Some(manual) = self.sync_pending.take() else {
             return;
@@ -1260,7 +1278,15 @@ impl Worker {
                 Err(error) => return SyncStep::Failed(error),
             };
         if remote.ahead == 0 && remote.behind == 0 {
-            return SyncStep::NothingToDo;
+            // An unmoved remote is not the whole story: uncommitted LOCAL edits
+            // must still be captured and pushed. Only a clean tree is truly
+            // "nothing to do"; a dirty tree falls through into the locked window,
+            // where the pre-sync snapshot commits it and the cycle pushes.
+            match sync_is_dirty(Arc::clone(&self.backend)).await {
+                Ok(false) => return SyncStep::NothingToDo,
+                Ok(true) => {}
+                Err(error) => return SyncStep::Failed(error),
+            }
         }
 
         // 2. Locked window — op lock + one journal bracket, ZERO network I/O:
@@ -1275,21 +1301,30 @@ impl Worker {
             let _mute = self.mute.acquire();
             run_locked_window(Arc::clone(&self.backend), scratch.to_path_buf(), guard).await
         };
-        let tip = match locked {
-            LockedResult::Reconciled { pulled, tip } => {
+        let (tip, presync_committed) = match locked {
+            LockedResult::Reconciled {
+                pulled,
+                tip,
+                presync_committed,
+            } => {
                 if let Some((prev, new)) = pulled {
                     self.emit_sync_pulled(prev, new);
                 }
-                tip
+                (tip, presync_committed)
             }
             LockedResult::Conflict => return SyncStep::Conflict,
             LockedResult::Failed(error) => return SyncStep::Failed(error),
         };
 
-        // 3. Push — OUTSIDE the op lock, timeout-bounded.
+        // 3. Push — OUTSIDE the op lock, timeout-bounded. What the remote
+        //    receives is the commits the fetch found us ahead by PLUS the
+        //    pre-sync snapshot commit this window just made (if any) — the
+        //    latter was uncounted when `commits` was captured as `ahead` at
+        //    fetch time (before the pre-sync snapshot existed).
+        let pushed = remote.ahead + usize::from(presync_committed);
         match sync_push(Arc::clone(&self.backend), self.cfg.sync_network_timeout).await {
             Ok(PushOutcome::Pushed) => {
-                self.emit_sync_pushed(tip, remote.ahead);
+                self.emit_sync_pushed(tip, pushed);
                 SyncStep::Done
             }
             Ok(PushOutcome::UpToDate) => SyncStep::Done,
@@ -1406,6 +1441,10 @@ enum LockedResult {
         pulled: Option<(String, String)>,
         /// The branch tip after the window (the ref a push would send).
         tip: String,
+        /// Whether the pre-sync snapshot committed local work in this window.
+        /// Counted into what the push sends (a pre-sync commit is a real commit
+        /// the remote receives), so [`Event::SyncPushed`] does not undercount it.
+        presync_committed: bool,
     },
     /// Reconcile hit a conflict; nothing advanced.
     Conflict,
@@ -1425,6 +1464,18 @@ async fn sync_fetch(
         Ok(Ok(remote)) => Ok(remote),
         Ok(Err(err)) => Err(format!("fetch: {err}")),
         Err(join) => Err(format!("fetch task panicked: {join}")),
+    }
+}
+
+/// Runs [`is_dirty`](VcsBackend::is_dirty) off the async runtime, mapping a
+/// backend error (or panic) to a message the sync cycle surfaces as a failure.
+/// Takes the backend by value (a cheap [`Arc`] clone) so the future stays
+/// `Send`.
+async fn sync_is_dirty(backend: SharedBackend) -> Result<bool, String> {
+    match tokio::task::spawn_blocking(move || backend.is_dirty()).await {
+        Ok(Ok(dirty)) => Ok(dirty),
+        Ok(Err(err)) => Err(format!("status: {err}")),
+        Err(join) => Err(format!("status task panicked: {join}")),
     }
 }
 
@@ -1456,11 +1507,15 @@ async fn run_locked_window(
 ) -> LockedResult {
     let joined = tokio::task::spawn_blocking(move || {
         // Snapshot local first, always: commit any pending local work before the
-        // tree can be moved by advance. A no-op on a clean tree.
-        if let Err(err) = backend.snapshot(&SnapshotRequest::new(Trigger::PreSync)) {
-            guard.complete();
-            return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
-        }
+        // tree can be moved by advance. A no-op on a clean tree. The commit
+        // carries a `Vard-Host` trailer so multi-machine history stays legible.
+        let presync_committed = match backend.snapshot(&pre_sync_request()) {
+            Ok(outcome) => outcome.is_some(),
+            Err(err) => {
+                guard.complete();
+                return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
+            }
+        };
         // Clear any scratch worktree a prior crashed cycle left behind (reconcile
         // requires the path not to exist). A no-op when absent.
         let _ = backend.prune_scratch(&scratch);
@@ -1480,6 +1535,7 @@ async fn run_locked_window(
                         LockedResult::Reconciled {
                             pulled: Some((tip_before, new_head.to_string())),
                             tip: new_head.to_string(),
+                            presync_committed,
                         }
                     }
                     Err(err) => {
@@ -1493,6 +1549,7 @@ async fn run_locked_window(
                 LockedResult::Reconciled {
                     pulled: None,
                     tip: tip_before,
+                    presync_committed,
                 }
             }
             Ok(ReconcileOutcome::Conflict) => {
@@ -1510,6 +1567,34 @@ async fn run_locked_window(
         Ok(result) => result,
         Err(join) => LockedResult::Failed(format!("sync task panicked: {join}")),
     }
+}
+
+/// Builds the [`SnapshotRequest`] for the sync cycle's pre-sync snapshot: a
+/// [`Trigger::PreSync`] commit tagged with a `Vard-Host: <hostname>` trailer.
+/// The trailer records which machine took the snapshot, so a branch synced
+/// across several hosts reads legibly (and a future tool can attribute commits).
+fn pre_sync_request() -> SnapshotRequest {
+    SnapshotRequest {
+        trigger: Trigger::PreSync,
+        user_text: None,
+        extra_trailers: vec![("Vard-Host".to_string(), host_name())],
+    }
+}
+
+/// The local host's name for the `Vard-Host` trailer, resolved once and cached.
+/// Read from the kernel via `uname(2)` (the same value `hostname` prints);
+/// falls back to `"unknown"` if it is empty or not valid UTF-8, so the trailer
+/// is always present and well-formed.
+fn host_name() -> String {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let uname = rustix::system::uname();
+        match uname.nodename().to_str() {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => "unknown".to_string(),
+        }
+    })
+    .clone()
 }
 
 /// The branch tip's id via a one-entry `log`, or `None` on any error/empty
@@ -2354,6 +2439,9 @@ mod tests {
         /// Scripted safe-state probe results, consumed before falling back to
         /// `safe`. Lets a test make [`is_safe_state`] fail or flip over calls.
         safe_results: VecDeque<Result<SafeState, VcsError>>,
+        /// Whether the work tree reports dirty ([`is_dirty`]); drives the sync
+        /// short-circuit's "clean tree is the only nothing-to-do" check.
+        dirty: bool,
         snapshots: VecDeque<Scripted>,
         /// When set, every snapshot commits — models a backend that never
         /// reports a clean tree (used to prove the post-op re-check is bounded).
@@ -2386,6 +2474,7 @@ mod tests {
                 inner: Mutex::new(FakeInner {
                     safe: SafeState::Safe,
                     safe_results: VecDeque::new(),
+                    dirty: false,
                     snapshots: VecDeque::new(),
                     always_commit: false,
                     always_fail: false,
@@ -2446,6 +2535,12 @@ mod tests {
             self.inner.lock().unwrap().safe = safe;
         }
 
+        /// Marks the work tree dirty (or clean) for the sync short-circuit's
+        /// [`is_dirty`](VcsBackend::is_dirty) probe.
+        fn set_dirty(&self, dirty: bool) {
+            self.inner.lock().unwrap().dirty = dirty;
+        }
+
         /// Makes every snapshot commit, so the post-op re-check never converges
         /// on its own — used to prove the re-check is bounded under the mute.
         fn set_always_commit(&self) {
@@ -2485,6 +2580,10 @@ mod tests {
                 Some(scripted) => scripted,
                 None => Ok(inner.safe.clone()),
             }
+        }
+
+        fn is_dirty(&self) -> Result<bool, VcsError> {
+            Ok(self.inner.lock().unwrap().dirty)
         }
 
         fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
@@ -2983,6 +3082,122 @@ mod tests {
             backend.push_calls(),
             SYNC_MAX_ATTEMPTS as usize,
             "the in-cycle race re-loop is capped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_dirty_tree_with_unmoved_remote_snapshots_and_pushes() {
+        // Regression: an unmoved remote (ahead == 0, behind == 0) is NOT
+        // "nothing to do" when the tree has uncommitted edits. The cycle must
+        // enter the locked window, commit the pre-sync snapshot, and push it.
+        let backend = FakeBackend::new();
+        backend.set_dirty(true);
+        backend.script_fetch([remote(0, 0)]);
+        // The locked window's pre-sync snapshot commits the dirty work.
+        backend.script([Scripted::Commit(1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::AlreadyUpToDate)]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            // The pre-sync commit is the one commit pushed (ahead was 0).
+            Event::SyncPushed { commits, .. } => assert_eq!(commits, 1),
+            other => panic!("expected SyncPushed, got {other:?}"),
+        }
+        assert_eq!(backend.push_calls(), 1, "the dirty tree was pushed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_pushed_count_includes_the_pre_sync_snapshot_commit() {
+        // With one commit already ahead AND uncommitted local work, the pushed
+        // count is the fetch-time ahead (1) PLUS the pre-sync snapshot commit
+        // (1) — the pre-sync commit must not be undercounted.
+        let backend = FakeBackend::new();
+        backend.set_dirty(true);
+        backend.script_fetch([remote(1, 0)]);
+        backend.script([Scripted::Commit(1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::AlreadyUpToDate)]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPushed { commits, .. } => {
+                assert_eq!(commits, 2, "one already-ahead commit plus the pre-sync one")
+            }
+            other => panic!("expected SyncPushed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_snapshot_drives_an_automatic_sync() {
+        // A committed snapshot on a sync-enabled watch fires an automatic sync,
+        // so the new local history reaches the remote without waiting on a timer.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        backend.script_fetch([remote(1, 0)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::AlreadyUpToDate)]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        // A plain filesystem trigger — no explicit sync request.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SnapshotCompleted { .. }
+        ));
+        // The post-snapshot trigger runs a real cycle that pushes.
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPushed { .. } => {}
+            other => panic!("expected a post-snapshot SyncPushed, got {other:?}"),
+        }
+        assert_eq!(
+            backend.fetch_calls(),
+            1,
+            "the snapshot drove one sync cycle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_on_a_conflicted_watch_does_not_auto_sync() {
+        // While a conflict latches, a successful snapshot must NOT fire an
+        // automatic sync — auto-sync is suppressed until a manual resolve.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::Conflict)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        // Latch the conflict via an explicit sync.
+        tx.send(WatchInput::RequestSync { manual: true }).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SyncConflict { .. }
+        ));
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::WatchStateChanged {
+                to: WatchState::Conflicted,
+                ..
+            }
+        ));
+
+        // A snapshot still commits while latched, but its auto-sync is suppressed.
+        let fetches = backend.fetch_calls();
+        backend.script([Scripted::Commit(1)]);
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        assert!(matches!(
+            advance_until_event(&mut events, Duration::from_secs(1)).await,
+            Event::SnapshotCompleted { .. }
+        ));
+        for _ in 0..10 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            backend.fetch_calls(),
+            fetches,
+            "a conflicted watch's snapshot must not auto-sync"
         );
     }
 

@@ -29,9 +29,10 @@ toml = { version = "0.9", default-features = false, features = ["parse", "displa
 toml_edit = { version = "0.23", default-features = false, features = ["parse", "display"] }
 # Advisory `flock` single-instance locking and `kill(pid, 0)` liveness probes
 # for stale-lock recovery back the daemon shell (vard only). `fs` supplies
-# `flock`; `process` supplies `test_kill_process`/`Pid`. Kept default-features
-# off to stay dependency-light.
-rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+# `flock`; `process` supplies `test_kill_process`/`Pid`; `system` supplies
+# `uname` (the host name stamped into a pre-sync snapshot's `Vard-Host`
+# trailer). Kept default-features off to stay dependency-light.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "system"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "4.5"

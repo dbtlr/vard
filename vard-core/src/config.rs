@@ -213,6 +213,16 @@ impl WatchSpec {
     pub fn scratch_dir(&self) -> Option<&Path> {
         self.scratch_dir.as_deref()
     }
+
+    /// Host-injects the out-of-tree reconcile [`scratch_dir`](Self::scratch_dir)
+    /// after the spec is built from config, turning real syncing on for this
+    /// watch. The host (the daemon, the `vard sync` CLI) derives the path from
+    /// its state directory; vard-core resolves none itself. Consuming, so it
+    /// chains off a built spec: `spec.with_scratch_dir(path)`.
+    pub fn with_scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dir = Some(dir.into());
+        self
+    }
 }
 
 /// A fluent builder for [`WatchSpec`]. Obtain one from [`WatchSpec::builder`].

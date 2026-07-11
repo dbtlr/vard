@@ -424,6 +424,16 @@ impl VcsBackend for GitBackend {
         }
     }
 
+    fn is_dirty(&self) -> Result<bool, VcsError> {
+        // `status --porcelain` prints one line per changed path and nothing at
+        // all for a clean tree, so a non-empty result means dirty. Untracked
+        // files are included by default (respecting `.gitignore`), matching the
+        // `add -A` sweep the snapshot would perform. No index mutation, no
+        // network — a cheap read.
+        let out = self.run(&[], ["status", "--porcelain"])?;
+        Ok(!out.trim().is_empty())
+    }
+
     fn snapshot(&self, req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
         self.ensure_safe()?;
 

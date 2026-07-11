@@ -71,6 +71,10 @@ impl VcsBackend for FakeBackend {
         Ok(SafeState::Safe)
     }
 
+    fn is_dirty(&self) -> Result<bool, VcsError> {
+        Ok(self.dirty.load(Ordering::SeqCst))
+    }
+
     fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
         if self.dirty.swap(false, Ordering::SeqCst) {
             self.committed.fetch_add(1, Ordering::SeqCst);
@@ -268,6 +272,10 @@ impl GatedBackend {
 impl VcsBackend for GatedBackend {
     fn is_safe_state(&self) -> Result<SafeState, VcsError> {
         Ok(SafeState::Safe)
+    }
+
+    fn is_dirty(&self) -> Result<bool, VcsError> {
+        Ok(self.dirty.load(Ordering::SeqCst))
     }
 
     fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
@@ -948,4 +956,52 @@ async fn sync_without_a_scratch_dir_is_disabled_even_when_sync_is_true() {
 
     assert!(handle.request_sync("proj"));
     assert_no_sync(&mut events, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn sync_commits_dirty_local_work_with_a_vard_host_trailer_and_pushes_it() {
+    let origin = bare_origin();
+    let (_a_dir, a) = synced_repo(origin.path());
+
+    // Uncommitted local edits, and the remote has not moved: the fetch reports
+    // nothing to pull or push, but the dirty tree must still be captured by the
+    // pre-sync snapshot and pushed (the short-circuit's clean-tree check).
+    std::fs::write(a.join("draft.txt"), "local work\n").unwrap();
+
+    let scratch_root = tempfile::tempdir().unwrap();
+    let scratch = scratch_root.path().join("scratch");
+    let engine = Engine::builder()
+        .watch(sync_spec("proj", &a, Some(&scratch), true))
+        .build()
+        .unwrap();
+    let mut events = engine.subscribe();
+    let handle = engine.start().await.unwrap();
+
+    assert!(handle.request_sync("proj"));
+    match recv_matching(&mut events, |e| matches!(e, Event::SyncPushed { .. })).await {
+        Event::SyncPushed { commits, .. } => {
+            assert_eq!(commits, 1, "the pre-sync commit is the one commit pushed")
+        }
+        other => panic!("expected SyncPushed, got {other:?}"),
+    }
+
+    // The pre-sync snapshot carries both the pre-sync trigger trailer and a
+    // Vard-Host trailer naming the machine that took it.
+    let body = git_out(&a, &["log", "-1", "--format=%B"]);
+    assert!(
+        body.contains("Vard-Trigger: pre-sync"),
+        "pre-sync trigger trailer missing: {body:?}"
+    );
+    assert!(
+        body.contains("Vard-Host: "),
+        "Vard-Host trailer missing: {body:?}"
+    );
+
+    // The commit really reached the remote.
+    let local_tip = git_out(&a, &["rev-parse", "HEAD"]);
+    let remote_tip = git_out(origin.path(), &["rev-parse", "refs/heads/main"]);
+    assert_eq!(
+        local_tip, remote_tip,
+        "the remote received the local commit"
+    );
 }

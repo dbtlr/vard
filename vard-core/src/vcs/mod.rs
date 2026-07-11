@@ -57,6 +57,17 @@ pub trait VcsBackend {
     /// `HEAD`, or a `HEAD` on the wrong branch all report `Unsafe`.
     fn is_safe_state(&self) -> Result<SafeState, VcsError>;
 
+    /// Reports whether the work tree holds uncommitted changes a
+    /// [`snapshot`](Self::snapshot) would capture — staged, unstaged, or
+    /// untracked-and-not-ignored files alike (the same `git add -A` sweep the
+    /// snapshot performs). A clean tree returns `false`.
+    ///
+    /// This is a cheap, non-network status probe. The sync cycle consults it so
+    /// that a watch with local edits but an unmoved remote is not mistaken for
+    /// "nothing to do": a dirty tree must proceed into the locked window, where
+    /// the pre-sync snapshot commits it before it can be pushed.
+    fn is_dirty(&self) -> Result<bool, VcsError>;
+
     /// Sweeps the whole work tree and commits it as one snapshot, returning
     /// the new snapshot's id and a summary of what it contains — or `None`
     /// when nothing changed.
