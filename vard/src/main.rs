@@ -6,6 +6,7 @@ mod config;
 mod config_cmd;
 mod config_edit;
 mod daemon;
+mod flock;
 mod health;
 mod help;
 mod instance;

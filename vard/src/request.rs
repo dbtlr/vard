@@ -30,7 +30,13 @@ use serde::{Deserialize, Serialize};
 /// A request older than this when the daemon drains it is discarded with a
 /// warning rather than applied: a stale manual snapshot from hours ago is not
 /// what the user wants acted on now. Matches the journal's 15-minute
-/// operation-window rationale.
+/// operation-window rationale ([`MAX_OP_WINDOW`](crate::journal::MAX_OP_WINDOW)).
+///
+/// This gate is about the *request file's* age and is orthogonal to the per-watch
+/// operation lock (VRD-37): a fresh request is merely injected as a
+/// `Trigger::Manual`, and it is the engine worker — not this drain — that later
+/// takes the op lock when it actually snapshots. So the op lock changes nothing
+/// about this gate's soundness.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// A request file: what operation, for which watch, and when it was queued.

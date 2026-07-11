@@ -18,7 +18,7 @@ use vard_core::{
 };
 
 use super::{
-    CmdError, CmdPaths, CmdResult, OutCtx, emit_action, emit_records, journaled_snapshot,
+    CmdError, CmdPaths, CmdResult, Gated, OutCtx, emit_action, emit_records, journaled_snapshot,
     load_config, open_backend, resolve_all, select_one,
 };
 use crate::cli::{ColorWhen, OutputFormat, SnapshotArgs};
@@ -141,13 +141,27 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
     };
 
     match journaled_snapshot(&paths.journal_dir, spec.path(), name, &backend, &req) {
-        Ok(Some(outcome)) => (committed_record(name, &outcome), 0),
-        Ok(None) => (result_record(name, "no changes", None, None, None), 0),
-        Err(VcsError::UnsafeState(reason)) => (
+        // Another operation holds the watch's op lock (a concurrent restore, say).
+        Gated::Busy => (
+            result_record(
+                name,
+                "busy",
+                Some("another vard operation holds this watch's lock; retry later"),
+                None,
+                None,
+            ),
+            1,
+        ),
+        // In-process snapshot is a sole vard actor, so `with_op_gate` never fails
+        // closed here; handle it defensively as an error rather than panicking.
+        Gated::LockFailed(detail) => (result_record(name, "error", Some(&detail), None, None), 2),
+        Gated::Ran(Ok(Some(outcome))) => (committed_record(name, &outcome), 0),
+        Gated::Ran(Ok(None)) => (result_record(name, "no changes", None, None, None), 0),
+        Gated::Ran(Err(VcsError::UnsafeState(reason))) => (
             result_record(name, "unsafe", Some(&unsafe_detail(&reason)), None, None),
             1,
         ),
-        Err(VcsError::LockContended { .. }) => (
+        Gated::Ran(Err(VcsError::LockContended { .. })) => (
             result_record(
                 name,
                 "busy",
@@ -157,7 +171,7 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
             ),
             1,
         ),
-        Err(e) => (
+        Gated::Ran(Err(e)) => (
             result_record(name, "error", Some(&e.to_string()), None, None),
             2,
         ),

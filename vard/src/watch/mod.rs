@@ -38,7 +38,7 @@ use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, fin
 use crate::config::{Config, ResolvedWatch, WatchConfig, expand_tilde};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::instance::{CliLock, InstanceLock};
-use crate::journal::{self, Journal};
+use crate::journal::{self, Journal, OpLock};
 use crate::output::record::{self, Record, RecordField};
 use crate::paths::{self, HomeNotFound};
 
@@ -504,19 +504,27 @@ fn cmd_remove(paths: &WatchPaths, out: &OutCtx, args: WatchRemoveArgs) -> CmdRes
 /// A recovery hiccup is never fatal — recovery folds every outcome into a
 /// report, and this is a cleanup step, not the removal itself.
 ///
-/// Returns `true` only when *this* CLI acquired the lock and drained the watch
-/// (the `Acquired` outcome). A daemon/peer holder returns `false`: we are not
-/// the journal's writer, so we left it alone — and `--purge` must then not
-/// delete a journal that could still record an open operation.
+/// Returns `true` only when *this* CLI acquired the lock **and** recovery reached
+/// a settled outcome that authorizes deleting the journal
+/// ([`RecoveryReport::settled`](crate::journal::RecoveryReport::settled): the
+/// record was compacted clean, a stale lock removed, no lock present, or the lock
+/// proven foreign). A daemon/peer holder — or a recovery that left the record
+/// live (a still-alive holder, a too-fresh lock, a corrupt/failed outcome) —
+/// returns `false`: `--purge` must then not delete a journal that could still
+/// record an open operation, and falls back to the
+/// [`is_clean`](Journal::is_clean) guard instead.
 fn drain_removed_watch(paths: &WatchPaths, repo_path: &Path, name: &str) -> bool {
     match InstanceLock::acquire_for_cli(&paths.lock_file, REMOVE_DRAIN_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
             let journal = Journal::for_repo_in_dir(&paths.journal_dir, repo_path);
             // Route through the shared logger so the CLI drain reports at the
-            // same per-variant levels as the daemon's recover sites.
-            journal.recover_and_log(repo_path, name, "watch-remove");
+            // same per-variant levels as the daemon's recover sites. Only a
+            // *settled* outcome authorizes deleting the recovery evidence.
+            let settled = journal
+                .recover_and_log(repo_path, name, "watch-remove")
+                .settled();
             drop(lock);
-            true
+            settled
         }
         // A daemon drains via its reload; a peer CLI means we are not the
         // writer. Either way, leave the journal untouched — we did not drain.
@@ -527,11 +535,12 @@ fn drain_removed_watch(paths: &WatchPaths, repo_path: &Path, name: &str) -> bool
     }
 }
 
-/// Drops vard's per-watch metadata (its operation journal, keyed by repo path)
-/// for a removed watch, returning whether it actually deleted the file.
+/// Drops vard's per-watch metadata (its operation journal and sibling op-lock
+/// file, keyed by repo path) for a removed watch, returning whether it actually
+/// deleted the journal.
 ///
 /// It deletes the journal only when doing so cannot destroy live recovery
-/// evidence: either this CLI already `drained` it (took the lock and ran
+/// evidence: either this CLI already `drained` it (took the op lock and ran
 /// recovery), or the journal is provably clean (no dangling `begin`). If a
 /// daemon or peer CLI holds the lock *and* the journal still records an open
 /// operation, the file is left for the daemon's reload-drain or the next
@@ -543,6 +552,31 @@ fn purge_metadata(paths: &WatchPaths, repo_path: &Path, drained: bool) -> Result
     if !drained && !journal.is_clean() {
         return Ok(false);
     }
+    // Prove the op lock free before unlinking anything. Unlinking a `.lock` file a
+    // live holder still has open would let the next acquirer create a *fresh
+    // inode* at the same path and flock that instead — silently breaking the
+    // single-writer invariant. So try-acquire the sibling first: a `WOULDBLOCK`
+    // means a holder is mid-operation, so leave the metadata for the daemon's
+    // reload-drain or the next start's sweep. Holding the lock, both unlinks are
+    // safe (mirrors `reconcile_orphan`'s held-lock delete; unlinking a file we
+    // hold open is fine on Unix, and the guard releases on return).
+    let _guard = match OpLock::try_acquire(journal.lock_path()) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Ok(false),
+        // Op-lock I/O trouble: best-effort, so retain rather than hard-fail the
+        // removal (the journal now encodes its own repo path, so the sweep can
+        // still recover it later).
+        Err(e) => {
+            eprintln!(
+                "vard: purge: op lock for {}: {e}; metadata retained",
+                repo_path.display()
+            );
+            return Ok(false);
+        }
+    };
+    // Drop the sibling op-lock file too (best-effort): purged metadata must leave
+    // nothing behind, and the orphan sweep only scans `.journal` files.
+    let _ = std::fs::remove_file(journal.lock_path());
     match std::fs::remove_file(journal.path()) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -716,7 +750,7 @@ fn emit_list(out: &OutCtx, records: &[Record]) -> CmdResult {
 mod tests {
     use super::*;
     use crate::instance::LockRole;
-    use crate::journal::test_support::plant_crashed;
+    use crate::journal::test_support::{plant_crashed, retry_until};
 
     fn paths_in(dir: &Path) -> WatchPaths {
         WatchPaths {
@@ -785,11 +819,20 @@ mod tests {
         let repo = dir.path().join("repo");
         let journal = clean_journal(&paths, &repo);
 
-        // A clean journal is deletable even without a drain.
-        assert!(matches!(purge_metadata(&paths, &repo, false), Ok(true)));
+        // A clean journal is deletable even without a drain. (Retry rides out the
+        // sibling-fork/exec race that can transiently hold the just-created op-lock
+        // fd — the same artifact the flock tests document; purge correctly retains
+        // on a *genuine* concurrent holder.)
+        assert!(retry_until(|| matches!(
+            purge_metadata(&paths, &repo, false),
+            Ok(true)
+        )));
         assert!(!journal.path().exists(), "purge deletes the journal file");
         // A second purge on an already-absent journal is a clean no-op.
-        assert!(matches!(purge_metadata(&paths, &repo, false), Ok(true)));
+        assert!(retry_until(|| matches!(
+            purge_metadata(&paths, &repo, false),
+            Ok(true)
+        )));
     }
 
     #[test]
@@ -802,7 +845,11 @@ mod tests {
 
         let drained = drain_removed_watch(&paths, &repo, "repo");
         assert!(drained);
-        assert!(matches!(purge_metadata(&paths, &repo, drained), Ok(true)));
+        // Retry rides out the fork/exec race on the just-released op-lock fd.
+        assert!(retry_until(|| matches!(
+            purge_metadata(&paths, &repo, drained),
+            Ok(true)
+        )));
         let journal = Journal::for_repo_in_dir(&paths.journal_dir, &repo);
         assert!(!journal.path().exists(), "a drained journal is purged");
     }
@@ -842,7 +889,11 @@ mod tests {
 
         let drained = drain_removed_watch(&paths, &repo, "repo");
         assert!(!drained);
-        assert!(matches!(purge_metadata(&paths, &repo, drained), Ok(true)));
+        // Retry rides out the fork/exec race on the just-created op-lock fd.
+        assert!(retry_until(|| matches!(
+            purge_metadata(&paths, &repo, drained),
+            Ok(true)
+        )));
         assert!(!journal.path().exists(), "a clean journal is safe to purge");
     }
 

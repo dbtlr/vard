@@ -76,7 +76,7 @@ vard snapshot notes --format json
 | Code | Meaning |
 |---|---|
 | `0` | Every named watch was snapshotted or queued (including `no changes`). |
-| `1` | A watch was skipped — an unsafe repository state, or a paused watch requested while the daemon is running. |
+| `1` | A watch was skipped — an unsafe repository state, a paused watch requested while the daemon is running, or its lock is held by another operation (retry). |
 | `2` | Operational error (e.g. a selector that resolves to no watch). |
 
 ## See also
