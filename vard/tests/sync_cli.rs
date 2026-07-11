@@ -1,0 +1,280 @@
+//! End-to-end tests for `vard sync` (VRD-19), driving the real binary against
+//! tempdir-isolated config, state, and HOME, with a bare file remote.
+//!
+//! These exercise the no-daemon in-process path, where the outcome is
+//! deterministic without a background process: the command builds a minimal
+//! engine, runs one real sync cycle per watch, and reports the result. The
+//! daemon-request dispatch path (a sync handed to a running `vard run`) is
+//! covered by the daemon's own integration test.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+mod common;
+use common::{Env, code, stderr, stdout};
+
+/// Runs `git -C <repo> <args>` against the throwaway global git config.
+fn git_in(env: &Env, repo: &Path, args: &[&str]) -> Output {
+    let mut full = vec!["-C", repo.to_str().unwrap()];
+    full.extend_from_slice(args);
+    Command::new("git")
+        .args(&full)
+        .env("GIT_CONFIG_GLOBAL", &env.git_config)
+        .output()
+        .expect("spawn git")
+}
+
+fn git_ok(env: &Env, repo: &Path, args: &[&str]) {
+    let out = git_in(env, repo, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        stderr(&out)
+    );
+}
+
+/// Deterministic, signer-free commits regardless of the host's git config.
+fn no_sign(env: &Env) {
+    env.set_git_config("commit.gpgsign", "false");
+}
+
+/// A bare repository usable as a file remote.
+fn bare_origin(env: &Env, name: &str) -> PathBuf {
+    let path = env.root.path().join(name);
+    let out = Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .arg(&path)
+        .env("GIT_CONFIG_GLOBAL", &env.git_config)
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success(), "init --bare failed: {}", stderr(&out));
+    path
+}
+
+/// A working repo on `main` with `origin` set, a base commit, and `main`
+/// pushed — the remote exists and the two agree at the base.
+fn synced_repo(env: &Env, name: &str, origin: &Path) -> PathBuf {
+    let path = env.root.path().join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    git_ok(env, &path, &["init", "-b", "main"]);
+    git_ok(
+        env,
+        &path,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    std::fs::write(path.join("base.txt"), "base\n").unwrap();
+    git_ok(env, &path, &["add", "-A"]);
+    git_ok(env, &path, &["commit", "-m", "base"]);
+    git_ok(env, &path, &["push", "-u", "origin", "main"]);
+    std::fs::canonicalize(&path).unwrap()
+}
+
+/// A second clone of `origin` that moves the remote out from under the watch.
+fn mover_pushes(env: &Env, origin: &Path, file: &str, contents: &str) {
+    let dest = env.root.path().join("mover");
+    let out = Command::new("git")
+        .args(["clone", origin.to_str().unwrap()])
+        .arg(&dest)
+        .env("GIT_CONFIG_GLOBAL", &env.git_config)
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success(), "clone failed: {}", stderr(&out));
+    std::fs::write(dest.join(file), contents).unwrap();
+    git_ok(env, &dest, &["add", "-A"]);
+    git_ok(env, &dest, &["commit", "-m", "remote work"]);
+    git_ok(env, &dest, &["push", "origin", "main"]);
+    std::fs::remove_dir_all(&dest).unwrap();
+}
+
+fn config_for(watches: &str) -> String {
+    format!("version = 1\n{watches}")
+}
+
+fn sync_watch(name: &str, path: &Path) -> String {
+    format!(
+        "[[watch]]\nname = \"{name}\"\npath = \"{}\"\nsync = true\nbranch = \"main\"\n\
+         remote = \"origin\"\ntrigger = \"interval\"\ninterval = \"1h\"\n",
+        path.display()
+    )
+}
+
+/// The single journal file is compacted to empty after every clean operation.
+fn assert_journals_clean(env: &Env) {
+    let dir = env.journal_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let len = std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(0);
+            assert_eq!(len, 0, "journal {:?} holds a dangling record", entry.path());
+        }
+    }
+}
+
+#[test]
+fn sync_in_process_pushes_dirty_work_and_exits_zero() {
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&sync_watch("notes", &repo)));
+
+    // Uncommitted local edit, remote unmoved: must be committed and pushed.
+    std::fs::write(repo.join("draft.txt"), "local work\n").unwrap();
+
+    let out = env.vard(&["--format", "records", "sync", "notes"]);
+    assert!(out.status.success(), "sync failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("status   pushed"), "got: {text}");
+    assert!(text.contains("commits  1"), "got: {text}");
+
+    // The commit really reached the remote.
+    let remote_head = git_in(&env, &origin, &["rev-parse", "refs/heads/main"]);
+    let local_head = git_in(&env, &repo, &["rev-parse", "HEAD"]);
+    assert_eq!(stdout(&remote_head).trim(), stdout(&local_head).trim());
+    assert_journals_clean(&env);
+}
+
+#[test]
+fn sync_up_to_date_reports_and_exits_zero() {
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&sync_watch("notes", &repo)));
+
+    // Clean tree, remote unmoved: nothing to do.
+    let out = env.vard(&["--format", "records", "sync", "notes"]);
+    assert!(out.status.success(), "sync failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("status   up to date"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert_journals_clean(&env);
+}
+
+#[test]
+fn sync_json_emits_the_machine_contract() {
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&sync_watch("notes", &repo)));
+
+    let out = env.vard(&["--format", "json", "sync", "notes"]);
+    assert!(out.status.success(), "sync failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(r#""name":"notes""#) && text.contains(r#""status":"up to date""#),
+        "got: {text}"
+    );
+    // Stable fixed-shape keys, present even when unused.
+    assert!(text.contains(r#""commits":null"#), "got: {text}");
+    assert!(text.contains(r#""ref":null"#), "got: {text}");
+}
+
+#[test]
+fn sync_conflict_reports_and_exits_one() {
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&sync_watch("notes", &repo)));
+
+    // The remote edits base.txt; the watch edits the same file locally. The
+    // pre-sync snapshot commits the local edit, then the reconcile conflicts.
+    mover_pushes(&env, &origin, "base.txt", "remote-change\n");
+    std::fs::write(repo.join("base.txt"), "local-change\n").unwrap();
+
+    let out = env.vard(&["--format", "records", "sync", "notes"]);
+    assert_eq!(
+        code(&out),
+        1,
+        "expected attention exit, stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("status   conflict"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn sync_named_unknown_watch_errors() {
+    let env = Env::new();
+    let origin = bare_origin(&env, "origin.git");
+    let repo = synced_repo(&env, "notes", &origin);
+    env.write_config(&config_for(&sync_watch("notes", &repo)));
+
+    let out = env.vard(&["sync", "nope"]);
+    assert_eq!(code(&out), 2, "expected operational error");
+    assert!(
+        stderr(&out).contains("nope"),
+        "error should name the bad selector: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn sync_named_non_sync_watch_is_disabled() {
+    let env = Env::new();
+    no_sign(&env);
+    // A plain local watch with syncing off.
+    let repo = env.root.path().join("local");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_ok(&env, &repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join("x.txt"), "x\n").unwrap();
+    git_ok(&env, &repo, &["add", "-A"]);
+    git_ok(&env, &repo, &["commit", "-m", "x"]);
+    let canon = std::fs::canonicalize(&repo).unwrap();
+    env.write_config(&config_for(&format!(
+        "[[watch]]\nname = \"local\"\npath = \"{}\"\nsync = false\n\
+         trigger = \"interval\"\ninterval = \"1h\"\n",
+        canon.display()
+    )));
+
+    let out = env.vard(&["--format", "records", "sync", "local"]);
+    assert_eq!(code(&out), 1, "expected attention exit");
+    assert!(
+        stdout(&out).contains("status   disabled"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn sync_all_syncs_enabled_and_skips_disabled() {
+    let env = Env::new();
+    no_sign(&env);
+    let origin = bare_origin(&env, "origin.git");
+    let synced = synced_repo(&env, "notes", &origin);
+
+    let local = env.root.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    git_ok(&env, &local, &["init", "-b", "main"]);
+    std::fs::write(local.join("x.txt"), "x\n").unwrap();
+    git_ok(&env, &local, &["add", "-A"]);
+    git_ok(&env, &local, &["commit", "-m", "x"]);
+    let local_canon = std::fs::canonicalize(&local).unwrap();
+
+    let local_watch = format!(
+        "[[watch]]\nname = \"local\"\npath = \"{}\"\nsync = false\n\
+         trigger = \"interval\"\ninterval = \"1h\"\n",
+        local_canon.display()
+    );
+    let watches = format!("{}{}", sync_watch("notes", &synced), local_watch);
+    env.write_config(&config_for(&watches));
+
+    // No selector: only the sync-enabled watch is acted on; the disabled one is
+    // silently skipped (not shown as an error).
+    let out = env.vard(&["--format", "json", "sync"]);
+    assert!(out.status.success(), "sync failed: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains(r#""name":"notes""#), "got: {text}");
+    assert!(
+        !text.contains(r#""name":"local""#),
+        "disabled watch shown: {text}"
+    );
+}

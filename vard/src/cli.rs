@@ -176,6 +176,36 @@ as explicit intent).
 `-m` prepends a message paragraph to the generated snapshot subject.")]
     Snapshot(SnapshotArgs),
 
+    /// Sync a watch with its remote now: fetch, reconcile, and push, out of
+    /// tree so the working tree only moves between committed states.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Reconcile a watch with its remote now.
+
+Runs one sync cycle for a watch that has syncing enabled: fetch the remote, \
+reconcile local and remote history out of tree (rebasing in a scratch worktree, \
+never the working tree), and push. Any uncommitted local work is committed by a \
+pre-sync snapshot first, so nothing is ever lost and the working tree only ever \
+moves between fully-committed states. With no selector every sync-enabled watch \
+is synced; with a `<name|path>` only that one is.
+
+Syncing must be enabled for the watch (`defaults.sync`/the watch's `sync` key, \
+with a `branch` and `remote` configured). A watch without syncing enabled is \
+reported as such and skipped; asking for one by name exits 1.
+
+If the vard daemon is running it owns the repositories, so the sync is handed to \
+it as a request and runs asynchronously; the command reports that the request \
+was queued, not the cycle result. With no daemon running the cycle runs \
+in-process under the single-instance lock and the result is reported per watch: \
+`pushed` (with the commit count), `pulled`, `synced` (both), or `up to date`.
+
+A reconcile that hits a conflict git cannot resolve latches the watch \
+`conflicted` and stops automatic syncing for it until the conflict is resolved; \
+the command reports it and exits 1. A network or authentication failure is \
+reported and exits 2. Output follows the global `--format`: human record blocks \
+on a terminal, JSON or JSONL when piped.")]
+    Sync(SyncArgs),
+
     /// Show a watch's snapshot history, most recent first.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
@@ -357,6 +387,15 @@ pub struct SnapshotArgs {
     /// A message paragraph prepended to the generated snapshot subject.
     #[arg(short = 'm', long = "message", value_name = "MSG")]
     pub message: Option<String>,
+}
+
+/// Arguments to `vard sync`.
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    /// The watch to sync, by name or by path. Omit to sync every sync-enabled
+    /// watch.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: Option<String>,
 }
 
 /// Arguments to `vard log`.

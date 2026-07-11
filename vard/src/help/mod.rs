@@ -234,6 +234,7 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
         Command::Run => "run",
         Command::Watch { .. } => "watch",
         Command::Snapshot(_) => "snapshot",
+        Command::Sync(_) => "sync",
         Command::Log(_) => "log",
         Command::Diff(_) => "diff",
         Command::Restore(_) => "restore",
