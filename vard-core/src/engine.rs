@@ -228,6 +228,15 @@ pub const DEFAULT_SYNC_BACKOFF_CAP: Duration = Duration::from_secs(60 * 60);
 /// single-race case.
 pub const SYNC_MAX_ATTEMPTS: u32 = 3;
 
+/// How many gate-busy deferrals the shutdown drain services before it stops
+/// waiting and terminates the request as [`SyncOutcome::NotRun`]. The drain
+/// exists to converge a request the engine itself deferred (a transient
+/// gate-busy, a clobber retry); a gate held by a *foreign or peer* process may
+/// never free, and a CLI must fail fast with an honest "did not run" rather
+/// than hang for the whole shutdown drain budget. Three paced tries cover the
+/// transient our-own-window case without stretching the stuck case past ~2 s.
+const DRAIN_GATE_BUSY_MAX_ATTEMPTS: u32 = 3;
+
 /// Tunable timing policy for a worker's retry and re-poll loops.
 ///
 /// The defaults are the `DEFAULT_*` constants in this module; the
@@ -572,8 +581,21 @@ pub enum SyncOutcome {
     /// the live remote gate ([`VcsBackend::has_remote`]) skipped the cycle: an
     /// honest no-op with no state change, no [`SyncError`](WatchState::SyncError),
     /// and no backoff. A remote added later is picked up on the next request.
+    /// (The rendered reason is [`SYNC_NO_REMOTE_REASON`].)
     NoRemote,
+    /// The request never ran: the op gate stayed busy through the shutdown
+    /// drain's bounded retries (a foreign or peer holder that did not free in
+    /// time). Honest "did not run" with the reason ready to surface — never a
+    /// false success, and no failure latch (the gate holder, not the sync, owns
+    /// the condition).
+    NotRun(String),
 }
+
+/// The single wording for "sync-enabled, but the repository has no configured
+/// remote": the reason on the engine's [`Event::SyncSkipped`] and the detail a
+/// host renders for [`SyncOutcome::NoRemote`] rows. One constant so the
+/// engine's log line and every CLI row cannot drift apart.
+pub const SYNC_NO_REMOTE_REASON: &str = "the repository has no configured remote";
 
 /// What woke a worker's [`run`](Worker::run) loop for one turn. Every variant
 /// falls through to the same snapshot/sync dispatch afterwards.
@@ -592,7 +614,7 @@ enum Wake {
 ///
 /// One invariant governs it: **every accepted request terminates in exactly one
 /// terminal [`SyncOutcome`] delivered to ALL of its waiters, and every
-/// non-terminal deferral leaves an armed wake ([`sync_retry_at`](Worker::sync_retry_at))
+/// non-terminal deferral leaves an armed wake ([`sync_defer`](Worker::sync_defer))
 /// that survives until the request terminates or the drain budget kills it.**
 /// Coalescing a second request onto a pending one APPENDS its ack (no waiter is
 /// ever dropped, finding 9) and keeps `manual` sticky; the single terminal
@@ -621,6 +643,40 @@ impl PendingSync {
             manual: false,
             acks: Vec::new(),
             clobber_attempts: 0,
+        }
+    }
+}
+
+/// Why (and until when) the pending sync is deferred. The two variants carry
+/// the same shape but mean different things, and a MANUAL request is allowed to
+/// bypass exactly one of them:
+///
+/// - [`Backoff`](Self::Backoff) — the exponential failure ramp after a failed
+///   cycle. A manual request bypasses it: a user's explicit sync is fresh
+///   activity and must not wait out a network-failure ramp (its own attempt
+///   surfaces any real problem).
+/// - [`Cadence`](Self::Cadence) — the short pacing between gate-busy/clobber
+///   re-attempts. EVERYONE respects it, manual included: it exists to keep a
+///   wake storm (an editor save-storm triggering snapshot passes) from
+///   re-running a full network cycle on every wake and burning the clobber cap
+///   within milliseconds.
+///
+/// Encoding the distinction in the type (rather than one overloaded deadline
+/// field) is what makes the bypass rule checkable at the dispatch site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncDeferral {
+    /// The exponential failure backoff ([`Worker::sync_backoff`]).
+    Backoff(Instant),
+    /// The short gate-busy/clobber pacing
+    /// ([`EngineConfig::gate_busy_retry_interval`]).
+    Cadence(Instant),
+}
+
+impl SyncDeferral {
+    /// The wake deadline, independent of kind (what the run loop's timer uses).
+    fn deadline(self) -> Instant {
+        match self {
+            SyncDeferral::Backoff(at) | SyncDeferral::Cadence(at) => at,
         }
     }
 }
@@ -707,10 +763,12 @@ struct Worker {
     /// Consecutive sync-cycle failures, driving the exponential backoff
     /// ([`sync_backoff`](Self::sync_backoff)); reset to zero on any success.
     sync_failures: u32,
-    /// When set, the deadline at which a backed-off (or gate-deferred) sync
-    /// re-attempts itself, without any external trigger. The run loop wakes on
-    /// it exactly as it wakes on the snapshot retry timer.
-    sync_retry_at: Option<Instant>,
+    /// When set, why (and until when) the pending sync is deferred — a failure
+    /// [`Backoff`](SyncDeferral::Backoff) a manual request may bypass, or the
+    /// short [`Cadence`](SyncDeferral::Cadence) pacing everyone respects. The
+    /// run loop wakes on its deadline exactly as it wakes on the snapshot retry
+    /// timer.
+    sync_defer: Option<SyncDeferral>,
 }
 
 impl Worker {
@@ -764,24 +822,52 @@ impl Worker {
     /// has an outstanding waiter to its terminal outcome, so a retry the engine
     /// armed (a transient gate-busy or WouldClobber) is never abandoned mid-flight
     /// with its ack unresolved. Only a request WITH acks obligates the drain — a
-    /// fire-and-forget auto request is dropped on shutdown. A request with acks
-    /// only ever defers on the SHORT cadence (a manual/acked request bypasses the
-    /// long failure backoff) and WouldClobber is capped, so this is bounded; the
-    /// outer shutdown drain budget is the hard cap. Snapshots are not serviced —
-    /// the channel is closed, no new trigger can arrive.
+    /// fire-and-forget auto request is dropped on shutdown.
+    ///
+    /// Every drain path is bounded: WouldClobber has its own cap
+    /// ([`SYNC_MAX_ATTEMPTS`]), and a persistently busy op gate (a foreign/peer
+    /// holder that never frees) gets [`DRAIN_GATE_BUSY_MAX_ATTEMPTS`] paced tries
+    /// before the request terminates honestly as [`SyncOutcome::NotRun`] — a
+    /// stuck lock must fail the CLI fast, not hang it for the whole outer drain
+    /// budget. Gate-busy attempts cost no network I/O (the cycle probes the gate
+    /// before its fetch). Snapshots are not serviced — the channel is closed, no
+    /// new trigger can arrive.
     async fn drain_pending_sync(&mut self) {
+        let mut gate_busy_attempts = 0u32;
         while self
             .sync_pending
             .as_ref()
             .is_some_and(|p| !p.acks.is_empty())
         {
-            if let Some(at) = self.sync_retry_at {
-                tokio::time::sleep(at.saturating_duration_since(Instant::now())).await;
+            if let Some(defer) = self.sync_defer {
+                tokio::time::sleep(defer.deadline().saturating_duration_since(Instant::now()))
+                    .await;
             }
             // Force the pending request to run now, past dispatch's snapshot/backoff
             // guards (there is no snapshot activity during drain).
-            self.sync_retry_at = None;
+            self.sync_defer = None;
+            let clobbers_before = self.sync_pending.as_ref().map(|p| p.clobber_attempts);
             self.run_sync_cycle().await;
+            // A request still pending with an UNCHANGED clobber count deferred on
+            // the gate (busy): count it against the drain's own small budget.
+            let clobbers_after = self.sync_pending.as_ref().map(|p| p.clobber_attempts);
+            if self.sync_pending.is_some() && clobbers_after == clobbers_before {
+                gate_busy_attempts += 1;
+                if gate_busy_attempts >= DRAIN_GATE_BUSY_MAX_ATTEMPTS
+                    && let Some(pending) = self.sync_pending.take()
+                {
+                    self.sync_defer = None;
+                    self.terminate_sync(
+                        pending.acks,
+                        SyncOutcome::NotRun(
+                            "another operation holds the repository; the sync did not run"
+                                .to_string(),
+                        ),
+                    );
+                }
+            } else {
+                gate_busy_attempts = 0;
+            }
         }
     }
 
@@ -803,7 +889,7 @@ impl Worker {
 
         // The nearest deadline across both timers, if any.
         let now = Instant::now();
-        let mut deadline = self.sync_retry_at;
+        let mut deadline = self.sync_defer.map(SyncDeferral::deadline);
         if let Some(interval) = snapshot_interval {
             let snap_deadline = now + interval;
             deadline = Some(deadline.map_or(snap_deadline, |d| d.min(snap_deadline)));
@@ -818,7 +904,10 @@ impl Worker {
                     Err(_elapsed) => {
                         // A timer fired. Prefer the sync timer when it is the one
                         // that came due; otherwise it is the snapshot retry tick.
-                        if self.sync_retry_at.is_some_and(|at| Instant::now() >= at) {
+                        if self
+                            .sync_defer
+                            .is_some_and(|defer| Instant::now() >= defer.deadline())
+                        {
                             return Wake::SyncTimer;
                         }
                         return Wake::SnapshotRetry;
@@ -843,7 +932,7 @@ impl Worker {
     /// (as an automatic re-attempt, preserving a manual intent that survived).
     /// The subsequent [`dispatch_sync`](Self::dispatch_sync) runs it.
     fn fire_sync_timer(&mut self) {
-        self.sync_retry_at = None;
+        self.sync_defer = None;
         // Ensure a request is pending as an automatic re-attempt. A deferred
         // record (a gate-busy/clobber re-arm still holding its acks and attempt
         // count) survives untouched; a pure backoff wake (record already
@@ -854,12 +943,21 @@ impl Worker {
     /// The single "may a sync run now?" decision, reached on every loop turn.
     ///
     /// Runs the pending cycle iff there is one, it is not blocked by a *live*
-    /// (armed, un-exhausted) snapshot retry, and any backoff/gate deadline has
+    /// (armed, un-exhausted) snapshot retry, and any deferral deadline has
     /// passed. A pending **manual** request bypasses the live-snapshot-retry
     /// block — an explicit user sync is honored even while snapshots are
     /// retrying, and its own pre-sync snapshot surfaces any real problem. When it
-    /// defers on the backoff deadline it leaves `sync_retry_at` armed, so the run
-    /// loop wakes and fires the sync without any external activity.
+    /// defers it leaves `sync_defer` armed, so the run loop wakes and fires the
+    /// sync without any external activity.
+    ///
+    /// The two deferral kinds are treated differently by origin (the point of
+    /// [`SyncDeferral`]): a manual request bypasses a failure
+    /// [`Backoff`](SyncDeferral::Backoff) (finding 2 — a user's explicit sync is
+    /// fresh activity, same rationale as the manual-resets-exhausted-budget
+    /// rule), but EVERY origin respects the short
+    /// [`Cadence`](SyncDeferral::Cadence) — otherwise each worker wake during an
+    /// editor save-storm would re-run a full network cycle for a deferred manual
+    /// request and burn the clobber cap within milliseconds.
     async fn dispatch_sync(&mut self) {
         let Some(manual) = self.sync_pending.as_ref().map(|p| p.manual) else {
             return;
@@ -871,14 +969,13 @@ impl Worker {
             // the loop back here once the retry resolves.
             return;
         }
-        if !manual && self.sync_retry_at.is_some_and(|at| Instant::now() < at) {
-            // An AUTOMATIC sync respects the backoff/gate deadline: the armed
-            // `sync_retry_at` is the wake, so the loop fires it then. A MANUAL
-            // request bypasses it — a user's explicit sync is fresh activity and
-            // must not wait out a failure backoff (finding 2), the same rationale
-            // as the manual-resets-exhausted-budget rule; its own pre-sync
-            // snapshot surfaces any real problem.
-            return;
+        let now = Instant::now();
+        match self.sync_defer {
+            // The short pacing binds everyone, manual included.
+            Some(SyncDeferral::Cadence(at)) if now < at => return,
+            // The failure backoff binds automatic requests only.
+            Some(SyncDeferral::Backoff(at)) if !manual && now < at => return,
+            _ => {}
         }
         self.run_sync_cycle().await;
     }
@@ -934,12 +1031,18 @@ impl Worker {
                 if let Some(ack) = ack {
                     pending.acks.push(ack);
                 }
-                // A manual request is fresh user activity: clear a standing
-                // failure-backoff (or gate) deadline so it runs promptly instead
-                // of waiting the SyncError backoff out (finding 2). A still-busy
-                // gate re-arms the short deadline on the next attempt.
+                // A manual request is fresh user activity, so it gets a fresh
+                // start on the FAILURE axes: clear a standing failure-backoff
+                // deadline (finding 2) and reset a partially-burned clobber
+                // budget it coalesced onto (finding 5) — the same rationale as
+                // the manual-resets-exhausted-snapshot-budget rule. The short
+                // Cadence deferral is deliberately NOT cleared: it is pacing,
+                // not a failure, and manual respects it (see `dispatch_sync`).
                 if manual {
-                    self.sync_retry_at = None;
+                    if matches!(self.sync_defer, Some(SyncDeferral::Backoff(_))) {
+                        self.sync_defer = None;
+                    }
+                    pending.clobber_attempts = 0;
                 }
             }
             WatchInput::Trouble { kind, detail } => {
@@ -1471,14 +1574,23 @@ impl Worker {
         // waiter is told `NoRemote`, one event is emitted, and NOTHING latches
         // (no SyncError, no backoff, no state change) — so a remote added after
         // the daemon started is picked up on the next request with no restart,
-        // and a remote-less watch never storms doomed fetches. A probe error is
-        // treated the same (we cannot sync without a usable remote), never as a
-        // latched failure.
+        // and a remote-less watch never storms doomed fetches.
+        //
+        // A probe ERROR is a different animal: `git config` failing to read is a
+        // real repository/environment fault, not a missing remote. Masking it as
+        // `NoRemote` would render the watch "disabled" and hide the fault, so it
+        // terminates as a failure (SyncFailed + SyncError latch + backoff),
+        // exactly like any other broken step.
         match sync_has_remote(Arc::clone(&self.backend)).await {
             Ok(true) => {}
-            Ok(false) | Err(_) => {
-                self.emit_sync_skipped("the repository has no configured remote");
+            Ok(false) => {
+                self.emit_sync_skipped(SYNC_NO_REMOTE_REASON);
                 self.terminate_sync(pending.acks, SyncOutcome::NoRemote);
+                return;
+            }
+            Err(error) => {
+                self.enter_sync_error(error.clone());
+                self.terminate_sync(pending.acks, SyncOutcome::Failed(error));
                 return;
             }
         }
@@ -1537,7 +1649,9 @@ impl Worker {
                     // re-attempt on the short gate-busy cadence, no state change —
                     // contention is transient, not a sync fault, and NOT a clobber
                     // attempt (the cap counts only genuine WouldClobber refusals).
-                    self.sync_retry_at = Some(Instant::now() + self.cfg.gate_busy_retry_interval);
+                    self.sync_defer = Some(SyncDeferral::Cadence(
+                        Instant::now() + self.cfg.gate_busy_retry_interval,
+                    ));
                     self.sync_pending = Some(pending);
                     return;
                 }
@@ -1559,7 +1673,9 @@ impl Worker {
                         self.terminate_sync(pending.acks, SyncOutcome::Failed(msg));
                         return;
                     }
-                    self.sync_retry_at = Some(Instant::now() + self.cfg.gate_busy_retry_interval);
+                    self.sync_defer = Some(SyncDeferral::Cadence(
+                        Instant::now() + self.cfg.gate_busy_retry_interval,
+                    ));
                     self.sync_pending = Some(pending);
                     return;
                 }
@@ -1587,8 +1703,19 @@ impl Worker {
     /// returns the [`SyncStep`] the caller folds into state and retry decisions.
     /// Reconcile+advance run only when the fetch found remote commits to
     /// integrate; otherwise the locked window is the pre-sync snapshot alone
-    /// (see [`run_locked_presync_only`]).
+    /// (see [`run_locked_window`]'s push-only shape).
     async fn sync_once(&mut self, scratch: &std::path::Path) -> SyncStep {
+        // 0. Cheap gate probe — BEFORE any network I/O. A busy op gate (a CLI
+        //    restore, a peer engine) defers the whole cycle on the short cadence
+        //    without paying for a fetch, so gate-busy retries are network-free
+        //    (they would otherwise storm the remote at the pacing interval). The
+        //    probe is advisory: a holder arriving between it and the locked
+        //    window's real `begin` simply surfaces as another GateBusy defer
+        //    there — the TOCTOU costs one fetch, never correctness.
+        if !self.gate.available() {
+            return SyncStep::GateBusy;
+        }
+
         // 1. Fetch — OUTSIDE the op lock, timeout-bounded. Nothing to pull and
         //    nothing to push is the whole job done.
         let remote =
@@ -1627,11 +1754,9 @@ impl Worker {
         };
         let locked = {
             let _mute = self.mute.acquire();
-            if remote.behind == 0 {
-                run_locked_presync_only(Arc::clone(&self.backend), guard).await
-            } else {
-                run_locked_window(Arc::clone(&self.backend), scratch.to_path_buf(), guard).await
-            }
+            // `behind == 0`: nothing to integrate, run the push-only window.
+            let scratch = (remote.behind > 0).then(|| scratch.to_path_buf());
+            run_locked_window(Arc::clone(&self.backend), scratch, guard).await
         };
         let (tip, presync_committed, pulled_moved) = match locked {
             LockedResult::Reconciled {
@@ -1684,7 +1809,7 @@ impl Worker {
             watch: self.name.clone(),
         });
         self.sync_failures = 0;
-        self.sync_retry_at = None;
+        self.sync_defer = None;
         self.set_sync_latch(Some(SyncLatch {
             state: WatchState::Conflicted,
             reason: Some("a sync conflict needs resolution".into()),
@@ -1713,7 +1838,7 @@ impl Worker {
             return;
         }
         self.sync_failures = self.sync_failures.saturating_add(1);
-        self.sync_retry_at = Some(Instant::now() + self.sync_backoff());
+        self.sync_defer = Some(SyncDeferral::Backoff(Instant::now() + self.sync_backoff()));
         self.set_sync_latch(Some(SyncLatch {
             state: WatchState::SyncError,
             reason: Some(error),
@@ -1727,7 +1852,7 @@ impl Worker {
     /// cleared latch). A no-op when there was no latch.
     fn sync_succeeded(&mut self) {
         self.sync_failures = 0;
-        self.sync_retry_at = None;
+        self.sync_defer = None;
         self.set_sync_latch(None);
     }
 
@@ -1874,12 +1999,25 @@ async fn sync_push(backend: SharedBackend, timeout: Duration) -> Result<PushOutc
     }
 }
 
-/// Runs the locked window — pre-sync snapshot → reconcile → advance — off the
-/// async runtime with the op `guard` **coupled to the blocking git work**
-/// exactly like the snapshot path: the guard moves into the blocking scope and
-/// is [`complete`](OpGuard::complete)d there on every non-panic outcome, so an
-/// async abort can never release the op lock mid-write. On a panic the guard is
-/// dropped release-only, leaving the journal `begin` as recovery evidence.
+/// Runs the locked window — pre-sync snapshot → (optionally) reconcile →
+/// advance — off the async runtime with the op `guard` **coupled to the
+/// blocking git work** exactly like the snapshot path: the guard moves into the
+/// blocking scope and is [`complete`](OpGuard::complete)d there on every
+/// non-panic outcome, so an async abort can never release the op lock
+/// mid-write. On a panic the guard is dropped release-only, leaving the journal
+/// `begin` as recovery evidence. This is the ONE place that guard/panic/journal
+/// discipline lives for the sync window; both window shapes share it.
+///
+/// `scratch` selects the shape. `Some` runs the full window (there are remote
+/// commits to integrate): pre-sync snapshot, then the out-of-tree reconcile in
+/// the scratch worktree, then the advance. `None` is the **push-only** window,
+/// used when the fetch found nothing new remotely (`behind == 0`) — including
+/// the never-pushed branch, whose upstream tracking ref does not exist yet:
+/// there is nothing to rebase onto or advance to, and rebasing onto the
+/// nonexistent ref would error the whole cycle (breaking the first push of a
+/// fresh repository). The push-only window is just the pre-sync snapshot
+/// (`pulled` is `None`, `tip` is the branch tip after it) and skips the
+/// scratch-worktree setup/teardown entirely.
 ///
 /// Recovery is never surgery on the user's files: a crash mid-window leaves the
 /// tree fully committed at worst mid-checkout, and the next sync cycle self-heals
@@ -1892,7 +2030,7 @@ async fn sync_push(backend: SharedBackend, timeout: Duration) -> Result<PushOutc
 /// not to exist.
 async fn run_locked_window(
     backend: SharedBackend,
-    scratch: PathBuf,
+    scratch: Option<PathBuf>,
     guard: Box<dyn OpGuard>,
 ) -> LockedResult {
     let joined = tokio::task::spawn_blocking(move || {
@@ -1905,6 +2043,17 @@ async fn run_locked_window(
                 guard.complete();
                 return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
             }
+        };
+        // Push-only window: nothing to integrate, so the snapshot was the whole
+        // job — report the tip it left for the push.
+        let Some(scratch) = scratch else {
+            let tip = current_tip(&backend).unwrap_or_default();
+            guard.complete();
+            return LockedResult::Reconciled {
+                pulled: None,
+                tip,
+                presync_committed,
+            };
         };
         // Clear any scratch worktree a prior crashed cycle left behind (reconcile
         // requires the path not to exist). A no-op when absent.
@@ -1956,39 +2105,6 @@ async fn run_locked_window(
                 guard.complete();
                 LockedResult::Failed(format!("reconcile: {err}"))
             }
-        }
-    })
-    .await;
-    match joined {
-        Ok(result) => result,
-        Err(join) => LockedResult::Failed(format!("sync task panicked: {join}")),
-    }
-}
-
-/// The push-only locked window: just the pre-sync snapshot, with the op `guard`
-/// coupled to the blocking git work exactly as in [`run_locked_window`]. Used
-/// when the fetch found nothing new remotely (`behind == 0`) — including the
-/// **never-pushed branch**, whose upstream tracking ref does not exist yet:
-/// there is nothing to rebase onto or advance to, and rebasing onto the
-/// nonexistent ref would error the whole cycle (breaking the first push of a
-/// fresh repository). Skipping reconcile also spares the scratch-worktree
-/// setup/teardown on the common push-only path. `pulled` is always `None` and
-/// `tip` is the branch tip after the snapshot (what the push sends).
-async fn run_locked_presync_only(backend: SharedBackend, guard: Box<dyn OpGuard>) -> LockedResult {
-    let joined = tokio::task::spawn_blocking(move || {
-        let presync_committed = match backend.snapshot(&pre_sync_request()) {
-            Ok(outcome) => outcome.is_some(),
-            Err(err) => {
-                guard.complete();
-                return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
-            }
-        };
-        let tip = current_tip(&backend).unwrap_or_default();
-        guard.complete();
-        LockedResult::Reconciled {
-            pulled: None,
-            tip,
-            presync_committed,
         }
     })
     .await;
@@ -2266,7 +2382,7 @@ impl Engine {
                 scratch_dir,
                 sync_pending: None,
                 sync_failures: 0,
-                sync_retry_at: None,
+                sync_defer: None,
             };
             prepared.push((worker, rx));
         }
@@ -2903,6 +3019,10 @@ mod tests {
         /// What [`has_remote`](VcsBackend::has_remote) reports; drives the sync
         /// cycle's live remote gate. Defaults to `true` (a usable remote).
         has_remote: bool,
+        /// When set, [`has_remote`](VcsBackend::has_remote) errors — models a
+        /// repository whose config cannot be read (a real fault, not a missing
+        /// remote).
+        fail_has_remote: bool,
         snapshots: VecDeque<Scripted>,
         /// When set, every snapshot commits — models a backend that never
         /// reports a clean tree (used to prove the post-op re-check is bounded).
@@ -2936,6 +3056,7 @@ mod tests {
                     safe_results: VecDeque::new(),
                     dirty: false,
                     has_remote: true,
+                    fail_has_remote: false,
                     snapshots: VecDeque::new(),
                     always_commit: false,
                     always_fail: false,
@@ -3015,6 +3136,11 @@ mod tests {
             self.inner.lock().unwrap().has_remote = has_remote;
         }
 
+        /// Makes the remote probe error (an unreadable repository config).
+        fn fail_has_remote(&self) {
+            self.inner.lock().unwrap().fail_has_remote = true;
+        }
+
         /// Makes every snapshot commit, so the post-op re-check never converges
         /// on its own — used to prove the re-check is bounded under the mute.
         fn set_always_commit(&self) {
@@ -3061,7 +3187,15 @@ mod tests {
         }
 
         fn has_remote(&self) -> Result<bool, VcsError> {
-            Ok(self.inner.lock().unwrap().has_remote)
+            let inner = self.inner.lock().unwrap();
+            if inner.fail_has_remote {
+                return Err(VcsError::CommandFailed {
+                    op: "config".into(),
+                    status: Some(128),
+                    stderr: "fatal: unable to read config file".into(),
+                });
+            }
+            Ok(inner.has_remote)
         }
 
         fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
@@ -3257,6 +3391,13 @@ mod tests {
                 Ok(None)
             }
         }
+
+        fn available(&self) -> bool {
+            // Honest probe: busy iff `begin` would report busy. A scripted
+            // *failing* gate reports available (optimistic, per the trait docs)
+            // so `begin` gets to surface its error.
+            self.fail.load(Ordering::SeqCst) || self.admit.load(Ordering::SeqCst)
+        }
     }
 
     struct FakeGuard;
@@ -3317,7 +3458,7 @@ mod tests {
             scratch_dir: None,
             sync_pending: None,
             sync_failures: 0,
-            sync_retry_at: None,
+            sync_defer: None,
         };
         tokio::spawn(worker.run(rx));
         (tx, events, counter)
@@ -3329,13 +3470,23 @@ mod tests {
         backend: Arc<FakeBackend>,
         cfg: EngineConfig,
     ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
+        spawn_sync_worker_with_gate(backend, cfg, default_gate())
+    }
+
+    /// [`spawn_sync_worker`] with an injected operation gate, for the sync
+    /// cycle's gate-busy paths (the pre-network probe, the bounded drain).
+    fn spawn_sync_worker_with_gate(
+        backend: Arc<FakeBackend>,
+        cfg: EngineConfig,
+        gate: SharedGate,
+    ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
         let bus = EventBus::default();
         let events = bus.subscribe();
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = Worker {
             name: "w".to_string(),
             backend: backend as SharedBackend,
-            gate: default_gate(),
+            gate,
             mute: MuteSource::Silent,
             _schedule: None,
             bus,
@@ -3355,7 +3506,7 @@ mod tests {
             scratch_dir: Some(PathBuf::from("/tmp/vard-test-scratch")),
             sync_pending: None,
             sync_failures: 0,
-            sync_retry_at: None,
+            sync_defer: None,
         };
         tokio::spawn(worker.run(rx));
         (tx, events)
@@ -4074,6 +4225,229 @@ mod tests {
         assert!(
             no_more_outcomes(&mut events),
             "the watch stays Conflicted; no SyncError transition"
+        );
+    }
+
+    // --- Round 3: deferral kinds, gate probe, drain bound, budgets ------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_manual_sync_respects_the_short_cadence_during_a_save_storm() {
+        // A manual request whose first cycle abandoned (WouldClobber) is paced by
+        // the short Cadence deferral. A storm of snapshot triggers (editor saves)
+        // wakes the worker repeatedly; each wake must NOT re-run the network
+        // cycle before the cadence deadline — otherwise the storm burns the
+        // clobber cap within milliseconds and latches a spurious SyncError.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 1), remote(1, 1)]);
+        backend.script_reconcile([
+            Ok(ReconcileOutcome::Rebased {
+                new_head: SnapshotId::new("cafef00d"),
+            }),
+            Ok(ReconcileOutcome::AlreadyUpToDate),
+        ]);
+        backend.script_advance([AdvanceOutcome::WouldClobber]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        // First cycle runs, clobbers, and arms the 500ms cadence.
+        advance_until_fetch_calls(&backend, 1, Duration::from_millis(50)).await;
+
+        // The save-storm: many triggers, NO clock movement. Every snapshot pass
+        // (clean tree) wakes the loop and reaches dispatch — which must hold the
+        // cadence even for the pending MANUAL request.
+        for _ in 0..5 {
+            tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+            settle().await;
+        }
+        assert_eq!(
+            backend.fetch_calls(),
+            1,
+            "no wake may re-run the cycle before the cadence deadline"
+        );
+
+        // The cadence elapses: exactly one paced retry converges the request.
+        let ev = advance_until_matching(&mut events, Duration::from_millis(300), |e| {
+            matches!(e, Event::SyncPushed { .. } | Event::SyncFailed { .. })
+        })
+        .await;
+        assert!(
+            matches!(ev, Event::SyncPushed { .. }),
+            "the paced retry converged without burning the clobber cap, got {ev:?}"
+        );
+        assert_eq!(backend.fetch_calls(), 2);
+        assert!(matches!(ack_rx.await, Ok(SyncOutcome::Moved { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_gate_defers_the_sync_before_any_network_fetch() {
+        // The cycle probes the op gate BEFORE its fetch: gate-busy deferrals are
+        // network-free, and no journal record is written by the probe (begins
+        // stays 0 too — the probe is not an admission).
+        let backend = FakeBackend::new();
+        let gate = FakeGate::busy();
+        let (tx, _events) = spawn_sync_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: None,
+        })
+        .unwrap();
+        // Several paced attempts against the busy gate: zero fetches, zero begins.
+        for _ in 0..4 {
+            settle().await;
+            tokio::time::advance(Duration::from_millis(600)).await;
+        }
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "a busy gate must defer the cycle before the network fetch"
+        );
+        assert_eq!(gate.begins(), 0, "the probe never opens an admission");
+
+        // The gate frees: the next paced attempt runs the whole cycle.
+        gate.admit();
+        advance_until_fetch_calls(&backend, 1, Duration::from_millis(300)).await;
+        assert_eq!(
+            backend.fetch_calls(),
+            1,
+            "the freed gate lets the cycle run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_bounds_gate_busy_attempts_and_reports_did_not_run() {
+        // Shutdown drain against a gate that NEVER frees (a foreign/peer holder):
+        // the drain services a small bounded number of paced attempts, then
+        // terminates the ack honestly as NotRun — it must not hang for the whole
+        // outer drain budget, and the attempts must cost no network fetches.
+        let backend = FakeBackend::new();
+        let gate = FakeGate::busy();
+        let (tx, _events) = spawn_sync_worker_with_gate(
+            Arc::clone(&backend),
+            test_cfg(),
+            Arc::clone(&gate) as SharedGate,
+        );
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        settle().await;
+        // Close the channel: the worker moves to the drain with the request
+        // still deferred on the busy gate.
+        drop(tx);
+
+        let outcome = timeout(Duration::from_secs(30), ack_rx)
+            .await
+            .expect("the bounded drain resolves the ack quickly")
+            .expect("the drain terminates the request rather than dropping it");
+        assert!(
+            matches!(outcome, SyncOutcome::NotRun(_)),
+            "a stuck gate terminates as an honest NotRun, got {outcome:?}"
+        );
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "gate-busy attempts are network-free"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_manual_request_coalescing_onto_a_burned_clobber_budget_gets_a_fresh_one() {
+        // Two of the three clobber attempts are burned; a MANUAL request then
+        // coalesces onto the pending record. Manual is fresh activity: the budget
+        // resets, so the request survives two MORE clobbers and converges on the
+        // fifth cycle — without the reset the third clobber would latch SyncError.
+        let backend = FakeBackend::new();
+        backend.script_fetch((0..5).map(|_| remote(1, 1)));
+        backend.script_reconcile((0..5).map(|_| {
+            Ok(ReconcileOutcome::Rebased {
+                new_head: SnapshotId::new("cafef00d"),
+            })
+        }));
+        backend.script_advance([
+            AdvanceOutcome::WouldClobber,
+            AdvanceOutcome::WouldClobber,
+            AdvanceOutcome::WouldClobber,
+            AdvanceOutcome::WouldClobber,
+            AdvanceOutcome::Advanced,
+        ]);
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack1_tx, ack1_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack1_tx),
+        })
+        .unwrap();
+        // Burn two of the three clobber attempts.
+        advance_until_fetch_calls(&backend, 2, Duration::from_millis(300)).await;
+
+        // A second manual request coalesces onto the pending record: fresh budget.
+        let (ack2_tx, ack2_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack2_tx),
+        })
+        .unwrap();
+
+        // Two more clobbers land (a spent budget would terminate on the first of
+        // them), then the fifth cycle converges.
+        let ev = advance_until_matching(&mut events, Duration::from_millis(300), |e| {
+            matches!(e, Event::SyncPushed { .. } | Event::SyncFailed { .. })
+        })
+        .await;
+        assert!(
+            matches!(ev, Event::SyncPushed { .. }),
+            "the coalesced manual request got a fresh clobber budget, got {ev:?}"
+        );
+        assert_eq!(backend.advance_calls(), 5, "four refusals plus the success");
+        assert!(matches!(ack1_rx.await, Ok(SyncOutcome::Moved { .. })));
+        assert!(matches!(ack2_rx.await, Ok(SyncOutcome::Moved { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_remote_probe_is_a_real_failure_not_no_remote() {
+        // `has_remote` erroring (an unreadable repository config) is a repository
+        // fault, not a missing remote: the cycle terminates as Failed with the
+        // SyncError latch — never masked as a benign NoRemote skip.
+        let backend = FakeBackend::new();
+        backend.fail_has_remote();
+        let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+
+        let ev = advance_until_matching(&mut events, Duration::from_millis(200), |e| {
+            matches!(e, Event::SyncFailed { .. } | Event::SyncSkipped { .. })
+        })
+        .await;
+        assert!(
+            matches!(ev, Event::SyncFailed { .. }),
+            "a probe error must surface as a failure, not a skip, got {ev:?}"
+        );
+        assert!(matches!(ack_rx.await, Ok(SyncOutcome::Failed(_))));
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "the cycle never reached the fetch"
         );
     }
 

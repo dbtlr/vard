@@ -77,6 +77,21 @@ pub trait OpGate: Send + Sync {
     ///   index lock).
     /// - `Err(_)` — the gate could not be evaluated (host I/O trouble).
     fn begin(&self, op: &str) -> Result<Option<Box<dyn OpGuard>>, OpGateError>;
+
+    /// A cheap, side-effect-free admission probe: whether a [`begin`](Self::begin)
+    /// issued right now would likely be admitted (`false` means a live holder
+    /// owns the watch). **Advisory only** — a holder can arrive between the probe
+    /// and the real `begin`, which then simply reports busy; callers must never
+    /// treat `true` as a held lock. The engine's sync cycle probes this *before*
+    /// its network fetch so a busy gate defers pre-network instead of paying for
+    /// a fetch it cannot use. Implementations should try-acquire and immediately
+    /// release their lock **without** recording anything (no journal write). The
+    /// default is optimistic (`true`), correct for gates with no contention
+    /// concept ([`NoOpGate`]); a probe that cannot be evaluated should also
+    /// return `true` and let `begin` surface the real error.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// The RAII half of [`OpGate`]: a live operation admitted by the gate.

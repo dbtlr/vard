@@ -1279,6 +1279,20 @@ impl vard_core::OpGate for JournalOpGate {
             None => Ok(None),
         }
     }
+
+    fn available(&self) -> bool {
+        // A side-effect-free admission probe: try-acquire the op lock and drop
+        // it immediately — no journal write, no recovery, nothing recorded. The
+        // engine's sync cycle uses this to defer BEFORE its network fetch when a
+        // live holder owns the watch. Advisory only (the trait's contract): a
+        // holder arriving after the probe is caught by the real `begin`. An I/O
+        // error probing stays optimistic so `begin` surfaces the real error.
+        match OpLock::try_acquire(&self.lock_path()) {
+            Ok(Some(_lock)) => true, // dropped here: released immediately
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
 }
 
 /// The guard [`JournalOpGate`] hands out: it owns the held [`OpLock`] and the
