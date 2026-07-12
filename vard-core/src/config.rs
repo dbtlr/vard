@@ -39,8 +39,10 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Default interval between background syncs to the remote.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
-/// Default for whether a watch syncs to a remote at all.
-pub const DEFAULT_SYNC: bool = true;
+/// Default for whether a watch syncs to a remote at all. Off: syncing is an
+/// explicit opt-in (`sync = true` on the watch, or `defaults.sync = true`), so a
+/// freshly-added watch never pushes to a remote until asked to.
+pub const DEFAULT_SYNC: bool = false;
 
 /// Default trigger mode: arm both change and interval triggers.
 pub const DEFAULT_TRIGGER: TriggerMode = TriggerMode::Both;
@@ -118,6 +120,7 @@ pub struct WatchSpec {
     branch: Option<String>,
     remote: String,
     poll_interval: Option<Duration>,
+    scratch_dir: Option<PathBuf>,
 }
 
 impl WatchSpec {
@@ -155,6 +158,12 @@ impl WatchSpec {
     }
 
     /// Whether the watch syncs to a remote.
+    ///
+    /// Sync is only actually performed when this is `true` **and** a
+    /// [`scratch_dir`](Self::scratch_dir) is set: vard-core resolves no paths
+    /// itself, so a syncing watch must be handed the out-of-tree reconcile
+    /// directory by its host. A `sync = true` watch with no scratch directory
+    /// never syncs (see [`scratch_dir`](Self::scratch_dir)).
     pub fn sync(&self) -> bool {
         self.sync
     }
@@ -189,6 +198,33 @@ impl WatchSpec {
     pub fn poll_interval(&self) -> Option<Duration> {
         self.poll_interval
     }
+
+    /// The host-injected directory the sync engine adds its out-of-tree
+    /// reconcile worktree under (see [`VcsBackend::reconcile`](crate::VcsBackend::reconcile)).
+    ///
+    /// vard-core resolves no XDG or filesystem paths itself, so a syncing host
+    /// must inject where the scratch worktree lives (the `vard` binary computes
+    /// `<XDG state>/reconcile/<key>/`; tests use a tempdir). **When unset, sync
+    /// is disabled for this watch even if [`sync`](Self::sync) is `true`** — the
+    /// engine has nowhere to reconcile, so it never runs the sync cycle. This is
+    /// the deliberate default rather than a build error: a `sync = true` watch
+    /// built before its host has computed a scratch path (or a `sync`-agnostic
+    /// embedder) must still construct, so erroring would be wrong. Disabling
+    /// instead keeps construction infallible and makes a scratch directory the
+    /// single switch that turns real syncing on.
+    pub fn scratch_dir(&self) -> Option<&Path> {
+        self.scratch_dir.as_deref()
+    }
+
+    /// Host-injects the out-of-tree reconcile [`scratch_dir`](Self::scratch_dir)
+    /// after the spec is built from config, turning real syncing on for this
+    /// watch. The host (the daemon, the `vard sync` CLI) derives the path from
+    /// its state directory; vard-core resolves none itself. Consuming, so it
+    /// chains off a built spec: `spec.with_scratch_dir(path)`.
+    pub fn with_scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dir = Some(dir.into());
+        self
+    }
 }
 
 /// A fluent builder for [`WatchSpec`]. Obtain one from [`WatchSpec::builder`].
@@ -209,6 +245,7 @@ pub struct WatchSpecBuilder {
     branch: Option<String>,
     remote: String,
     poll_interval: Option<Duration>,
+    scratch_dir: Option<PathBuf>,
 }
 
 impl WatchSpecBuilder {
@@ -225,6 +262,7 @@ impl WatchSpecBuilder {
             branch: None,
             remote: DEFAULT_REMOTE.to_string(),
             poll_interval: None,
+            scratch_dir: None,
         }
     }
 
@@ -286,6 +324,14 @@ impl WatchSpecBuilder {
         self
     }
 
+    /// Sets the out-of-tree reconcile scratch directory (see
+    /// [`WatchSpec::scratch_dir`]). Required for a watch to actually sync; unset
+    /// leaves sync disabled for the watch.
+    pub fn scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.scratch_dir = Some(dir.into());
+        self
+    }
+
     /// Validates the accumulated fields and produces a [`WatchSpec`].
     ///
     /// Enforces: non-empty name; a name limited to ASCII alphanumerics and
@@ -343,6 +389,7 @@ impl WatchSpecBuilder {
             branch: self.branch,
             remote: self.remote,
             poll_interval: self.poll_interval,
+            scratch_dir: self.scratch_dir,
         })
     }
 }
@@ -549,6 +596,7 @@ mod tests {
         assert_eq!(spec.branch(), None);
         assert_eq!(spec.remote(), DEFAULT_REMOTE);
         assert_eq!(spec.poll_interval(), None);
+        assert_eq!(spec.scratch_dir(), None);
     }
 
     #[test]
@@ -563,23 +611,27 @@ mod tests {
             .trigger(TriggerMode::Events)
             .quiesce(Duration::from_secs(3))
             .interval(Duration::from_secs(300))
-            .sync(false)
+            // sync is off by default, so `true` is the non-default value that
+            // proves the setter overrides the default rather than matching it.
+            .sync(true)
             .sync_interval(Duration::from_secs(3600))
             .exclude(["target", "*.log"])
             .branch("backup")
             .remote("origin2")
             .poll_interval(Duration::from_secs(30))
+            .scratch_dir("/tmp/reconcile/proj")
             .build()
             .unwrap();
         assert_eq!(spec.trigger(), TriggerMode::Events);
         assert_eq!(spec.quiesce(), Duration::from_secs(3));
         assert_eq!(spec.interval(), Duration::from_secs(300));
-        assert!(!spec.sync());
+        assert!(spec.sync());
         assert_eq!(spec.sync_interval(), Duration::from_secs(3600));
         assert_eq!(spec.exclude(), ["target".to_string(), "*.log".to_string()]);
         assert_eq!(spec.branch(), Some("backup"));
         assert_eq!(spec.remote(), "origin2");
         assert_eq!(spec.poll_interval(), Some(Duration::from_secs(30)));
+        assert_eq!(spec.scratch_dir(), Some(Path::new("/tmp/reconcile/proj")));
     }
 
     #[test]

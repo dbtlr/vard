@@ -94,6 +94,17 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "snapshot notes with a message on the subject".to_string(),
             ),
         ]
+    } else if cmd_path == format!("{BIN_NAME} sync") {
+        vec![
+            (
+                format!("{BIN_NAME} sync"),
+                "sync every sync-enabled watch with its remote now".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} sync notes"),
+                "fetch, reconcile, and push just the notes watch".to_string(),
+            ),
+        ]
     } else if cmd_path == format!("{BIN_NAME} log") {
         vec![
             (

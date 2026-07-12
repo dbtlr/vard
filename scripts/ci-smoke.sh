@@ -68,6 +68,10 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" restore --help | grep -q 'protective snapshot' || fail "vard restore --help missing its prose"
 "$VARD" diff --help | grep -q 'text-only' || fail "vard diff --help missing the text-only note"
 
+# The sync command (VRD-19) renders help through the same v2 path.
+"$VARD" sync -h | grep -q 'For full help, run' || fail "vard sync -h missing the v2 short-help footer"
+"$VARD" sync --help | grep -q 'out of tree' || fail "vard sync --help missing its prose"
+
 # The status/config commands (VRD-17) render help through the same v2 path.
 "$VARD" status -h | grep -q 'For full help, run' || fail "vard status -h missing the v2 short-help footer"
 "$VARD" config -h | grep -q 'For full help, run' || fail "vard config -h missing the v2 short-help footer"
@@ -189,5 +193,16 @@ mv "$SMOKE_TMP/config-away.toml" "$XDG_CONFIG_HOME/vard/config.toml"
 "$VARD" watch remove smoke >/dev/null || fail "vard watch remove failed"
 test -d "$WDIR/.git" || fail "vard watch remove touched the repository"
 test "$("$VARD" --format json watch list)" = "[]" || fail "vard watch list not empty after remove"
+
+# vard sync (VRD-19): with no watches configured there is nothing to sync, so it
+# exits 1 (attention) with a clear message — a deterministic check that needs no
+# remote (the live cycle is covered by the CLI test suite and daemon test).
+if sync_out="$("$VARD" sync 2>&1)"; then
+  fail "vard sync with no sync-enabled watches must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard sync with no sync-enabled watches must exit 1"
+fi
+printf '%s\n' "$sync_out" | grep -q 'no sync-enabled watches' \
+  || fail "vard sync did not report the absence of sync-enabled watches"
 
 echo "smoke: all assertions passed ($VARD)"

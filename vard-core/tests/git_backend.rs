@@ -6,16 +6,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 use vard_core::vcs::git::GitBackend;
 use vard_core::{
-    LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState, SnapshotId,
+    AdvanceOutcome, LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState, SnapshotId,
     SnapshotOutcome, SnapshotRequest, Trigger, UnsafeReason, VcsBackend, VcsError, VcsRef,
 };
 
 // --- helpers ---------------------------------------------------------------
+
+/// A network timeout generous enough that a local file-remote fetch/push never
+/// approaches it; the dedicated timeout tests drive expiry deliberately.
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs a raw git command in `dir`, returning its output.
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -104,6 +110,76 @@ fn commit_exists(dir: &Path, id: &str) -> bool {
 
 fn git_dir(dir: &Path) -> PathBuf {
     dir.join(".git")
+}
+
+/// A not-yet-existing scratch-worktree path under a fresh tempdir. The `TempDir`
+/// is returned so the caller keeps it alive across the reconcile call; the
+/// backend creates and removes the linked worktree at the returned path.
+fn scratch() -> (TempDir, PathBuf) {
+    let holder = TempDir::new().unwrap();
+    let path = holder.path().join("scratch");
+    (holder, path)
+}
+
+/// `git status --porcelain` for `dir`, trimmed. Empty means a clean tree.
+fn porcelain(dir: &Path) -> String {
+    let out = git(dir, &["status", "--porcelain"]);
+    assert!(out.status.success(), "git status failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A TCP endpoint that accepts connections and then stays silent forever, so a
+/// git transport dialing it (as a `git://` remote) blocks reading the protocol
+/// banner and never returns on its own. Dropping the guard stops the accept
+/// loop. Used to drive the fetch/push timeout kill-path hermetically, with no
+/// real network.
+struct SilentEndpoint {
+    addr: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SilentEndpoint {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            // Hold every accepted connection open and never write a byte.
+            let mut held = Vec::new();
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((sock, _)) => held.push(sock),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        SilentEndpoint {
+            addr,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// A `git://` URL naming this endpoint (the path is irrelevant — git never
+    /// gets a reply).
+    fn url(&self) -> String {
+        format!("git://{}/repo", self.addr)
+    }
+}
+
+impl Drop for SilentEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 // --- detect / init / open --------------------------------------------------
@@ -844,7 +920,7 @@ fn remote_fixture() -> RemoteFixture {
     );
     write(a_tmp.path(), "file.txt", "base\n");
     snap(&a, Trigger::Manual);
-    assert_eq!(a.push().unwrap(), PushOutcome::Pushed);
+    assert_eq!(a.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
 
     let (b_tmp, b_path, b) = clone_of(origin.path());
     RemoteFixture {
@@ -862,9 +938,9 @@ fn push_reports_pushed_then_up_to_date() {
     let fx = remote_fixture();
     write(fx.a_tmp.path(), "file.txt", "more\n");
     snap(&fx.a, Trigger::Manual);
-    assert_eq!(fx.a.push().unwrap(), PushOutcome::Pushed);
+    assert_eq!(fx.a.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
     // Nothing new to send.
-    assert_eq!(fx.a.push().unwrap(), PushOutcome::UpToDate);
+    assert_eq!(fx.a.push(TEST_TIMEOUT).unwrap(), PushOutcome::UpToDate);
 }
 
 #[test]
@@ -873,17 +949,23 @@ fn push_reports_non_fast_forward_after_a_competing_push() {
     // B advances origin.
     write(&fx.b_path, "file.txt", "from-b\n");
     snap(&fx.b, Trigger::Manual);
-    assert_eq!(fx.b.push().unwrap(), PushOutcome::Pushed);
+    assert_eq!(fx.b.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
 
     // A commits on the stale base and pushes without fetching: rejected.
     write(fx.a_tmp.path(), "file.txt", "from-a\n");
     snap(&fx.a, Trigger::Manual);
-    assert_eq!(fx.a.push().unwrap(), PushOutcome::NonFastForward);
+    assert_eq!(
+        fx.a.push(TEST_TIMEOUT).unwrap(),
+        PushOutcome::NonFastForward
+    );
 
     // The same race after fetching reports the other porcelain spelling
     // ("non-fast-forward" instead of "fetch first") — both are the race.
-    fx.a.fetch().unwrap();
-    assert_eq!(fx.a.push().unwrap(), PushOutcome::NonFastForward);
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    assert_eq!(
+        fx.a.push(TEST_TIMEOUT).unwrap(),
+        PushOutcome::NonFastForward
+    );
 }
 
 #[test]
@@ -905,7 +987,7 @@ fn push_rejection_that_is_not_the_race_is_a_command_failure() {
     let (_tmp, dest, backend) = clone_of(remote.path());
     write(&dest, "f", "x\n");
     snap(&backend, Trigger::Manual);
-    match backend.push() {
+    match backend.push(TEST_TIMEOUT) {
         Err(VcsError::CommandFailed { op, stderr, .. }) => {
             assert_eq!(op, "push");
             assert!(
@@ -930,9 +1012,14 @@ fn fetch_before_first_push_is_a_normal_state() {
     write(tmp.path(), "f", "x\n");
     snap(&backend, Trigger::Manual);
 
-    let state = backend.fetch().unwrap();
+    let state = backend.fetch(TEST_TIMEOUT).unwrap();
     assert!(!state.remote_moved);
     assert_eq!((state.ahead, state.behind), (1, 0));
+    assert!(
+        !state.stale_tracking_ref,
+        "a never-pushed branch has no tracking ref to distrust: the push-time \
+         count (ahead_of_upstream) stays in effect"
+    );
 
     // Even with an unborn local branch it is a state, not an error.
     let (tmp2, backend2) = new_repo();
@@ -940,7 +1027,7 @@ fn fetch_before_first_push_is_a_normal_state() {
         tmp2.path(),
         &["remote", "add", "origin", origin.path().to_str().unwrap()],
     );
-    let state = backend2.fetch().unwrap();
+    let state = backend2.fetch(TEST_TIMEOUT).unwrap();
     assert_eq!(
         (state.remote_moved, state.ahead, state.behind),
         (false, 0, 0)
@@ -948,19 +1035,103 @@ fn fetch_before_first_push_is_a_normal_state() {
 }
 
 #[test]
+fn ahead_of_upstream_counts_commits_since_the_last_fetch() {
+    // The local-only ahead read against the tracking ref the last fetch left.
+    // Commits landing AFTER a fetch are included — the number a push right now
+    // would send, which is what keeps the push-time commit count accurate.
+    let fx = remote_fixture(); // base commit pushed; clone `b` tracks it
+    assert_eq!(
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(0),
+        "freshly cloned: nothing to send"
+    );
+    write(&fx.b_path, "a", "1\n");
+    snap_id(&fx.b, Trigger::Manual);
+    write(&fx.b_path, "b", "2\n");
+    snap_id(&fx.b, Trigger::Manual);
+    assert_eq!(
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(2),
+        "two commits since the clone's implicit fetch"
+    );
+
+    // A manual `git push` updates the tracking ref too, so the push-time count
+    // stays accurate (zero) even for commits the user pushed by hand rather
+    // than through a fetch of ours.
+    assert_eq!(fx.b.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
+    assert_eq!(
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(0),
+        "a manual push moves the tracking ref, keeping the count accurate"
+    );
+
+    // A never-pushed branch (no tracking ref): ahead by its whole history —
+    // a trustworthy local read, so the push-time count applies there too.
+    let origin2 = bare_origin();
+    let (tmp2, backend2) = new_repo();
+    git_ok(
+        tmp2.path(),
+        &["remote", "add", "origin", origin2.path().to_str().unwrap()],
+    );
+    write(tmp2.path(), "f", "x\n");
+    snap_id(&backend2, Trigger::Manual);
+    assert_eq!(backend2.ahead_of_upstream().unwrap(), Some(1));
+}
+
+#[test]
+fn a_deleted_remote_branch_flags_the_stale_tracking_ref_with_the_full_history_count() {
+    // The remote branch is deleted after a normal synced state: the next fetch
+    // reports the missing remote ref via `stale_tracking_ref` (a local tracking
+    // ref survives from before the deletion), with ahead = the FULL history
+    // (what the next push recreates). ZERO mutation: the stale tracking ref is
+    // deliberately left alone (deleting it from this lock-free path would run
+    // user reference-transaction hooks and race concurrent fetches); the flag
+    // is what tells callers not to trust local reads against it for this cycle.
+    let fx = remote_fixture();
+    // `b` synced at the base commit, tracking ref present. Add one local commit.
+    write(&fx.b_path, "extra.txt", "x\n");
+    snap_id(&fx.b, Trigger::Manual);
+
+    // Delete the branch on the remote out from under `b` (directly on the bare
+    // repository — a push deletion of the current branch is denied by default).
+    git_ok(fx._origin.path(), &["update-ref", "-d", "refs/heads/main"]);
+
+    let state = fx.b.fetch(TEST_TIMEOUT).unwrap();
+    assert!(
+        state.stale_tracking_ref,
+        "the surviving pre-deletion tracking ref is flagged"
+    );
+    assert_eq!(
+        (state.ahead, state.behind),
+        (2, 0),
+        "ahead is the FULL history the next push recreates (base + extra)"
+    );
+    // The stale tracking ref is LEFT ALONE (no ref mutation outside a locked
+    // window) — the flag, not a prune, carries the truth.
+    let out = git(
+        &fx.b_path,
+        &["rev-parse", "--verify", "refs/remotes/origin/main"],
+    );
+    assert!(
+        out.status.success(),
+        "the stale tracking ref is deliberately not pruned"
+    );
+}
+
+#[test]
 fn fetch_reports_remote_movement_and_behind_count() {
     let fx = remote_fixture();
     // Before any remote movement.
-    let before = fx.a.fetch().unwrap();
+    let before = fx.a.fetch(TEST_TIMEOUT).unwrap();
     assert!(!before.remote_moved);
     assert_eq!((before.ahead, before.behind), (0, 0));
 
     // B advances origin by one commit.
     write(&fx.b_path, "file.txt", "from-b\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
 
-    let after = fx.a.fetch().unwrap();
+    let after = fx.a.fetch(TEST_TIMEOUT).unwrap();
     assert!(after.remote_moved);
     assert_eq!((after.ahead, after.behind), (0, 1));
 }
@@ -976,9 +1147,9 @@ fn fetch_works_without_a_configured_fetch_refspec() {
     );
     write(&fx.b_path, "file.txt", "from-b\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
 
-    let state = fx.a.fetch().unwrap();
+    let state = fx.a.fetch(TEST_TIMEOUT).unwrap();
     assert!(state.remote_moved);
     assert_eq!(state.behind, 1);
 }
@@ -986,8 +1157,18 @@ fn fetch_works_without_a_configured_fetch_refspec() {
 #[test]
 fn reconcile_already_up_to_date_when_nothing_moved() {
     let fx = remote_fixture();
-    fx.a.fetch().unwrap();
-    assert_eq!(fx.a.reconcile().unwrap(), ReconcileOutcome::AlreadyUpToDate);
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let head_before = rev(fx.a_tmp.path(), "HEAD");
+
+    let (_h, scr) = scratch();
+    assert_eq!(
+        fx.a.reconcile(&scr).unwrap(),
+        ReconcileOutcome::AlreadyUpToDate
+    );
+
+    // Nothing moved and the scratch worktree was cleaned up.
+    assert_eq!(rev(fx.a_tmp.path(), "HEAD"), head_before);
+    assert!(!scr.exists(), "scratch worktree must be removed");
 }
 
 #[test]
@@ -996,59 +1177,144 @@ fn reconcile_rebases_cleanly_onto_a_moved_remote() {
     // B advances origin (a file A does not touch → clean).
     write(&fx.b_path, "other.txt", "b-only\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
     let remote_head = rev(&fx.b_path, "HEAD");
+    let branch_before = rev(fx.a_tmp.path(), "refs/heads/main");
 
-    fx.a.fetch().unwrap();
-    match fx.a.reconcile().unwrap() {
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    match fx.a.reconcile(&scr).unwrap() {
         ReconcileOutcome::Rebased { new_head } => {
-            // With no local commits, the branch fast-forwards to the remote tip.
+            // With no local commits the rebase fast-forwards to the remote tip,
+            // but the branch ref itself is NOT moved — that is advance's job.
             assert_eq!(new_head.as_str(), remote_head);
         }
         other => panic!("expected Rebased, got {other:?}"),
     }
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), branch_before);
+    assert!(!scr.exists());
     assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
 }
 
 #[test]
-fn reconcile_conflict_aborts_to_a_pristine_tree() {
+fn reconcile_out_of_tree_then_advance_lands_both_sides() {
+    // The clean-path acceptance: local and remote diverge, reconcile rebases
+    // out of tree leaving the user's tree/HEAD provably unmoved, and advance
+    // then makes the result live with both sides' changes present.
+    let fx = remote_fixture();
+    // B advances origin with a non-conflicting file.
+    write(&fx.b_path, "b.txt", "from-b\n");
+    snap(&fx.b, Trigger::Manual);
+    fx.b.push(TEST_TIMEOUT).unwrap();
+
+    // A commits its own change (so reconcile must replay it, not just ff).
+    write(fx.a_tmp.path(), "a.txt", "from-a\n");
+    let a_local = snap_id(&fx.a, Trigger::Manual);
+
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let head_before = rev(fx.a_tmp.path(), "HEAD");
+    let tree_before = rev(fx.a_tmp.path(), "HEAD^{tree}");
+
+    let (_h, scr) = scratch();
+    let new_head = match fx.a.reconcile(&scr).unwrap() {
+        ReconcileOutcome::Rebased { new_head } => new_head,
+        other => panic!("expected Rebased, got {other:?}"),
+    };
+
+    // Reconcile moved nothing in the user's repo: branch, HEAD, and tree are
+    // exactly as before; the rebased tip exists only in the object store.
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), a_local.as_str());
+    assert_eq!(rev(fx.a_tmp.path(), "HEAD"), head_before);
+    assert_eq!(rev(fx.a_tmp.path(), "HEAD^{tree}"), tree_before);
+    assert_ne!(new_head.as_str(), a_local.as_str());
+    assert!(commit_exists(fx.a_tmp.path(), new_head.as_str()));
+    assert!(
+        porcelain(fx.a_tmp.path()).is_empty(),
+        "main tree must be clean"
+    );
+    assert!(!scr.exists(), "scratch worktree removed");
+
+    // Advance lands it: branch and tree move to the rebased tip, still clean.
+    // The expected tip is the branch tip the reconcile consumed (a_local).
+    assert_eq!(
+        fx.a.advance(&new_head, &a_local).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), new_head.as_str());
+    assert!(
+        porcelain(fx.a_tmp.path()).is_empty(),
+        "tree clean after advance"
+    );
+    // Both sides' changes are present in the working tree.
+    assert_eq!(
+        fs::read_to_string(fx.a_tmp.path().join("a.txt")).unwrap(),
+        "from-a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.a_tmp.path().join("b.txt")).unwrap(),
+        "from-b\n"
+    );
+    assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
+}
+
+#[test]
+fn reconcile_conflict_leaves_main_untouched_and_removes_scratch() {
+    // The conflict-path acceptance: the rebase only ever runs in the scratch
+    // worktree, so a conflict leaves the user's repo provably untouched, with
+    // no rebase state anywhere under the main worktree's git dir.
     let fx = remote_fixture();
     // B changes the shared file and advances origin.
     write(&fx.b_path, "file.txt", "b-change\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
 
-    // A changes the same line locally (not pushed) → rebase will conflict.
+    // A changes the same line locally (committed, not pushed) → rebase conflicts.
     write(fx.a_tmp.path(), "file.txt", "a-change\n");
     let a_local = snap_id(&fx.a, Trigger::Manual);
+    let head_before = rev(fx.a_tmp.path(), "HEAD");
 
-    fx.a.fetch().unwrap();
-    assert_eq!(fx.a.reconcile().unwrap(), ReconcileOutcome::Conflict);
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    assert_eq!(fx.a.reconcile(&scr).unwrap(), ReconcileOutcome::Conflict);
 
-    // Branch is exactly where it was before the rebase.
+    // Branch and HEAD are exactly where they were; the file is byte-identical.
     assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), a_local.as_str());
-    // No conflict markers survived the abort.
+    assert_eq!(rev(fx.a_tmp.path(), "HEAD"), head_before);
     let contents = fs::read_to_string(fx.a_tmp.path().join("file.txt")).unwrap();
     assert_eq!(contents, "a-change\n");
     assert!(!contents.contains("<<<<<<<"));
-    // No rebase left in progress, and the repo is safe again.
+    // No rebase state under the MAIN worktree's git dir, and the scratch
+    // worktree (and its metadata) is gone.
     assert!(!git_dir(fx.a_tmp.path()).join("rebase-merge").exists());
     assert!(!git_dir(fx.a_tmp.path()).join("rebase-apply").exists());
+    assert!(
+        !scr.exists(),
+        "scratch worktree must be removed on conflict"
+    );
+    assert!(
+        !git_dir(fx.a_tmp.path()).join("worktrees/scratch").exists(),
+        "scratch worktree metadata must be gone"
+    );
+    assert!(
+        porcelain(fx.a_tmp.path()).is_empty(),
+        "main tree stays clean"
+    );
     assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
 }
 
 #[test]
 fn reconcile_with_a_broken_signer_still_rebases() {
-    // Red-proven: pre-fix, commit.gpgsign=true with a failing signer aborted
-    // the replay mid-rebase, leaving rebase-merge/ behind, and reconcile
-    // misreported it as Conflict. The backend pins signing off.
+    // A broken signer must not derail the out-of-tree replay: the scratch
+    // rebase pins commit.gpgsign=false, so commit machinery during the replay
+    // never invokes the failing signer.
     let fx = remote_fixture();
     write(&fx.b_path, "other.txt", "b-only\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
 
     // A has a local commit (so the rebase must replay → commit machinery) and
-    // a broken signing config, as a user's repo might.
+    // a broken signing config, as a user's repo might. Config is shared with
+    // the linked scratch worktree, so the pin is what saves the replay.
     write(fx.a_tmp.path(), "mine.txt", "a-only\n");
     snap(&fx.a, Trigger::Manual);
     git_ok(fx.a_tmp.path(), &["config", "commit.gpgsign", "true"]);
@@ -1057,46 +1323,94 @@ fn reconcile_with_a_broken_signer_still_rebases() {
         &["config", "gpg.program", "/usr/bin/false"],
     );
 
-    fx.a.fetch().unwrap();
-    match fx.a.reconcile() {
-        Ok(ReconcileOutcome::Rebased { .. }) => {}
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    match fx.a.reconcile(&scr).unwrap() {
+        ReconcileOutcome::Rebased { .. } => {}
         other => panic!("expected Rebased, got {other:?}"),
     }
+    assert!(!scr.exists());
     assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
 }
 
 #[test]
-fn reconcile_never_lets_autostash_leave_markers() {
-    // Red-proven: with rebase.autostash=true and a dirty conflicting tree,
-    // the rebase exits 0 but the stash pop leaves conflict markers — pre-fix
-    // reconcile reported Rebased over a corrupted tree. The backend pins
-    // autostash off, so a dirty tree is a refused rebase instead.
+fn reconcile_and_advance_ignore_a_failing_post_checkout_hook() {
+    // A user's post-checkout hook must never run under vard's automated sync:
+    // `worktree add` (reconcile) and `checkout -B` (advance) both pin
+    // core.hooksPath=/dev/null, so a hook that would fail (or run arbitrary code
+    // from a background daemon) cannot break the cycle.
+    let fx = remote_fixture();
+    // A diverging remote so reconcile actually rebases, and a local commit.
+    write(&fx.b_path, "other.txt", "b-only\n");
+    snap(&fx.b, Trigger::Manual);
+    fx.b.push(TEST_TIMEOUT).unwrap();
+    write(fx.a_tmp.path(), "mine.txt", "a-only\n");
+    let a_local = snap_id(&fx.a, Trigger::Manual);
+
+    // Install a post-checkout hook that always fails. Hooks live under the shared
+    // git dir, so this covers the linked scratch worktree too.
+    let hooks = git_dir(fx.a_tmp.path()).join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    fs::write(&hook, "#!/bin/sh\necho 'hook ran' >&2\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    let new_head = match fx.a.reconcile(&scr).unwrap() {
+        ReconcileOutcome::Rebased { new_head } => new_head,
+        other => panic!("expected Rebased despite the hook, got {other:?}"),
+    };
+    assert!(!scr.exists());
+    // Advance lands cleanly despite the failing hook.
+    assert_eq!(
+        fx.a.advance(&new_head, &a_local).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), new_head.as_str());
+    assert!(porcelain(fx.a_tmp.path()).is_empty());
+    assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
+}
+
+#[test]
+fn reconcile_leaves_a_dirty_main_tree_untouched() {
+    // The out-of-tree rebase runs in a clean scratch worktree, so a dirty main
+    // tree is neither stashed, popped, nor clobbered — even with autostash on,
+    // which an in-tree rebase could have used to pop conflict markers into it.
     let fx = remote_fixture();
     write(&fx.b_path, "file.txt", "remote-change\n");
     snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
+    fx.b.push(TEST_TIMEOUT).unwrap();
 
     git_ok(fx.a_tmp.path(), &["config", "rebase.autostash", "true"]);
     write(fx.a_tmp.path(), "file.txt", "dirty-local\n"); // uncommitted
+    let branch_before = rev(fx.a_tmp.path(), "refs/heads/main");
 
-    fx.a.fetch().unwrap();
-    let result = fx.a.reconcile();
-    let contents = fs::read_to_string(fx.a_tmp.path().join("file.txt")).unwrap();
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+    let (_h, scr) = scratch();
+    let outcome = fx.a.reconcile(&scr).unwrap();
+
+    // The branch reconciled out of tree (a fast-forward onto the remote tip)...
     assert!(
-        !contents.contains("<<<<<<<"),
-        "conflict markers in tree after reconcile ({result:?}): {contents}"
+        matches!(outcome, ReconcileOutcome::Rebased { .. }),
+        "expected Rebased, got {outcome:?}"
     );
+    // ...while the user's branch ref never moved and the dirty file is intact.
+    assert_eq!(rev(fx.a_tmp.path(), "refs/heads/main"), branch_before);
+    let contents = fs::read_to_string(fx.a_tmp.path().join("file.txt")).unwrap();
     assert_eq!(contents, "dirty-local\n", "dirty content must be untouched");
-    match result {
-        Err(VcsError::CommandFailed { op, .. }) => assert_eq!(op, "rebase"),
-        other => panic!("expected CommandFailed for a dirty tree, got {other:?}"),
-    }
+    assert!(!contents.contains("<<<<<<<"));
+    assert!(!scr.exists());
 }
 
 #[test]
 fn reconcile_non_conflict_failure_is_not_reported_as_conflict() {
-    // A missing upstream ref (never fetched) fails the rebase without leaving
-    // a rebase in progress: that is a CommandFailed, not a Conflict.
+    // A missing upstream ref (never fetched) fails the scratch rebase without
+    // leaving a rebase in progress: that is a CommandFailed, not a Conflict.
     let origin = bare_origin();
     let (tmp, backend) = new_repo();
     git_ok(
@@ -1106,35 +1420,416 @@ fn reconcile_non_conflict_failure_is_not_reported_as_conflict() {
     write(tmp.path(), "f", "x\n");
     snap(&backend, Trigger::Manual);
 
-    match backend.reconcile() {
+    let (_h, scr) = scratch();
+    match backend.reconcile(&scr) {
         Err(VcsError::CommandFailed { op, .. }) => assert_eq!(op, "rebase"),
         other => panic!("expected CommandFailed, got {other:?}"),
     }
+    // Even on this error path the scratch worktree is cleaned up.
+    assert!(!scr.exists(), "scratch worktree must be removed on error");
     assert_eq!(backend.is_safe_state().unwrap(), SafeState::Safe);
-}
-
-#[test]
-fn reconcile_reports_lock_contention() {
-    let fx = remote_fixture();
-    write(&fx.b_path, "other.txt", "b\n");
-    snap(&fx.b, Trigger::Manual);
-    fx.b.push().unwrap();
-    fx.a.fetch().unwrap();
-
-    fs::write(git_dir(fx.a_tmp.path()).join("index.lock"), "").unwrap();
-    match fx.a.reconcile() {
-        Err(VcsError::LockContended { op }) => assert_eq!(op, "rebase"),
-        other => panic!("expected LockContended, got {other:?}"),
-    }
-    assert!(git_dir(fx.a_tmp.path()).join("index.lock").exists());
 }
 
 #[test]
 fn reconcile_refuses_an_unsafe_repo() {
     let fx = remote_fixture();
     fs::write(git_dir(fx.a_tmp.path()).join("MERGE_HEAD"), "sentinel\n").unwrap();
-    match fx.a.reconcile() {
+    let (_h, scr) = scratch();
+    match fx.a.reconcile(&scr) {
         Err(VcsError::UnsafeState(UnsafeReason::MergeInProgress)) => {}
         other => panic!("expected UnsafeState(MergeInProgress), got {other:?}"),
     }
+    // Refused before any worktree was created.
+    assert!(!scr.exists());
+}
+
+// --- advance ---------------------------------------------------------------
+
+#[test]
+fn advance_is_idempotent_to_current_head() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    let head = snap_id(&backend, Trigger::Manual);
+
+    // Advancing to the current tip (expected == current) is a clean no-op.
+    assert_eq!(
+        backend.advance(&head, &head).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), head.as_str());
+    assert!(porcelain(tmp.path()).is_empty());
+
+    // Still a no-op on a second call.
+    assert_eq!(
+        backend.advance(&head, &head).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
+}
+
+#[test]
+fn advance_moves_the_branch_and_tree_forward() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n");
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // Roll the branch/tree back to the first commit (expected tip is `second`),
+    // then forward again (expected tip is now `first`). A clean tree is never a
+    // clobber.
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "one\n");
+    assert!(porcelain(tmp.path()).is_empty());
+
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
+    assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "two\n");
+}
+
+#[test]
+fn advance_rejects_a_missing_target() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    let head = snap_id(&backend, Trigger::Manual);
+
+    let bogus = SnapshotId::new("0".repeat(40));
+    match backend.advance(&bogus, &head) {
+        Err(VcsError::CommandFailed { op, .. }) => assert_eq!(op, "advance"),
+        other => panic!("expected CommandFailed for a missing target, got {other:?}"),
+    }
+    // Nothing moved: the target was verified before anything was checked out.
+    assert_eq!(rev(tmp.path(), "HEAD"), head.as_str());
+}
+
+#[test]
+fn advance_reports_lock_contention() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n");
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // A held index.lock makes the checkout that would move the tree back to
+    // `first` fail as lock contention (attributed to the checkout).
+    fs::write(git_dir(tmp.path()).join("index.lock"), "").unwrap();
+    match backend.advance(&first, &second) {
+        Err(VcsError::LockContended { op }) => assert_eq!(op, "checkout"),
+        other => panic!("expected LockContended, got {other:?}"),
+    }
+    assert!(git_dir(tmp.path()).join("index.lock").exists());
+}
+
+#[test]
+fn advance_refuses_an_unsafe_repo() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    let head = snap_id(&backend, Trigger::Manual);
+    fs::write(git_dir(tmp.path()).join("MERGE_HEAD"), "sentinel\n").unwrap();
+    match backend.advance(&head, &head) {
+        Err(VcsError::UnsafeState(UnsafeReason::MergeInProgress)) => {}
+        other => panic!("expected UnsafeState(MergeInProgress), got {other:?}"),
+    }
+}
+
+#[test]
+fn advance_refuses_a_conflicting_tracked_modification() {
+    // A tracked file locally modified where the target also changed it: advance
+    // must REFUSE (WouldClobber) rather than destroy the uncommitted edit.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n");
+    let second = snap_id(&backend, Trigger::Manual); // branch tip
+
+    // Uncommitted local change to the same file the target (`first`) differs on.
+    write(tmp.path(), "f", "dirty-local\n");
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    // Tree and branch are exactly as they were; the edit survives.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("f")).unwrap(),
+        "dirty-local\n"
+    );
+}
+
+#[test]
+fn advance_refuses_a_conflicting_untracked_file() {
+    // An untracked file the target would introduce: advance must REFUSE rather
+    // than overwrite the user's untracked file.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "keep", "x\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    // `second` adds `extra`, so rolling forward to it would create that path.
+    write(tmp.path(), "extra", "from-commit\n");
+    let second = snap_id(&backend, Trigger::Manual);
+    // Go back to `first` (which lacks `extra`)...
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    // ...then leave an UNTRACKED `extra` and try to advance forward to `second`,
+    // which would overwrite it.
+    write(tmp.path(), "extra", "my-untracked\n");
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("extra")).unwrap(),
+        "my-untracked\n"
+    );
+}
+
+#[test]
+fn advance_refuses_a_conflicting_gitignored_file() {
+    // Data-loss hole (finding 1): a remote commit adding a path that is a LOCAL
+    // gitignored file must not silently clobber the local copy. The pre-sync
+    // snapshot never captures an ignored file, so advance's `--no-overwrite-ignore`
+    // is the only guard — it must REFUSE (WouldClobber), leaving the local file
+    // intact, exactly like the untracked-file case.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), ".gitignore", ".env\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    // `second` adds a TRACKED `.env` (as a remote commit would). Force-add it so
+    // the ignore rule does not skip it.
+    write(tmp.path(), ".env", "from-commit\n");
+    git_ok(tmp.path(), &["add", "-f", ".env"]);
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // Go back to `first` (which has `.env` only as an ignored file)...
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    // ...leave a LOCAL gitignored `.env` with private content, and try to advance
+    // forward to `second`, which tracks `.env` — this would clobber the local file.
+    write(tmp.path(), ".env", "LOCAL_SECRET\n");
+    assert!(
+        porcelain(tmp.path()).is_empty(),
+        "the local .env is ignored, so the tree reads clean"
+    );
+    assert_eq!(
+        backend.advance(&second, &first).unwrap(),
+        AdvanceOutcome::WouldClobber,
+        "advancing over a local gitignored file must refuse, not overwrite it"
+    );
+    // Branch unmoved and the local secret intact.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(
+        fs::read_to_string(tmp.path().join(".env")).unwrap(),
+        "LOCAL_SECRET\n"
+    );
+}
+
+#[test]
+fn advance_carries_a_non_conflicting_dirty_file_over() {
+    // A dirty file the target does NOT touch is carried over unharmed: advance
+    // succeeds and the local edit survives.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    write(tmp.path(), "other", "base\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "f", "two\n"); // only `f` changes between first and second
+    let second = snap_id(&backend, Trigger::Manual);
+
+    // Uncommitted edit to `other`, which neither commit differs on.
+    write(tmp.path(), "other", "dirty-but-safe\n");
+    assert_eq!(
+        backend.advance(&first, &second).unwrap(),
+        AdvanceOutcome::Advanced
+    );
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), first.as_str());
+    assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "one\n");
+    // The non-conflicting edit was carried over.
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("other")).unwrap(),
+        "dirty-but-safe\n"
+    );
+}
+
+#[test]
+fn advance_refuses_when_the_branch_tip_moved() {
+    // The addendum guard: a commit the user landed on the branch after the
+    // reconcile read its tip must not be stranded. advance refuses when the
+    // current branch tip no longer equals the expected tip.
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "one\n");
+    let first = snap_id(&backend, Trigger::Manual);
+    write(tmp.path(), "g", "two\n");
+    let second = snap_id(&backend, Trigger::Manual); // the user's raced commit
+
+    // Reconcile "consumed" `first` as the expected tip, but the branch is now at
+    // `second`. Advancing to some target with the stale expectation refuses.
+    assert_eq!(
+        backend.advance(&first, &first).unwrap(),
+        AdvanceOutcome::WouldClobber
+    );
+    // The user's commit is intact on the branch.
+    assert_eq!(rev(tmp.path(), "refs/heads/main"), second.as_str());
+    assert!(commit_exists(tmp.path(), second.as_str()));
+}
+
+#[test]
+fn has_remote_reflects_the_configured_remote() {
+    let origin = bare_origin();
+    let (tmp, _backend) = new_repo();
+    // No remote configured yet.
+    let backend = GitBackend::open(tmp.path(), "main", "origin").unwrap();
+    assert!(!backend.has_remote().unwrap(), "no remote configured");
+
+    git_ok(
+        tmp.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    assert!(backend.has_remote().unwrap(), "remote now present");
+
+    // A backend configured for a *different* remote name still reports absent.
+    let other = GitBackend::open(tmp.path(), "main", "upstream").unwrap();
+    assert!(!other.has_remote().unwrap(), "different remote name absent");
+}
+
+// --- scratch-worktree pruning (crash recovery) -----------------------------
+
+#[test]
+fn prune_scratch_is_a_no_op_when_absent() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    snap(&backend, Trigger::Manual);
+
+    // No scratch worktree has ever existed: pruning is a clean no-op.
+    let (_h, scr) = scratch();
+    backend.prune_scratch(&scr).unwrap();
+    // Idempotent — safe to call again.
+    backend.prune_scratch(&scr).unwrap();
+}
+
+#[test]
+fn prune_scratch_recovers_a_crashed_mid_rebase_then_reconcile_succeeds() {
+    // Crash simulation: a scratch worktree is created and left mid-rebase (as a
+    // killed/abandoned process would), then the prune primitive reclaims it and
+    // a subsequent reconcile runs to a clean outcome.
+    let fx = remote_fixture();
+    // B changes the shared file so a replay of A's local change would conflict.
+    write(&fx.b_path, "file.txt", "b-change\n");
+    snap(&fx.b, Trigger::Manual);
+    fx.b.push(TEST_TIMEOUT).unwrap();
+    write(fx.a_tmp.path(), "file.txt", "a-change\n");
+    snap(&fx.a, Trigger::Manual);
+    fx.a.fetch(TEST_TIMEOUT).unwrap();
+
+    // Hand-build a scratch worktree and leave it mid-rebase — the state a crash
+    // during reconcile would abandon.
+    let (_h, scr) = scratch();
+    git_ok(
+        fx.a_tmp.path(),
+        &["worktree", "add", "--detach", scr.to_str().unwrap(), "main"],
+    );
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&scr)
+        .args(["-c", "rebase.autostash=false", "rebase", "origin/main"])
+        .output()
+        .expect("failed to spawn git rebase");
+    let meta = git_dir(fx.a_tmp.path()).join("worktrees/scratch");
+    assert!(
+        meta.join("rebase-merge").exists(),
+        "precondition: scratch left mid-rebase"
+    );
+
+    // Crash recovery: prune force-removes the worktree and reaps its metadata.
+    fx.a.prune_scratch(&scr).unwrap();
+    assert!(!scr.exists(), "scratch dir removed");
+    assert!(!meta.exists(), "scratch worktree metadata pruned");
+
+    // A subsequent reconcile now works end-to-end at the same path (this pair
+    // of changes conflicts, so the defined outcome is Conflict — the point is
+    // that the machinery runs and cleans up, proving recovery).
+    let outcome = fx.a.reconcile(&scr).unwrap();
+    assert_eq!(outcome, ReconcileOutcome::Conflict);
+    assert!(!scr.exists(), "scratch removed after the retry");
+    assert_eq!(fx.a.is_safe_state().unwrap(), SafeState::Safe);
+}
+
+// --- network timeouts ------------------------------------------------------
+
+#[test]
+fn fetch_times_out_against_a_silent_endpoint() {
+    // A git:// remote that accepts but never replies makes fetch block reading;
+    // the timeout must kill it and return VcsError::Timeout promptly.
+    let endpoint = SilentEndpoint::start();
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    snap(&backend, Trigger::Manual);
+    git_ok(tmp.path(), &["remote", "add", "origin", &endpoint.url()]);
+
+    let started = Instant::now();
+    match backend.fetch(Duration::from_millis(750)) {
+        Err(VcsError::Timeout { op, elapsed }) => {
+            assert_eq!(op, "fetch");
+            assert!(
+                elapsed >= Duration::from_millis(700),
+                "elapsed under the budget: {elapsed:?}"
+            );
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    // The kill is prompt — nowhere near a hang.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "kill was not prompt: {:?}",
+        started.elapsed()
+    );
+
+    // The child was reaped (no zombie): a fresh, well-formed operation still
+    // works against a real file remote right after.
+    let origin = bare_origin();
+    git_ok(
+        tmp.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            origin.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(backend.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
+}
+
+#[test]
+fn push_times_out_against_a_silent_endpoint() {
+    let endpoint = SilentEndpoint::start();
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "f", "x\n");
+    snap(&backend, Trigger::Manual);
+    git_ok(tmp.path(), &["remote", "add", "origin", &endpoint.url()]);
+
+    let started = Instant::now();
+    match backend.push(Duration::from_millis(750)) {
+        Err(VcsError::Timeout { op, elapsed }) => {
+            assert_eq!(op, "push");
+            assert!(
+                elapsed >= Duration::from_millis(700),
+                "elapsed under the budget: {elapsed:?}"
+            );
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "kill was not prompt: {:?}",
+        started.elapsed()
+    );
 }

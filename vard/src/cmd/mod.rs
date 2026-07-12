@@ -30,6 +30,7 @@ pub(crate) mod diff;
 pub(crate) mod log;
 pub(crate) mod restore;
 pub(crate) mod snapshot;
+pub(crate) mod sync;
 
 // Time rendering and the `--at`/`--since` grammar live in vard-core (VRD-18
 // renders the same RFC 3339); re-exported here so the commands reach it as

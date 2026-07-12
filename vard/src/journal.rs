@@ -310,8 +310,32 @@ impl Journal {
     /// panics and never returns an error: every outcome is folded into the
     /// returned [`RecoveryReport`] so startup is never blocked.
     pub(crate) fn recover(&self, repo_path: &Path) -> RecoveryReport {
+        self.recover_generic(repo_path, None)
+    }
+
+    /// [`recover`](Self::recover) with a [`SyncSettler`] that additionally
+    /// settles a dangling **sync** record — pruning its leftover scratch worktree
+    /// (and nothing else) — but ONLY once recovery has proven the record ours and
+    /// its owner dead by the very same gates that authorize removing a stale git
+    /// lock (dead PID, ours-vs-foreign op window, [`FOREIGN_LOCK_GRACE`]). A
+    /// crashed advance leaves a fully-committed tree at worst mid-checkout, so
+    /// recovery never re-applies anything to the user's files — the next sync
+    /// cycle self-heals. Used by daemon startup for sync-capable watches.
+    pub(crate) fn recover_with_settler(
+        &self,
+        repo_path: &Path,
+        settler: &dyn SyncSettler,
+    ) -> RecoveryReport {
+        self.recover_generic(repo_path, Some(settler))
+    }
+
+    fn recover_generic(
+        &self,
+        repo_path: &Path,
+        settler: Option<&dyn SyncSettler>,
+    ) -> RecoveryReport {
         match OpLock::try_acquire(&self.lock_path) {
-            Ok(Some(guard)) => self.recover_locked(repo_path, &guard),
+            Ok(Some(guard)) => self.recover_locked_inner(repo_path, &guard, settler),
             Ok(None) => RecoveryReport::HolderActive,
             Err(detail) => RecoveryReport::Failed { detail },
         }
@@ -329,7 +353,23 @@ impl Journal {
     /// supplant (see the [module docs](self)). A recorded PID equal to this
     /// process is treated as dead, not a live holder: holding the op lock proves
     /// our own prior operation unwound (the proof relies on the `_witness`).
-    fn recover_locked(&self, repo_path: &Path, _witness: &OpLock) -> RecoveryReport {
+    fn recover_locked(&self, repo_path: &Path, witness: &OpLock) -> RecoveryReport {
+        self.recover_locked_inner(repo_path, witness, None)
+    }
+
+    /// [`recover_locked`](Self::recover_locked) with an optional [`SyncSettler`].
+    /// When present and the dangling record is a **sync** op, its scratch worktree
+    /// is pruned (and nothing else) at the two provably-ours-and-dead settle
+    /// points — no git lock present, or a stale one just removed — before the
+    /// journal is compacted. Every other disposition (foreign lock, too-fresh
+    /// lock, live holder, corrupt) leaves the tree untouched, exactly as for a
+    /// snapshot record.
+    fn recover_locked_inner(
+        &self,
+        repo_path: &Path,
+        _witness: &OpLock,
+        settler: Option<&dyn SyncSettler>,
+    ) -> RecoveryReport {
         let dangling = match self.read_dangling() {
             Ok(Some(record)) => record,
             Ok(None) => return RecoveryReport::Clean,
@@ -366,8 +406,13 @@ impl Journal {
         let lock_path = repo_path.join(".git").join("index.lock");
         let mtime = match lock_mtime(&lock_path) {
             LockMtime::Absent => {
-                // Owner is dead and nothing is wedged; drop the dangling record so
-                // we don't reconsider it every start.
+                // Owner is dead and nothing is wedged. Settle a sync record's
+                // tree (prune the leftover scratch worktree) BEFORE compacting,
+                // so a settle failure keeps the evidence for a later start.
+                if let Err(detail) = self.settle_sync(&dangling, settler) {
+                    return RecoveryReport::Failed { detail };
+                }
+                // Drop the dangling record so we don't reconsider it every start.
                 let _ = self.compact();
                 return RecoveryReport::NoLockPresent { op: dangling.op };
             }
@@ -413,6 +458,12 @@ impl Journal {
         }
         match fs::remove_file(&lock_path) {
             Ok(()) => {
+                // Lock proven ours and removed: settle a sync record's tree
+                // (prune the leftover scratch worktree) before compacting (keep
+                // evidence on a settle failure).
+                if let Err(detail) = self.settle_sync(&dangling, settler) {
+                    return RecoveryReport::Failed { detail };
+                }
                 let _ = self.compact();
                 RecoveryReport::LockRemoved {
                     op: dangling.op,
@@ -423,6 +474,25 @@ impl Journal {
             Err(source) => RecoveryReport::Failed {
                 detail: format!("removing {}: {source}", lock_path.display()),
             },
+        }
+    }
+
+    /// Settles a dangling **sync** record's working tree once recovery has proven
+    /// it ours and its owner dead: prunes the leftover scratch worktree, via the
+    /// injected [`SyncSettler`]. It is deliberately the *only* tree surgery
+    /// recovery does — a crashed advance leaves a fully-committed tree at worst
+    /// mid-checkout, and the next sync cycle self-heals. A no-op for a non-sync
+    /// record, or when no settler was supplied (the engine-admit and orphan-sweep
+    /// paths). Returns the settler's error so the caller can preserve the evidence
+    /// rather than compact it away.
+    fn settle_sync(
+        &self,
+        dangling: &DanglingOp,
+        settler: Option<&dyn SyncSettler>,
+    ) -> Result<(), String> {
+        match settler {
+            Some(settler) if dangling.op == "sync" => settler.settle(),
+            _ => Ok(()),
         }
     }
 
@@ -443,16 +513,7 @@ impl Journal {
         context: &str,
     ) -> RecoveryReport {
         let report = self.recover(repo_path);
-        match &report {
-            RecoveryReport::Clean => {}
-            RecoveryReport::LockRemoved { .. } => {
-                warn!(watch, context, report = %report, "recovered a stale git lock");
-            }
-            RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
-                warn!(watch, context, report = %report, "journal recovery: foreign lock left in place");
-            }
-            _ => info!(watch, context, report = %report, "journal recovery"),
-        }
+        log_recovery(&report, watch, context);
         report
     }
 
@@ -480,6 +541,16 @@ impl Journal {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
+                continue;
+            }
+            // Benign legacy: an intermediate VRD-19 build wrote `advance <sha>`
+            // progress lines into the sync journal. They are not `begin` records
+            // and were never part of the durable format; skip them rather than
+            // treating them as Corrupt, which would wedge recovery for a watch
+            // whose journal an upgrade inherited (stale lock never removed, sync
+            // scratch never settled). This is the ONLY tolerated non-`begin`
+            // line; everything else stays strictly Corrupt.
+            if line.split_whitespace().next() == Some("advance") {
                 continue;
             }
             let record =
@@ -510,6 +581,46 @@ impl Journal {
             source,
         }
     }
+}
+
+/// Logs a [`RecoveryReport`] at the level every drain/recover site agrees on: a
+/// removed lock and any foreign-lock signal
+/// ([`LockNotOurs`](RecoveryReport::LockNotOurs),
+/// [`HolderAlive`](RecoveryReport::HolderAlive)) at `warn` — both are
+/// operator-significant even when the lock is not ours to touch — and every
+/// other non-`Clean` outcome (including [`HolderActive`](RecoveryReport::HolderActive),
+/// a transient live op-lock holder) at `info`; `Clean` is silent. Shared by
+/// [`recover_and_log`](Journal::recover_and_log) and the settler-driven startup
+/// recovery so their log levels never drift.
+pub(crate) fn log_recovery(report: &RecoveryReport, watch: &str, context: &str) {
+    match report {
+        RecoveryReport::Clean => {}
+        RecoveryReport::LockRemoved { .. } => {
+            warn!(watch, context, report = %report, "recovered a stale git lock");
+        }
+        RecoveryReport::LockNotOurs { .. } | RecoveryReport::HolderAlive { .. } => {
+            warn!(watch, context, report = %report, "journal recovery: foreign lock left in place");
+        }
+        _ => info!(watch, context, report = %report, "journal recovery"),
+    }
+}
+
+/// Settles a crashed **sync** operation's working tree during recovery, once the
+/// journal has proven the record ours and its owner dead. Injected into
+/// [`Journal::recover_with_settler`] so the safety-critical gate logic stays in
+/// the journal while the git work (which needs a backend and the scratch path)
+/// lives at the daemon/test call site.
+///
+/// The contract is idempotent and constitution-safe: prune the vard-owned
+/// scratch worktree (always safe — never the user's files) and nothing more. A
+/// crashed advance is *not* re-applied — the tree is fully committed at worst
+/// mid-checkout, so the next sync cycle self-heals rather than recovery doing
+/// surgery on the user's files. Recovery calls this at most once per dangling
+/// record.
+pub(crate) trait SyncSettler {
+    /// Prune the leftover scratch worktree. Returns a human-readable error the
+    /// caller folds into a [`RecoveryReport::Failed`], preserving the evidence.
+    fn settle(&self) -> Result<(), String>;
 }
 
 /// A parsed dangling `begin` record.
@@ -1168,6 +1279,20 @@ impl vard_core::OpGate for JournalOpGate {
             None => Ok(None),
         }
     }
+
+    fn available(&self) -> bool {
+        // A side-effect-free admission probe: try-acquire the op lock and drop
+        // it immediately — no journal write, no recovery, nothing recorded. The
+        // engine's sync cycle uses this to defer BEFORE its network fetch when a
+        // live holder owns the watch. Advisory only (the trait's contract): a
+        // holder arriving after the probe is caught by the real `begin`. An I/O
+        // error probing stays optimistic so `begin` surfaces the real error.
+        match OpLock::try_acquire(&self.lock_path()) {
+            Ok(Some(_lock)) => true, // dropped here: released immediately
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
 }
 
 /// The guard [`JournalOpGate`] hands out: it owns the held [`OpLock`] and the
@@ -1738,6 +1863,28 @@ pub(crate) mod test_support {
         (repo.to_path_buf(), lock)
     }
 
+    /// Like [`plant_crashed`] but for a crashed **sync**: the dangling record is a
+    /// `begin sync …` line (no advance target — recovery re-applies nothing; it
+    /// only prunes the scratch worktree). Returns `(repo, lock)`.
+    pub(crate) fn plant_crashed_sync(journal_dir: &Path, repo: &Path) -> (PathBuf, PathBuf) {
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let journal = Journal::for_repo_in_dir(journal_dir, repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\n",
+                dead_pid(),
+                hex_encode(identity_path(repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+        (repo.to_path_buf(), lock)
+    }
+
     /// Like [`plant_crashed`] but leaves the git lock at its FRESH (current)
     /// mtime, so recovery sees an in-window lock younger than
     /// [`FOREIGN_LOCK_GRACE`] and retains it as
@@ -1773,9 +1920,29 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        age_far_past, dead_pid, live_pid, plant_crashed, plant_crashed_fresh, retry_until,
+        age_far_past, dead_pid, live_pid, plant_crashed, plant_crashed_fresh, plant_crashed_sync,
+        retry_until,
     };
     use super::*;
+
+    /// A [`SyncSettler`] that counts prune calls for assertions and never fails.
+    #[derive(Default)]
+    struct RecordingSettler {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingSettler {
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SyncSettler for RecordingSettler {
+        fn settle(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     /// A `repo_path` whose `.git` directory exists, plus a pre-written
     /// `index.lock` with the current wall-clock mtime.
@@ -2012,6 +2179,41 @@ mod tests {
         assert!(
             lock_path(&repo).exists(),
             "a corrupt journal must never remove a lock"
+        );
+    }
+
+    #[test]
+    fn a_legacy_advance_line_is_skipped_and_recovery_still_settles() {
+        // Finding 8: an intermediate VRD-19 build wrote `advance <sha>` progress
+        // lines into the sync journal. A journal an upgrade inherited with such a
+        // line alongside its `begin sync` must NOT be treated as Corrupt (which
+        // would wedge recovery: stale lock never removed, scratch never settled).
+        // The `advance` line is skipped as benign legacy, so recovery proceeds:
+        // the stale git lock is removed, the settler prunes the scratch, and the
+        // journal is compacted.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo);
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        // Append a legacy `advance <sha>` line after the `begin sync` record.
+        let mut content = fs::read_to_string(journal.path()).unwrap();
+        content.push_str("advance 0123456789abcdef0123456789abcdef01234567\n");
+        fs::write(journal.path(), content).unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockRemoved { .. }),
+            "the legacy advance line must not wedge recovery, got {report:?}"
+        );
+        assert!(!lock.exists(), "the stale git lock was removed");
+        assert_eq!(settler.call_count(), 1, "the scratch worktree was settled");
+        assert_eq!(
+            fs::metadata(journal.path()).unwrap().len(),
+            0,
+            "the journal was compacted once recovery settled"
         );
     }
 
@@ -2911,6 +3113,136 @@ mod tests {
         assert!(
             retry_until(|| OpLock::try_acquire(&path).unwrap().is_some()),
             "a released op lock never became reacquirable"
+        );
+    }
+
+    // --- sync recovery -------------------------------------------------------
+
+    #[test]
+    fn dangling_sync_record_settled_removes_lock_and_prunes_the_scratch() {
+        // A provably-ours-and-stale crashed sync (dead owner, aged in-window
+        // lock) is settled: the git lock is removed, the settler is invoked to
+        // prune the leftover scratch worktree, and the journal is compacted. No
+        // advance is ever re-applied (the next sync cycle self-heals).
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo);
+
+        let settler = RecordingSettler::default();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockRemoved { .. }),
+            "expected LockRemoved, got {report:?}"
+        );
+        assert!(!lock.exists(), "the stale git lock must be removed");
+        assert_eq!(
+            settler.call_count(),
+            1,
+            "the settler prunes the scratch worktree exactly once"
+        );
+        assert!(journal.is_clean(), "the settled journal is compacted");
+    }
+
+    #[test]
+    fn dangling_sync_record_with_no_lock_still_prunes_the_scratch() {
+        // Dead owner, no git lock present (the checkout completed but the record
+        // never closed): recovery still prunes the scratch via the settler.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        let (_repo, lock) = plant_crashed_sync(&journal_dir, &repo);
+        fs::remove_file(&lock).unwrap();
+
+        let settler = RecordingSettler::default();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::NoLockPresent { .. }),
+            "expected NoLockPresent, got {report:?}"
+        );
+        assert_eq!(settler.call_count(), 1);
+    }
+
+    #[test]
+    fn a_live_owner_defers_sync_settlement_gate_respected() {
+        // A dangling sync record whose recorded PID is still alive is HolderAlive:
+        // the tree is NOT touched (the settler is never called), exactly as the
+        // liveness gate protects the git lock.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = age_far_past(&lock);
+        let live = live_pid();
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\n",
+                live.pid(),
+                hex_encode(identity_path(&repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::HolderAlive { .. }),
+            "expected HolderAlive, got {report:?}"
+        );
+        assert!(lock.exists(), "a live holder's lock is never removed");
+        assert_eq!(
+            settler.call_count(),
+            0,
+            "a live holder must not have its tree settled"
+        );
+    }
+
+    #[test]
+    fn a_too_fresh_lock_defers_sync_settlement_foreign_grace_respected() {
+        // Dead owner, in-window lock but younger than FOREIGN_LOCK_GRACE: it
+        // cannot yet be proven ours rather than a live foreign lock, so recovery
+        // retains it (LockTooFresh) and does NOT settle the tree.
+        let dir = tempfile::tempdir().unwrap();
+        let journal_dir = dir.path().join("journal");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        fs::write(&lock, b"lock").unwrap();
+        let ts = mtime_secs(&lock); // fresh, in-window
+        let journal = Journal::for_repo_in_dir(&journal_dir, &repo);
+        fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
+        fs::write(
+            journal.path(),
+            format!(
+                "begin sync pid={} ts={ts} path={}\n",
+                dead_pid(),
+                hex_encode(identity_path(&repo).as_os_str().as_bytes()),
+            ),
+        )
+        .unwrap();
+
+        let settler = RecordingSettler::default();
+        let report = journal.recover_with_settler(&repo, &settler);
+
+        assert!(
+            matches!(report, RecoveryReport::LockTooFresh { .. }),
+            "expected LockTooFresh, got {report:?}"
+        );
+        assert!(lock.exists(), "a too-fresh lock is retained");
+        assert_eq!(
+            settler.call_count(),
+            0,
+            "the foreign-lock grace must gate sync settlement too"
         );
     }
 }

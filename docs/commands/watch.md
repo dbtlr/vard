@@ -57,8 +57,10 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 | `--trigger <MODE>` | Which automatic triggers arm snapshots: `events`, `interval`, or `both`. |
 | `--interval <DURATION>` | Interval between periodic snapshots, e.g. `15m` or `1h30m`. |
 | `--quiesce <DURATION>` | How long file activity must settle before a snapshot, e.g. `10s`. |
-| `--no-sync` | Register the watch as local-only: never sync to a remote. |
+| `--no-sync` | Force the watch local-only: never sync to a remote, even if `defaults.sync = true`. Syncing is off by default, so this is only needed to override an enabling default. |
 | `--init` | If the directory is not a git repository, `git init` it without prompting (the non-interactive escape hatch). |
+
+Syncing is **off by default**: a newly added watch is local-only until you turn it on. There is no `--sync` flag on `add` yet — enable syncing by setting `sync = true` on the watch (or `defaults.sync = true` for all watches) in the config, then configure a `remote` and `branch`. See [`sync`](sync.md).
 
 ## remove
 
@@ -91,7 +93,7 @@ Output follows the global `--format`: human-readable records on a terminal, JSON
   remote    origin
   trigger   both
   interval  15m
-  sync      yes
+  sync      no
   paused    no
 ```
 
@@ -100,8 +102,10 @@ vard watch list --format json
 ```
 
 ```json
-[{"name":"notes","path":"~/notes","branch":null,"remote":"origin","trigger":"both","interval":"15m","sync":true,"paused":false,"aliases":null}]
+[{"name":"notes","path":"~/notes","branch":null,"remote":"origin","trigger":"both","interval":"15m","sync":false,"paused":false,"aliases":null}]
 ```
+
+(The `sync` field is the effective value: `no`/`false` here because a default-added watch is local-only until syncing is enabled in the config.)
 
 ## pause / resume
 

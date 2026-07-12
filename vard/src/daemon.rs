@@ -34,8 +34,11 @@
 //!   [`EngineHandle::trigger`](vard_core::EngineHandle::trigger) — for the named
 //!   watch, or every watch when `watch` is omitted. An unknown watch is logged
 //!   and skipped.
-//! - `kind = "sync"` is accepted but not yet implemented (VRD-19); it is logged
-//!   and dropped.
+//! - `kind = "sync"` requests a manual sync cycle via
+//!   [`EngineHandle::request_sync`](vard_core::EngineHandle::request_sync) — for
+//!   the named watch, or every watch when `watch` is omitted. A watch that
+//!   cannot sync accepts the request and does nothing; an unknown watch is
+//!   logged and skipped.
 //!
 //! Every consumed file is deleted — including a malformed one, which is logged
 //! and removed so a single poison file cannot wedge the queue.
@@ -232,6 +235,9 @@ pub(crate) struct DaemonPaths {
     pub request_dir: PathBuf,
     /// The directory holding per-watch operation journals.
     pub journal_dir: PathBuf,
+    /// The parent directory under which each syncing watch gets its out-of-tree
+    /// reconcile scratch worktree (`<reconcile_dir>/<journal-key>`).
+    pub reconcile_dir: PathBuf,
     /// The health file rewritten on every watch state change and cleared on
     /// clean shutdown; `vard notify` reads it.
     pub health_file: PathBuf,
@@ -245,8 +251,17 @@ impl DaemonPaths {
             lock_file: paths::lock_file()?,
             request_dir: paths::request_dir()?,
             journal_dir: paths::journal_dir()?,
+            reconcile_dir: paths::reconcile_dir()?,
             health_file: paths::health_file()?,
         })
+    }
+
+    /// The out-of-tree reconcile scratch path for the watch rooted at
+    /// `repo_path`: `<reconcile_dir>/<journal-key>`, keyed by the same repository
+    /// identity as the watch's journal so recovery can address it.
+    fn scratch_for(&self, repo_path: &Path) -> PathBuf {
+        self.reconcile_dir
+            .join(journal::journal_file_name(repo_path))
     }
 }
 
@@ -529,11 +544,14 @@ async fn run_daemon(
     if defined.is_empty() {
         return Err(StartupError::NoWatches);
     }
-    let specs: Vec<WatchSpec> = defined
-        .iter()
-        .filter(|w| !w.paused)
-        .map(|w| w.spec.clone())
-        .collect();
+    let specs: Vec<WatchSpec> = inject_scratch_dirs(
+        &paths,
+        defined
+            .iter()
+            .filter(|w| !w.paused)
+            .map(|w| w.spec.clone())
+            .collect(),
+    );
     if specs.is_empty() {
         info!("all configured watches are paused; starting idle (a resume will reload)");
     }
@@ -632,7 +650,81 @@ fn reconcile_journals(paths: &DaemonPaths, defined: &[crate::config::ResolvedWat
 fn recover_stale_locks<'a>(paths: &DaemonPaths, specs: impl IntoIterator<Item = &'a WatchSpec>) {
     for spec in specs {
         let journal = Journal::for_repo_in_dir(&paths.journal_dir, spec.path());
-        journal.recover_and_log(spec.path(), spec.name(), "startup");
+        // A syncing watch may have crashed mid-sync, leaving a scratch worktree
+        // and an un-applied advance target. Recover with a settler that cleans
+        // those up — but ONLY through the journal's provably-ours-and-dead gates.
+        // A non-sync watch (or a repo we cannot open) takes the plain path.
+        match sync_settler(paths, spec) {
+            Some(settler) => {
+                let report = journal.recover_with_settler(spec.path(), &settler);
+                journal::log_recovery(&report, spec.name(), "startup");
+            }
+            None => {
+                journal.recover_and_log(spec.path(), spec.name(), "startup");
+            }
+        }
+    }
+}
+
+/// Host-injects the out-of-tree reconcile scratch directory into every
+/// sync-enabled spec, so vard-core can run the sync cycle (it resolves no paths
+/// itself). The path is [`DaemonPaths::scratch_for`] — the *same* derivation
+/// [`recover_stale_locks`] prunes via [`GitSyncSettler`], so the engine
+/// reconciles in exactly the directory recovery cleans.
+///
+/// Scratch injection depends ONLY on `sync = true`; it does **not** probe the
+/// remote (findings 4/5). The remote gate is LIVE inside the engine's sync cycle
+/// ([`VcsBackend::has_remote`](vard_core::VcsBackend::has_remote) at cycle
+/// start), so a remote added after the daemon started is picked up on the next
+/// request with no restart, and a request on a remote-less watch is answered
+/// honestly (an `Event::SyncSkipped` the daemon logs) rather than silently
+/// dropped. A non-sync spec is returned unchanged.
+fn inject_scratch_dirs(paths: &DaemonPaths, specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
+    specs
+        .into_iter()
+        .map(|spec| {
+            if !spec.sync() {
+                return spec;
+            }
+            let scratch = paths.scratch_for(spec.path());
+            spec.with_scratch_dir(scratch)
+        })
+        .collect()
+}
+
+/// Builds a [`SyncSettler`](journal::SyncSettler) for a syncing watch, or `None`
+/// when the watch does not sync or its repository cannot be opened (recovery
+/// then falls back to the plain lock-only path).
+fn sync_settler(paths: &DaemonPaths, spec: &WatchSpec) -> Option<GitSyncSettler> {
+    if !spec.sync() {
+        return None;
+    }
+    let backend = vard_core::open_git_backend(spec).ok()?;
+    Some(GitSyncSettler {
+        backend,
+        scratch: paths.scratch_for(spec.path()),
+    })
+}
+
+/// The daemon's [`SyncSettler`](journal::SyncSettler): idempotently settles a
+/// crashed sync's tree through a real [`GitBackend`](vard_core::GitBackend).
+struct GitSyncSettler {
+    backend: vard_core::GitBackend,
+    scratch: PathBuf,
+}
+
+impl journal::SyncSettler for GitSyncSettler {
+    fn settle(&self) -> Result<(), String> {
+        use vard_core::VcsBackend;
+        // Recovery is never surgery on the user's files: prune the vard-owned
+        // scratch worktree (always safe, never the user's tree; a no-op when
+        // absent) and nothing else. A crashed advance leaves a fully-committed
+        // tree at worst mid-checkout, and the next sync cycle self-heals — its
+        // dirty check + pre-sync snapshot + fresh reconcile land the work
+        // properly. No advance is ever re-applied here.
+        self.backend
+            .prune_scratch(&self.scratch)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -749,11 +841,14 @@ async fn build_started_engine(
     // future sweep), so recovery below looks under the right path keys.
     reconcile_journals(paths, &defined);
 
-    let specs: Vec<WatchSpec> = defined
-        .iter()
-        .filter(|w| !w.paused)
-        .map(|w| w.spec.clone())
-        .collect();
+    let specs: Vec<WatchSpec> = inject_scratch_dirs(
+        paths,
+        defined
+            .iter()
+            .filter(|w| !w.paused)
+            .map(|w| w.spec.clone())
+            .collect(),
+    );
     if specs.is_empty() {
         info!("reload: all watches are paused; running idle");
     }
@@ -1198,7 +1293,11 @@ fn log_event(event: &Event) {
                 info!(event = name, %watch, %from, %to, reason, "watch state changed");
             }
         }
-        Event::SyncPushed { watch } => info!(event = name, %watch, "pushed to remote"),
+        Event::SyncPushed {
+            watch,
+            new_ref,
+            commits,
+        } => info!(event = name, %watch, %new_ref, commits, "pushed to remote"),
         Event::SyncPulled {
             watch,
             prev_ref,
@@ -1209,6 +1308,9 @@ fn log_event(event: &Event) {
             info!(event = name, %watch, %resolver, "sync conflict resolved");
         }
         Event::SyncFailed { watch, error } => warn!(event = name, %watch, %error, "sync failed"),
+        Event::SyncSkipped { watch, reason } => {
+            info!(event = name, %watch, %reason, "sync skipped")
+        }
         Event::RestoreCompleted {
             watch,
             restored_to,
@@ -1324,9 +1426,10 @@ fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
     }
 }
 
-/// Applies one parsed request: a snapshot injects a manual trigger (for the
-/// named watch, or every watch when unnamed); a sync is logged and dropped
-/// pending VRD-19.
+/// Applies one parsed request: a snapshot injects a manual trigger and a sync a
+/// manual sync request — for the named watch, or every watch when unnamed. A
+/// watch that cannot sync accepts the request and does nothing (see
+/// [`EngineHandle::request_sync`]).
 fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdentity]) {
     match request.kind {
         RequestKind::Snapshot => match request.watch {
@@ -1347,9 +1450,24 @@ fn apply_request(request: Request, handle: &EngineHandle, watches: &[WatchIdenti
                 );
             }
         },
-        RequestKind::Sync => {
-            info!("sync requested but not yet implemented (VRD-19); dropping");
-        }
+        RequestKind::Sync => match request.watch {
+            Some(watch) => {
+                if handle.request_sync(&watch) {
+                    info!(%watch, "manual sync requested");
+                } else {
+                    warn!(%watch, "sync requested for an unknown watch; ignoring");
+                }
+            }
+            None => {
+                for watch in watches {
+                    handle.request_sync(&watch.name);
+                }
+                info!(
+                    count = watches.len(),
+                    "manual sync requested for all watches"
+                );
+            }
+        },
     }
 }
 
@@ -1456,6 +1574,55 @@ impl SourceDiedBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- GitSyncSettler (crash-recovery settlement) ---------------------------
+
+    /// Opens a `GitSyncSettler` over `repo` on `main`, scratch under a subdir.
+    fn settler_for(repo: &Path) -> GitSyncSettler {
+        GitSyncSettler {
+            backend: vard_core::GitBackend::open(repo, "main", "origin").unwrap(),
+            scratch: repo.join(".vard-scratch"),
+        }
+    }
+
+    #[test]
+    fn git_sync_settler_prunes_the_scratch_and_never_touches_user_files() {
+        use journal::SyncSettler;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-m", "one"]);
+
+        // A leftover scratch worktree from a crashed reconcile, at the very path
+        // the settler prunes.
+        let scratch = repo.join(".vard-scratch");
+        git_ok(
+            &repo,
+            &["worktree", "add", "--detach", scratch.to_str().unwrap()],
+        );
+        assert!(scratch.exists(), "scratch worktree planted");
+
+        // An uncommitted edit to a tracked file that recovery must NOT touch —
+        // recovery is never surgery on the user's files; it only prunes scratch.
+        std::fs::write(repo.join("a.txt"), "unsaved local work\n").unwrap();
+        let commits_before = commit_count(&repo);
+
+        settler_for(&repo).settle().unwrap();
+
+        assert!(!scratch.exists(), "the scratch worktree is pruned");
+        assert_eq!(
+            commit_count(&repo),
+            commits_before,
+            "no advance is ever re-applied by recovery"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "unsaved local work\n",
+            "the uncommitted edit survives untouched"
+        );
+    }
 
     // --- request-file staleness ----------------------------------------------
 
@@ -1792,6 +1959,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -1883,6 +2051,214 @@ mod tests {
         }
     }
 
+    /// A bare repository usable as a file remote.
+    fn bare_origin(path: &Path) -> PathBuf {
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(path)
+            .output()
+            .expect("spawn git");
+        path.to_path_buf()
+    }
+
+    /// A working repo with `origin` set, a base commit, and `main` pushed.
+    fn synced_repo(repo: &Path, origin: &Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        git_ok(repo, &["init", "-b", "main"]);
+        git_ok(repo, &["config", "user.email", "vard-test@example.com"]);
+        git_ok(repo, &["config", "user.name", "Vard Test"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git_ok(repo, &["add", "-A"]);
+        git_ok(repo, &["commit", "-m", "base"]);
+        git_ok(repo, &["push", "-u", "origin", "main"]);
+    }
+
+    /// Commits reachable from the bare remote's `main`.
+    fn remote_commit_count(origin: &Path) -> usize {
+        let out = std::process::Command::new("git")
+            .args(["rev-list", "--count", "refs/heads/main"])
+            .current_dir(origin)
+            .output()
+            .expect("failed to spawn git");
+        if !out.status.success() {
+            return 0;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_consumes_a_sync_request_and_pushes_to_the_remote() {
+        // A sync-enabled watch on an interval-only trigger (no watcher, no auto
+        // fire): the ONLY thing that drives a sync is the dropped request file.
+        // Proves the daemon injects the reconcile scratch dir (so the cycle can
+        // run at all) and routes a `kind = "sync"` request to `request_sync`.
+        let root = tempfile::tempdir().unwrap();
+        let origin = bare_origin(&root.path().join("origin.git"));
+        let notes = root.path().join("notes");
+        synced_repo(&notes, &origin);
+        // Uncommitted local work: the sync's pre-sync snapshot commits it, then
+        // the cycle pushes it — moving the remote from 1 commit to 2.
+        std::fs::write(notes.join("draft.txt"), "local work\n").unwrap();
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"notes\"\npath = {notes:?}\nsync = true\n\
+                 branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            ),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        assert_eq!(remote_commit_count(&origin), 1, "remote starts at the base");
+        request::write(
+            &paths.request_dir,
+            &request::Request::sync(Some("notes".to_string())),
+        )
+        .unwrap();
+
+        // The consumed request drives the cycle, which pushes the pre-sync commit.
+        let mut pushed = false;
+        for _ in 0..400 {
+            if remote_commit_count(&origin) >= 2 {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(pushed, "the sync request must push the pre-sync commit");
+        assert!(
+            head_message(&notes).contains("Vard-Trigger: pre-sync"),
+            "the pushed commit must be the pre-sync snapshot, got:\n{}",
+            head_message(&notes)
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+
+        let journal_path = Journal::for_repo_in_dir(&paths.journal_dir, &notes);
+        let len = std::fs::metadata(journal_path.path())
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(len, 0, "a clean sync leaves no dangling journal record");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_added_after_daemon_start_is_picked_up_on_the_next_sync() {
+        // Findings 4/5: the remote gate is LIVE in the sync cycle, not a
+        // startup-only probe. A sync-enabled watch whose repo has no remote
+        // *configured* when the daemon starts still gets its scratch injected;
+        // once the remote is added (no daemon restart) a queued sync runs and
+        // pushes to it.
+        let root = tempfile::tempdir().unwrap();
+        let origin = bare_origin(&root.path().join("origin.git"));
+        let notes = root.path().join("notes");
+        // A normal synced repo (origin has `main`), but the remote is then
+        // REMOVED so the watch starts with no configured remote.
+        synced_repo(&notes, &origin);
+        git_ok(&notes, &["remote", "remove", "origin"]);
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"notes\"\npath = {notes:?}\nsync = true\n\
+                 branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            ),
+        )
+        .unwrap();
+
+        let paths = DaemonPaths {
+            config_file,
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // The remote is added AFTER the daemon started (and some local work made).
+        git_ok(
+            &notes,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        std::fs::write(notes.join("draft.txt"), "local work\n").unwrap();
+        request::write(
+            &paths.request_dir,
+            &request::Request::sync(Some("notes".to_string())),
+        )
+        .unwrap();
+
+        // The live gate now sees the remote, so the queued sync runs and pushes.
+        // The remote starts at the base (1 commit); the drained sync pushes the
+        // pre-sync commit, moving it to 2.
+        let mut pushed = false;
+        for _ in 0..400 {
+            if remote_commit_count(&origin) >= 2 {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            pushed,
+            "a remote added after daemon start must be picked up with no restart"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+    }
+
     use crate::journal::test_support::{plant_crashed, retry_until};
 
     fn id(name: &str, path: &Path) -> WatchIdentity {
@@ -1901,6 +2277,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         let removed_repo = root.path().join("removed");
@@ -2054,6 +2431,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2111,6 +2489,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2170,6 +2549,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();
@@ -2256,6 +2636,7 @@ mod tests {
             lock_file: state.join("vard.lock"),
             request_dir: state.join("requests"),
             journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
             health_file: state.join("health"),
         };
         std::fs::create_dir_all(&paths.request_dir).unwrap();

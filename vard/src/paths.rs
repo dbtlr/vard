@@ -73,6 +73,12 @@ pub fn journal_dir() -> Result<PathBuf, HomeNotFound> {
     Ok(state_dir()?.join("journal"))
 }
 
+/// `<state_dir>/reconcile` — parent of each syncing watch's out-of-tree
+/// reconcile scratch worktree.
+pub fn reconcile_dir() -> Result<PathBuf, HomeNotFound> {
+    Ok(state_dir()?.join("reconcile"))
+}
+
 fn xdg_dir(var: &str, default_rel: &str) -> Result<PathBuf, HomeNotFound> {
     resolve(env::var_os(var), home().as_deref(), default_rel).ok_or(HomeNotFound)
 }

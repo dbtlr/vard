@@ -154,6 +154,42 @@ impl Env {
     }
 }
 
+/// A real `vard run` daemon spawned against an [`Env`], killed (and reaped) on
+/// drop so a failing assertion can never leak the process.
+pub struct DaemonGuard(std::process::Child);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Env {
+    /// Spawns the real daemon detached from the test's stdio and waits until it
+    /// is demonstrably up — the health file written, the instance lock held —
+    /// so a subsequent CLI command takes the daemon-present dispatch path.
+    /// Panics if the daemon never comes up. Drop the guard to stop it.
+    pub fn spawn_daemon(&self) -> DaemonGuard {
+        let child = self
+            .command(&["run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vard run");
+        let guard = DaemonGuard(child);
+        let health = self.health_file();
+        for _ in 0..100 {
+            if health.exists() {
+                return guard;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("the daemon never started (no health file)");
+    }
+}
+
 /// The process exit code, or a panic if it was signalled.
 pub fn code(out: &Output) -> i32 {
     out.status.code().expect("process exited via a signal")

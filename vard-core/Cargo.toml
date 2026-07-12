@@ -17,6 +17,15 @@ tokio = { workspace = true, features = ["rt", "time"] }
 notify = { workspace = true }
 ignore = { workspace = true }
 
+# On unix, a timed-out `fetch`/`push` kills the git child's whole process group
+# (`kill_process_group`) so an ssh transport's children die with it rather than
+# leaking, and the `Vard-Host` trailer reads the hostname via `uname(2)`. Both
+# are unix-only syscalls, so the dependency is unix-gated; the non-unix code
+# paths compile without it. Reuses the workspace `rustix` the daemon already
+# pulls in for its `flock`/liveness probes.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 # `macros` + `test-util` drive the watcher's deterministic tests: paused-time
 # (`start_paused`) quiescence tests and `#[tokio::test]` real-FS tests.

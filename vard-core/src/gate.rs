@@ -77,6 +77,27 @@ pub trait OpGate: Send + Sync {
     ///   index lock).
     /// - `Err(_)` — the gate could not be evaluated (host I/O trouble).
     fn begin(&self, op: &str) -> Result<Option<Box<dyn OpGuard>>, OpGateError>;
+
+    /// A cheap, side-effect-free admission probe: whether a [`begin`](Self::begin)
+    /// issued right now would likely be admitted (`false` means a live holder
+    /// owns the watch). **Advisory only** — a holder can arrive between the probe
+    /// and the real `begin`, which then simply reports busy; callers must never
+    /// treat `true` as a held lock.
+    ///
+    /// The engine's sync cycle uses this to gate its **locked window** (the
+    /// pre-sync snapshot / reconcile / advance), not its pre-flight: the fetch
+    /// and dirty check are lock-free and run regardless, and while a busy gate
+    /// keeps deferring, the paced retries probe *only* this — the pre-flight
+    /// result is cached, so waiting on a wedged holder costs zero network I/O.
+    ///
+    /// Implementations should try-acquire and immediately release their lock
+    /// **without** recording anything (no journal write). The default is
+    /// optimistic (`true`), correct for gates with no contention concept
+    /// ([`NoOpGate`]); a probe that cannot be evaluated should also return
+    /// `true` and let `begin` surface the real error.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// The RAII half of [`OpGate`]: a live operation admitted by the gate.
@@ -91,6 +112,12 @@ pub trait OpGuard: Send {
     /// Records the operation's clean completion (the host compacts its journal)
     /// and releases the lock. Consumes the guard. Not calling this — dropping the
     /// guard instead — is the release-only path that preserves recovery evidence.
+    ///
+    /// A crashed operation leaves only the `begin` record as evidence; recovery
+    /// is never surgery on the user's files. A dangling **sync** record's cleanup
+    /// prunes the vard-owned scratch worktree and nothing else — the crashed
+    /// tree is fully committed at worst mid-checkout, and the next sync cycle
+    /// self-heals (dirty check → pre-sync snapshot → fresh reconcile → advance).
     fn complete(self: Box<Self>);
 }
 

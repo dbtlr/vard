@@ -124,6 +124,18 @@ pub enum Event {
     SyncPushed {
         /// Stable name of the watch.
         watch: String,
+        /// The reference (tip) that was pushed to the remote.
+        new_ref: String,
+        /// How many commits the remote received in this push. On the push-only
+        /// path this is resolved **at push time** (via
+        /// [`ahead_of_upstream`](crate::VcsBackend::ahead_of_upstream)), so
+        /// commits landing after the cycle's fetch are counted — except when
+        /// the fetch found the branch deleted remotely with a stale tracking
+        /// ref surviving ([`stale_tracking_ref`](crate::RemoteState::stale_tracking_ref)),
+        /// where the fetch-time full-history count is used because the local
+        /// read is untrustworthy. On the integrate path it is the fetch-time
+        /// count plus the pre-sync snapshot's commit.
+        commits: usize,
     },
     /// Remote changes were pulled into the local repository.
     SyncPulled {
@@ -152,6 +164,17 @@ pub enum Event {
         watch: String,
         /// Human-readable description of the failure.
         error: String,
+    },
+    /// A sync request reached a benign no-op and was skipped — currently only
+    /// when the live remote gate finds the repository has no configured remote.
+    /// Emitted so a request on a remote-less watch is never *silently* dropped
+    /// (the daemon logs it); it carries no state change, no failure, and no
+    /// backoff.
+    SyncSkipped {
+        /// Stable name of the watch.
+        watch: String,
+        /// Human-readable reason the cycle was skipped.
+        reason: String,
     },
     /// A restore completed, moving the working tree to a prior snapshot.
     RestoreCompleted {
@@ -209,6 +232,7 @@ impl Event {
             Event::SyncConflict { .. } => "sync.conflict",
             Event::SyncResolved { .. } => "sync.resolved",
             Event::SyncFailed { .. } => "sync.failed",
+            Event::SyncSkipped { .. } => "sync.skipped",
             Event::RestoreCompleted { .. } => "restore.completed",
             Event::WatchStateChanged { .. } => "watch.state_changed",
             Event::DaemonStarted => "daemon.started",
@@ -638,6 +662,8 @@ mod tests {
             (
                 Event::SyncPushed {
                     watch: "w".to_string(),
+                    new_ref: "abc".to_string(),
+                    commits: 2,
                 },
                 "sync.pushed",
             ),
@@ -668,6 +694,13 @@ mod tests {
                     error: "e".to_string(),
                 },
                 "sync.failed",
+            ),
+            (
+                Event::SyncSkipped {
+                    watch: "w".to_string(),
+                    reason: "no remote".to_string(),
+                },
+                "sync.skipped",
             ),
             (
                 Event::RestoreCompleted {

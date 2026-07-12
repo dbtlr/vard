@@ -74,6 +74,16 @@ impl Request {
         }
     }
 
+    /// A sync request for `watch` (or every sync-enabled watch when `None`),
+    /// stamped `requested_at = now`.
+    pub(crate) fn sync(watch: Option<String>) -> Request {
+        Request {
+            kind: RequestKind::Sync,
+            watch,
+            requested_at: now_epoch_secs(),
+        }
+    }
+
     /// How long ago this request was written, relative to `now`. Zero when the
     /// stamp is in the future (a clock skew), so a skewed request is treated as
     /// fresh rather than as impossibly old. A stamp too large to represent as a
@@ -106,7 +116,7 @@ pub(crate) fn write(request_dir: &Path, request: &Request) -> Result<(), String>
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let pid = std::process::id();
-    let settled = request_dir.join(format!("snapshot-{pid}-{nanos}.toml"));
+    let settled = request_dir.join(format!("req-{pid}-{nanos}.toml"));
     crate::atomic::write(&settled, text.as_bytes())
         .map_err(|e| format!("writing request file: {e}"))
 }
