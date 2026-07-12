@@ -68,7 +68,7 @@ vard sync notes --format json
 | Code | Meaning |
 |---|---|
 | `0` | Every acted-on watch was synced or queued (including `up to date`), or was an informational no-selector row (`paused`, or `disabled` for a missing remote). |
-| `1` | Attention — a reconcile conflict latched a watch, or a watch asked for **by name** has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or its repository lacks the configured remote (the message names it). |
+| `1` | Attention — a reconcile conflict latched a watch; a watch asked for **by name** has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or its repository lacks the configured remote (the message names it); or, with **no selector**, no watch has syncing enabled at all (`no sync-enabled watches configured`). |
 | `2` | Operational error — a network or authentication failure, a repository that could not be opened, a sync that could not complete before the engine stopped (including a repository held by another operation throughout), or a selector that resolves to no watch. |
 
 ## See also
