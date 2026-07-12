@@ -756,6 +756,8 @@ path = "/data/bare"
         assert_eq!(spec.interval(), DEFAULT_INTERVAL);
         assert_eq!(spec.quiesce(), DEFAULT_QUIESCE);
         assert_eq!(spec.sync(), DEFAULT_SYNC);
+        // Sync is off by default: a bare watch is local-only until it opts in.
+        assert!(!spec.sync(), "sync defaults off");
         assert_eq!(spec.sync_interval(), DEFAULT_SYNC_INTERVAL);
         assert_eq!(spec.remote(), DEFAULT_REMOTE);
     }

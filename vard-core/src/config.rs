@@ -39,8 +39,10 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Default interval between background syncs to the remote.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
-/// Default for whether a watch syncs to a remote at all.
-pub const DEFAULT_SYNC: bool = true;
+/// Default for whether a watch syncs to a remote at all. Off: syncing is an
+/// explicit opt-in (`sync = true` on the watch, or `defaults.sync = true`), so a
+/// freshly-added watch never pushes to a remote until asked to.
+pub const DEFAULT_SYNC: bool = false;
 
 /// Default trigger mode: arm both change and interval triggers.
 pub const DEFAULT_TRIGGER: TriggerMode = TriggerMode::Both;
@@ -205,11 +207,11 @@ impl WatchSpec {
     /// `<XDG state>/reconcile/<key>/`; tests use a tempdir). **When unset, sync
     /// is disabled for this watch even if [`sync`](Self::sync) is `true`** — the
     /// engine has nowhere to reconcile, so it never runs the sync cycle. This is
-    /// the deliberate default rather than a build error: [`DEFAULT_SYNC`] is
-    /// `true`, so erroring would reject every default-built watch that has not
-    /// yet been handed a scratch path (every embedder and the whole existing
-    /// test corpus). Disabling instead keeps construction infallible and makes a
-    /// scratch directory the single switch that turns real syncing on.
+    /// the deliberate default rather than a build error: a `sync = true` watch
+    /// built before its host has computed a scratch path (or a `sync`-agnostic
+    /// embedder) must still construct, so erroring would be wrong. Disabling
+    /// instead keeps construction infallible and makes a scratch directory the
+    /// single switch that turns real syncing on.
     pub fn scratch_dir(&self) -> Option<&Path> {
         self.scratch_dir.as_deref()
     }
@@ -609,7 +611,9 @@ mod tests {
             .trigger(TriggerMode::Events)
             .quiesce(Duration::from_secs(3))
             .interval(Duration::from_secs(300))
-            .sync(false)
+            // sync is off by default, so `true` is the non-default value that
+            // proves the setter overrides the default rather than matching it.
+            .sync(true)
             .sync_interval(Duration::from_secs(3600))
             .exclude(["target", "*.log"])
             .branch("backup")
@@ -621,7 +625,7 @@ mod tests {
         assert_eq!(spec.trigger(), TriggerMode::Events);
         assert_eq!(spec.quiesce(), Duration::from_secs(3));
         assert_eq!(spec.interval(), Duration::from_secs(300));
-        assert!(!spec.sync());
+        assert!(spec.sync());
         assert_eq!(spec.sync_interval(), Duration::from_secs(3600));
         assert_eq!(spec.exclude(), ["target".to_string(), "*.log".to_string()]);
         assert_eq!(spec.branch(), Some("backup"));
