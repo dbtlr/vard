@@ -2135,10 +2135,12 @@ async fn sync_fetch(
 }
 
 /// Runs [`has_remote`](VcsBackend::has_remote) off the async runtime — the sync
-/// cycle's live remote gate. A backend error (or panic) maps to `Err`, which the
-/// cycle treats as "no usable remote" (an honest no-op, never a latched
-/// failure). Takes the backend by value (a cheap [`Arc`] clone) so the future
-/// stays `Send`.
+/// cycle's live remote gate. `Ok(false)` (the configured remote is not defined)
+/// is the honest no-op the cycle skips on without latching. A backend error (or
+/// panic) is different: it maps to `Err`, which the cycle treats as a real
+/// repository/environment fault — it latches [`SyncError`](WatchState::SyncError)
+/// and surfaces [`SyncOutcome::Failed`], never masked as a missing remote. Takes
+/// the backend by value (a cheap [`Arc`] clone) so the future stays `Send`.
 async fn sync_has_remote(backend: SharedBackend) -> Result<bool, String> {
     match tokio::task::spawn_blocking(move || backend.has_remote()).await {
         Ok(Ok(has)) => Ok(has),
@@ -2319,16 +2321,28 @@ fn pre_sync_request() -> SnapshotRequest {
 }
 
 /// The local host's name for the `Vard-Host` trailer, resolved once and cached.
-/// Read from the kernel via `uname(2)` (the same value `hostname` prints);
-/// falls back to `"unknown"` if it is empty or not valid UTF-8, so the trailer
+/// On unix it is read from the kernel via `uname(2)` (the same value `hostname`
+/// prints); elsewhere it falls back to the `COMPUTERNAME`/`HOSTNAME` environment
+/// variables. Any empty or unreadable result becomes `"unknown"`, so the trailer
 /// is always present and well-formed.
 fn host_name() -> String {
     static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
-        let uname = rustix::system::uname();
-        match uname.nodename().to_str() {
-            Ok(name) if !name.is_empty() => name.to_string(),
-            _ => "unknown".to_string(),
+        #[cfg(unix)]
+        {
+            let uname = rustix::system::uname();
+            match uname.nodename().to_str() {
+                Ok(name) if !name.is_empty() => name.to_string(),
+                _ => "unknown".to_string(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::var("COMPUTERNAME")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .ok()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
         }
     })
     .clone()
@@ -3270,6 +3284,11 @@ mod tests {
         advance_calls: usize,
         prune_calls: usize,
         push_calls: usize,
+        /// When set, model git's real reconcile precondition on disk: `reconcile`
+        /// fails (as `worktree add` does) if the scratch path already exists, and
+        /// `prune_scratch` actually removes it. Off by default so the scriptable
+        /// tests that never touch a real scratch path are unaffected.
+        model_scratch_precondition: bool,
     }
 
     impl FakeBackend {
@@ -3300,8 +3319,17 @@ mod tests {
                     advance_calls: 0,
                     prune_calls: 0,
                     push_calls: 0,
+                    model_scratch_precondition: false,
                 }),
             })
+        }
+
+        /// Turns on on-disk modeling of git's scratch precondition: `reconcile`
+        /// fails when the scratch path already exists (as `worktree add` does)
+        /// and `prune_scratch` really removes it. For the leftover-scratch
+        /// self-heal pin; the scriptable tests never touch a real path.
+        fn model_scratch_precondition(&self) {
+            self.inner.lock().unwrap().model_scratch_precondition = true;
         }
 
         /// Scripts the sync primitives' results, consumed in order (falling back
@@ -3335,6 +3363,9 @@ mod tests {
         }
         fn push_calls(&self) -> usize {
             self.inner.lock().unwrap().push_calls
+        }
+        fn prune_calls(&self) -> usize {
+            self.inner.lock().unwrap().prune_calls
         }
 
         fn script(&self, results: impl IntoIterator<Item = Scripted>) {
@@ -3558,10 +3589,19 @@ mod tests {
 
         fn reconcile(
             &self,
-            _scratch: &std::path::Path,
+            scratch: &std::path::Path,
         ) -> Result<crate::vcs::ReconcileOutcome, VcsError> {
             let mut inner = self.inner.lock().unwrap();
             inner.reconcile_calls += 1;
+            if inner.model_scratch_precondition && scratch.exists() {
+                // Model git's real precondition: `worktree add` fails when the
+                // scratch path already exists (a crashed prior cycle's leftover).
+                return Err(VcsError::CommandFailed {
+                    op: "worktree add".into(),
+                    status: Some(128),
+                    stderr: format!("fatal: '{}' already exists", scratch.display()),
+                });
+            }
             inner
                 .reconcile_results
                 .pop_front()
@@ -3581,8 +3621,12 @@ mod tests {
                 .unwrap_or(AdvanceOutcome::Advanced))
         }
 
-        fn prune_scratch(&self, _scratch: &std::path::Path) -> Result<(), VcsError> {
-            self.inner.lock().unwrap().prune_calls += 1;
+        fn prune_scratch(&self, scratch: &std::path::Path) -> Result<(), VcsError> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.prune_calls += 1;
+            if inner.model_scratch_precondition && scratch.exists() {
+                std::fs::remove_dir_all(scratch).map_err(VcsError::Io)?;
+            }
             Ok(())
         }
 
@@ -3748,12 +3792,35 @@ mod tests {
         spawn_sync_worker_with_gate(backend, cfg, default_gate())
     }
 
+    /// [`spawn_sync_worker`] with an explicit scratch path, for tests that
+    /// model the scratch directory's real on-disk lifecycle.
+    fn spawn_sync_worker_with_scratch(
+        backend: Arc<FakeBackend>,
+        cfg: EngineConfig,
+        scratch: PathBuf,
+    ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
+        let (tx, events) = spawn_sync_worker_inner(backend, cfg, default_gate(), scratch);
+        (tx, events)
+    }
+
     /// [`spawn_sync_worker`] with an injected operation gate, for the sync
     /// cycle's gate-busy paths (the pre-network probe, the bounded drain).
     fn spawn_sync_worker_with_gate(
         backend: Arc<FakeBackend>,
         cfg: EngineConfig,
         gate: SharedGate,
+    ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
+        // The scriptable FakeBackend never touches the scratch path, so a fixed
+        // mock path is fine here; on-disk lifecycle tests inject a tempdir via
+        // `spawn_sync_worker_with_scratch`.
+        spawn_sync_worker_inner(backend, cfg, gate, PathBuf::from("/tmp/vard-test-scratch"))
+    }
+
+    fn spawn_sync_worker_inner(
+        backend: Arc<FakeBackend>,
+        cfg: EngineConfig,
+        gate: SharedGate,
+        scratch: PathBuf,
     ) -> (mpsc::UnboundedSender<WatchInput>, EventReceiver) {
         let bus = EventBus::default();
         let events = bus.subscribe();
@@ -3778,7 +3845,7 @@ mod tests {
             retry_attempts: 0,
             retry_exhausted: false,
             sync_enabled: true,
-            scratch_dir: Some(PathBuf::from("/tmp/vard-test-scratch")),
+            scratch_dir: Some(scratch),
             remote: "origin".to_string(),
             sync_pending: None,
             sync_failures: 0,
@@ -3936,6 +4003,46 @@ mod tests {
             backend.advance_calls(),
             1,
             "a rebase is made live by advance"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leftover_scratch_worktree_from_a_crash_self_heals() {
+        // A prior cycle crashed mid-reconcile and left the scratch worktree on
+        // disk. `reconcile`'s real precondition (`worktree add`) fails on an
+        // existing path, so the locked window MUST prune before reconciling —
+        // this pins that ordering, daemon-less: the next cycle self-heals with
+        // no settler involved.
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("reconcile-scratch");
+        std::fs::create_dir_all(&scratch).unwrap(); // the crash leftover
+        let backend = FakeBackend::new();
+        backend.model_scratch_precondition();
+        backend.script_fetch([remote(0, 1)]);
+        backend.script_reconcile([Ok(ReconcileOutcome::Rebased {
+            new_head: SnapshotId::new("healedtip"),
+        })]);
+        backend.script_push([Ok(PushOutcome::UpToDate)]);
+        let (tx, mut events) =
+            spawn_sync_worker_with_scratch(Arc::clone(&backend), test_cfg(), scratch.clone());
+
+        tx.send(WatchInput::RequestSync {
+            manual: true,
+            ack: None,
+        })
+        .unwrap();
+        match advance_until_event(&mut events, Duration::from_secs(1)).await {
+            Event::SyncPulled { new_ref, .. } => assert_eq!(new_ref, "healedtip"),
+            other => panic!("expected the cycle to self-heal and pull, got {other:?}"),
+        }
+        assert_eq!(backend.reconcile_calls(), 1, "reconcile ran exactly once");
+        assert!(
+            backend.prune_calls() >= 1,
+            "the leftover was pruned before reconcile"
+        );
+        assert!(
+            !scratch.exists(),
+            "the leftover scratch directory is gone from disk"
         );
     }
 

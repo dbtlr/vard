@@ -234,10 +234,13 @@ pub trait VcsBackend {
     /// repository, as a cheap **non-network** config lookup
     /// (`git config remote.<name>.url`) — it never contacts the remote.
     ///
-    /// The sync engine's host probes this at build/injection time so a
-    /// `sync = true` watch whose repository has no such remote is left with sync
-    /// disabled (one log line, no state change) rather than latching a
-    /// [`VcsError`]/`SyncError` storm on every doomed fetch. The default returns
+    /// The sync engine probes this **live, at the start of every sync cycle**
+    /// (not once at build/injection time) so a `sync = true` watch whose
+    /// repository has no such remote is skipped as an honest no-op (one log line,
+    /// no state change) rather than latching a [`VcsError`]/`SyncError` storm on
+    /// every doomed fetch — and a remote added after the daemon started is picked
+    /// up on the next cycle with no restart. An `Ok(false)` skips; only a probe
+    /// *error* (an unreadable config) latches `SyncError`. The default returns
     /// `Ok(true)` for backends with no notion of a remote (test doubles); the git
     /// backend performs the real lookup.
     fn has_remote(&self) -> Result<bool, VcsError> {
