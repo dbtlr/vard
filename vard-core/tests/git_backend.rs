@@ -1015,6 +1015,11 @@ fn fetch_before_first_push_is_a_normal_state() {
     let state = backend.fetch(TEST_TIMEOUT).unwrap();
     assert!(!state.remote_moved);
     assert_eq!((state.ahead, state.behind), (1, 0));
+    assert!(
+        !state.stale_tracking_ref,
+        "a never-pushed branch has no tracking ref to distrust: the push-time \
+         count (ahead_of_upstream) stays in effect"
+    );
 
     // Even with an unborn local branch it is a state, not an error.
     let (tmp2, backend2) = new_repo();
@@ -1030,36 +1035,38 @@ fn fetch_before_first_push_is_a_normal_state() {
 }
 
 #[test]
-fn upstream_status_counts_commits_since_the_last_fetch() {
-    // The local-only (ahead, behind) read against the tracking ref the last
-    // fetch left. Commits landing AFTER a fetch are included — the number a
-    // push right now would send.
+fn ahead_of_upstream_counts_commits_since_the_last_fetch() {
+    // The local-only ahead read against the tracking ref the last fetch left.
+    // Commits landing AFTER a fetch are included — the number a push right now
+    // would send, which is what keeps the push-time commit count accurate.
     let fx = remote_fixture(); // base commit pushed; clone `b` tracks it
     assert_eq!(
-        fx.b.upstream_status().unwrap(),
-        Some((0, 0)),
-        "freshly cloned: nothing to send, nothing to integrate"
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(0),
+        "freshly cloned: nothing to send"
     );
     write(&fx.b_path, "a", "1\n");
     snap_id(&fx.b, Trigger::Manual);
     write(&fx.b_path, "b", "2\n");
     snap_id(&fx.b, Trigger::Manual);
     assert_eq!(
-        fx.b.upstream_status().unwrap(),
-        Some((2, 0)),
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(2),
         "two commits since the clone's implicit fetch"
     );
 
-    // A manual `git push` updates the tracking ref, so the local-only read
-    // detects a hand-resolved watch without any fetch.
+    // A manual `git push` updates the tracking ref too, so the push-time count
+    // stays accurate (zero) even for commits the user pushed by hand rather
+    // than through a fetch of ours.
     assert_eq!(fx.b.push(TEST_TIMEOUT).unwrap(), PushOutcome::Pushed);
     assert_eq!(
-        fx.b.upstream_status().unwrap(),
-        Some((0, 0)),
-        "a manual push reads as resolved, locally"
+        fx.b.ahead_of_upstream().unwrap(),
+        Some(0),
+        "a manual push moves the tracking ref, keeping the count accurate"
     );
 
-    // A never-pushed branch (no tracking ref): ahead by its whole history.
+    // A never-pushed branch (no tracking ref): ahead by its whole history —
+    // a trustworthy local read, so the push-time count applies there too.
     let origin2 = bare_origin();
     let (tmp2, backend2) = new_repo();
     git_ok(
@@ -1068,18 +1075,18 @@ fn upstream_status_counts_commits_since_the_last_fetch() {
     );
     write(tmp2.path(), "f", "x\n");
     snap_id(&backend2, Trigger::Manual);
-    assert_eq!(backend2.upstream_status().unwrap(), Some((1, 0)));
+    assert_eq!(backend2.ahead_of_upstream().unwrap(), Some(1));
 }
 
 #[test]
-fn a_deleted_remote_branch_reports_upstream_missing_with_the_full_history_count() {
+fn a_deleted_remote_branch_flags_the_stale_tracking_ref_with_the_full_history_count() {
     // The remote branch is deleted after a normal synced state: the next fetch
-    // reports the missing remote ref via `upstream_missing`, with ahead = the
-    // FULL history (what the next push recreates). ZERO mutation: the stale
-    // tracking ref is deliberately left alone (deleting it from this lock-free
-    // path would run user reference-transaction hooks and race concurrent
-    // fetches); the flag is what tells callers not to trust local reads
-    // against it for this cycle.
+    // reports the missing remote ref via `stale_tracking_ref` (a local tracking
+    // ref survives from before the deletion), with ahead = the FULL history
+    // (what the next push recreates). ZERO mutation: the stale tracking ref is
+    // deliberately left alone (deleting it from this lock-free path would run
+    // user reference-transaction hooks and race concurrent fetches); the flag
+    // is what tells callers not to trust local reads against it for this cycle.
     let fx = remote_fixture();
     // `b` synced at the base commit, tracking ref present. Add one local commit.
     write(&fx.b_path, "extra.txt", "x\n");
@@ -1090,7 +1097,10 @@ fn a_deleted_remote_branch_reports_upstream_missing_with_the_full_history_count(
     git_ok(fx._origin.path(), &["update-ref", "-d", "refs/heads/main"]);
 
     let state = fx.b.fetch(TEST_TIMEOUT).unwrap();
-    assert!(state.upstream_missing, "the deletion is reported as a fact");
+    assert!(
+        state.stale_tracking_ref,
+        "the surviving pre-deletion tracking ref is flagged"
+    );
     assert_eq!(
         (state.ahead, state.behind),
         (2, 0),

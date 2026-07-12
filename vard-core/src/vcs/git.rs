@@ -632,18 +632,20 @@ impl VcsBackend for GitBackend {
                 // The branch does not exist on the remote: a normal state — it
                 // was never pushed, or it was deleted remotely. Everything
                 // local is "ahead" (the next push [re]creates it); there is
-                // nothing to be behind. `upstream_missing` carries the fact so
-                // callers know a locally-readable tracking ref may be a stale
-                // pre-deletion leftover: this lock-free path deliberately
-                // mutates NO refs (no prune — a ref deletion would run user
-                // reference-transaction hooks from the daemon and race
-                // concurrent user fetches and a peer's locked reconcile).
+                // nothing to be behind. When a LOCAL tracking ref survives
+                // (the deleted-remote case, not a first push),
+                // `stale_tracking_ref` tells callers it is a stale pre-deletion
+                // leftover whose local reads must not be trusted: this
+                // lock-free path deliberately mutates NO refs (no prune — a
+                // ref deletion would run user reference-transaction hooks from
+                // the daemon and race concurrent user fetches and a peer's
+                // locked reconcile).
                 let ahead = self.commit_count(&format!("refs/heads/{}", self.branch))?;
                 return Ok(RemoteState {
                     remote_moved: false,
                     ahead,
                     behind: 0,
-                    upstream_missing: true,
+                    stale_tracking_ref: before.is_some(),
                 });
             }
             return Err(classify_failure("fetch", &out));
@@ -667,7 +669,7 @@ impl VcsBackend for GitBackend {
             remote_moved,
             ahead,
             behind,
-            upstream_missing: false,
+            stale_tracking_ref: false,
         })
     }
 
@@ -790,23 +792,23 @@ impl VcsBackend for GitBackend {
         Err(classify_failure("checkout", &out))
     }
 
-    fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
+    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
         // Local-only reads: the tracking ref is whatever the last fetch (or a
         // manual push, which also updates it) left. A never-pushed branch (no
-        // tracking ref) is ahead by its whole history and behind by nothing;
-        // an unborn local branch is behind by everything upstream.
+        // tracking ref) is ahead by its whole history; an unborn local branch
+        // is ahead by nothing.
         let tracking = format!("refs/remotes/{}/{}", self.remote, self.branch);
         if self.rev_of(&tracking)?.is_none() {
             let branch_ref = format!("refs/heads/{}", self.branch);
-            return Ok(Some((self.commit_count(&branch_ref)?, 0)));
+            return Ok(Some(self.commit_count(&branch_ref)?));
         }
         if self
             .rev_of(&format!("refs/heads/{}", self.branch))?
             .is_none()
         {
-            return Ok(Some((0, self.commit_count(&tracking)?)));
+            return Ok(Some(0));
         }
-        Ok(Some(self.ahead_behind(&tracking)?))
+        Ok(Some(self.ahead_behind(&tracking)?.0))
     }
 
     fn has_remote(&self) -> Result<bool, VcsError> {

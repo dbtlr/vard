@@ -128,10 +128,13 @@ pub enum Event {
         new_ref: String,
         /// How many commits the remote received in this push. On the push-only
         /// path this is resolved **at push time** (via
-        /// [`upstream_status`](crate::VcsBackend::upstream_status)), so
-        /// commits landing after the cycle's fetch are counted; on the
-        /// integrate path it is the fetch-time count plus the pre-sync
-        /// snapshot's commit.
+        /// [`ahead_of_upstream`](crate::VcsBackend::ahead_of_upstream)), so
+        /// commits landing after the cycle's fetch are counted — except when
+        /// the fetch found the branch deleted remotely with a stale tracking
+        /// ref surviving ([`stale_tracking_ref`](crate::RemoteState::stale_tracking_ref)),
+        /// where the fetch-time full-history count is used because the local
+        /// read is untrustworthy. On the integrate path it is the fetch-time
+        /// count plus the pre-sync snapshot's commit.
         commits: usize,
     },
     /// Remote changes were pulled into the local repository.

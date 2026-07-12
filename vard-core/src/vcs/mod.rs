@@ -244,20 +244,22 @@ pub trait VcsBackend {
         Ok(true)
     }
 
-    /// How the local branch relates to its remote-tracking ref **right now** —
-    /// `(ahead, behind)` as a cheap, local-only read (no network; the tracking
+    /// Counts how many commits the local branch is ahead of its remote-tracking
+    /// ref **right now** — a cheap, local-only read (no network; the tracking
     /// ref reflects the last fetch, and a manual `git push` updates it too).
     ///
     /// The sync engine's gate-free push resolves its commit count from this at
     /// push time, so commits landing after the cycle's fetch are counted —
-    /// EXCEPT when that fetch reported the upstream missing
-    /// ([`RemoteState::upstream_missing`]): the tracking ref may then be a
-    /// stale pre-deletion leftover, and the fetch-time count is used instead.
+    /// EXCEPT when that fetch reported the branch deleted remotely while a
+    /// stale tracking ref survives ([`RemoteState::stale_tracking_ref`]): the
+    /// local read is then untrustworthy and the fetch-time count is used
+    /// instead. A never-pushed branch (no tracking ref at all) counts its full
+    /// history here, which IS trustworthy.
     ///
     /// Returns `Ok(None)` when the backend has no such notion (the default);
-    /// callers must then fall back to their fetch-time knowledge. The values
-    /// are advisory (counts) — never a correctness gate.
-    fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
+    /// callers must then fall back to their fetch-time count. The count is
+    /// informational (events/rows) — never a correctness gate.
+    fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
         Ok(None)
     }
 
@@ -497,14 +499,15 @@ pub struct RemoteState {
     pub ahead: usize,
     /// How many commits the local branch is behind the upstream.
     pub behind: usize,
-    /// The remote reported that the branch does not exist there (never pushed,
-    /// or deleted remotely). `ahead` is then the branch's full history — what
-    /// the next push (re)creates — and a locally-readable tracking ref may be a
-    /// STALE leftover from before the deletion: local reads against it
-    /// ([`VcsBackend::upstream_status`]) must not be trusted for this cycle.
+    /// The remote reported the branch missing while a LOCAL tracking ref still
+    /// exists — the deleted-remote-branch case. `ahead` is then the branch's
+    /// full history (what the next push recreates) and the surviving tracking
+    /// ref is a stale pre-deletion leftover: local reads against it
+    /// ([`VcsBackend::ahead_of_upstream`]) must not be trusted for this cycle.
     /// The flag carries that truth instead of any ref being mutated outside a
-    /// locked window.
-    pub upstream_missing: bool,
+    /// locked window. A never-pushed branch (missing remotely, no tracking ref
+    /// locally either) does NOT set this — its local reads are trustworthy.
+    pub stale_tracking_ref: bool,
 }
 
 /// The result of a single [`VcsBackend::reconcile`] attempt.

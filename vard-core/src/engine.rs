@@ -1865,16 +1865,17 @@ impl Worker {
             }
             // Count what this push actually sends at PUSH time when the backend
             // can (commits may have landed since the fetch); fall back to the
-            // fetch-time count. When the remote reported the branch MISSING
-            // (never pushed, or deleted remotely) the fetch-time count is the
-            // recreate-the-branch truth and a local tracking ref may be a stale
-            // pre-deletion leftover, so `upstream_status` must not be consulted.
-            let pushed = if remote.upstream_missing {
+            // fetch-time count. The one exception is a branch deleted remotely
+            // with a stale tracking ref surviving: the local read is then
+            // untrustworthy, and the fetch-time count (the full history this
+            // push recreates) is the truth. A never-pushed branch has no
+            // tracking ref, so its push-time read is trustworthy as usual.
+            let pushed = if remote.stale_tracking_ref {
                 remote.ahead
             } else {
-                sync_upstream_status(Arc::clone(&self.backend))
+                sync_ahead_of_upstream(Arc::clone(&self.backend))
                     .await
-                    .map_or(remote.ahead, |(ahead, _)| ahead)
+                    .unwrap_or(remote.ahead)
             };
             let tip = sync_current_tip(Arc::clone(&self.backend)).await;
             return self.push_step(tip, pushed, false).await;
@@ -2157,14 +2158,13 @@ async fn sync_current_tip(backend: SharedBackend) -> String {
         .unwrap_or_default()
 }
 
-/// Runs [`upstream_status`](VcsBackend::upstream_status) off the async runtime
-/// — the local-only `(ahead, behind)` read behind the gate-free push's
-/// at-push-time commit count and the gate-busy wait's hand-resolution check.
-/// **Best-effort**: a backend without the notion (the default `None`), an
-/// error, or a panic all yield `None`, and callers fall back to their
-/// fetch-time knowledge — the values are advisory, never a correctness gate.
-async fn sync_upstream_status(backend: SharedBackend) -> Option<(usize, usize)> {
-    tokio::task::spawn_blocking(move || backend.upstream_status().ok().flatten())
+/// Runs [`ahead_of_upstream`](VcsBackend::ahead_of_upstream) off the async
+/// runtime — the local-only read behind the gate-free push's at-push-time
+/// commit count. **Best-effort**: a backend without the notion (the default
+/// `None`), an error, or a panic all yield `None`, and the caller falls back
+/// to the fetch-time count — the count is advisory, never a correctness gate.
+async fn sync_ahead_of_upstream(backend: SharedBackend) -> Option<usize> {
+    tokio::task::spawn_blocking(move || backend.ahead_of_upstream().ok().flatten())
         .await
         .ok()
         .flatten()
@@ -3243,10 +3243,10 @@ mod tests {
         /// a side effect — models an edit saved WHILE the fetch was in flight,
         /// for pinning the pre-flight's fetch-then-dirty ordering (P4).
         dirty_after_fetch: Option<bool>,
-        /// What [`upstream_status`](VcsBackend::upstream_status) reports
-        /// (`None` = the trait default: the backend has no such notion, callers
-        /// fall back to their fetch-time knowledge).
-        upstream_now: Option<(usize, usize)>,
+        /// What [`ahead_of_upstream`](VcsBackend::ahead_of_upstream) reports
+        /// (`None` = the trait default: the backend has no such notion, the
+        /// push-time count falls back to the fetch-time one).
+        ahead_now: Option<usize>,
         snapshots: VecDeque<Scripted>,
         /// When set, every snapshot commits — models a backend that never
         /// reports a clean tree (used to prove the post-op re-check is bounded).
@@ -3283,7 +3283,7 @@ mod tests {
                     has_remote: true,
                     fail_has_remote: false,
                     dirty_after_fetch: None,
-                    upstream_now: None,
+                    ahead_now: None,
                     snapshots: VecDeque::new(),
                     always_commit: false,
                     always_fail: false,
@@ -3380,11 +3380,11 @@ mod tests {
             self.inner.lock().unwrap().dirty_after_fetch = Some(dirty);
         }
 
-        /// Scripts the local-only `(ahead, behind)` read
-        /// ([`upstream_status`](VcsBackend::upstream_status)) — the at-push-time
-        /// count and the gate-busy wait's hand-resolution check.
-        fn set_upstream_now(&self, ahead: usize, behind: usize) {
-            self.inner.lock().unwrap().upstream_now = Some((ahead, behind));
+        /// Scripts the local-only ahead read
+        /// ([`ahead_of_upstream`](VcsBackend::ahead_of_upstream)) — this feeds
+        /// ONLY the gate-free push's at-push-time commit count.
+        fn set_ahead_now(&self, ahead: usize) {
+            self.inner.lock().unwrap().ahead_now = Some(ahead);
         }
 
         /// Makes every snapshot commit, so the post-op re-check never converges
@@ -3440,8 +3440,8 @@ mod tests {
             Ok(inner.dirty)
         }
 
-        fn upstream_status(&self) -> Result<Option<(usize, usize)>, VcsError> {
-            Ok(self.inner.lock().unwrap().upstream_now)
+        fn ahead_of_upstream(&self) -> Result<Option<usize>, VcsError> {
+            Ok(self.inner.lock().unwrap().ahead_now)
         }
 
         fn has_remote(&self) -> Result<bool, VcsError> {
@@ -3552,7 +3552,7 @@ mod tests {
                     remote_moved: false,
                     ahead: 0,
                     behind: 0,
-                    upstream_missing: false,
+                    stale_tracking_ref: false,
                 }))
         }
 
@@ -3795,19 +3795,19 @@ mod tests {
             remote_moved: behind > 0,
             ahead,
             behind,
-            upstream_missing: false,
+            stale_tracking_ref: false,
         })
     }
 
-    /// A scripted fetch result for a branch the remote reports MISSING (never
-    /// pushed, or deleted remotely): ahead by `ahead` (the full local history),
+    /// A scripted fetch result for a branch DELETED remotely while a stale
+    /// local tracking ref survives: ahead by `ahead` (the full local history),
     /// with the flag set so the cycle must not trust local tracking-ref reads.
-    fn remote_missing_upstream(ahead: usize) -> Result<crate::vcs::RemoteState, VcsError> {
+    fn remote_with_stale_tracking(ahead: usize) -> Result<crate::vcs::RemoteState, VcsError> {
         Ok(crate::vcs::RemoteState {
             remote_moved: false,
             ahead,
             behind: 0,
-            upstream_missing: true,
+            stale_tracking_ref: true,
         })
     }
 
@@ -4821,10 +4821,10 @@ mod tests {
     async fn the_gate_free_push_counts_commits_at_push_time() {
         // Finding 3: commits landing between the fetch and the push are pushed —
         // the reported count must include them when the backend can count at
-        // push time (upstream_status), not the stale fetch-time `ahead`.
+        // push time (ahead_of_upstream), not the stale fetch-time `ahead`.
         let backend = FakeBackend::new();
         backend.script_fetch([remote(2, 0)]);
-        backend.set_upstream_now(3, 0); // one more commit landed after the fetch
+        backend.set_ahead_now(3); // one more commit landed after the fetch
         backend.script_push([Ok(PushOutcome::Pushed)]);
         let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
 
@@ -4850,16 +4850,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_missing_upstream_uses_the_fetch_time_count_not_the_stale_tracking_ref() {
+    async fn a_stale_tracking_ref_uses_the_fetch_time_count() {
         // Deleted-remote-branch scenario, zero-mutation variant: the fetch
-        // reports the branch missing (upstream_missing), so the push count is
-        // the fetch-time ahead (full history — what the push recreates) and the
-        // stale local tracking ref (poisoned here via upstream_status) is never
-        // consulted. No ref is mutated outside a locked window.
+        // reports the branch deleted with a stale tracking ref surviving
+        // (stale_tracking_ref), so the push count is the fetch-time ahead
+        // (full history — what the push recreates) and the stale local read
+        // (poisoned here via ahead_of_upstream) is never consulted. A
+        // never-pushed branch does NOT set the flag and keeps the push-time
+        // count. No ref is mutated outside a locked window.
         let backend = FakeBackend::new();
-        backend.script_fetch([remote_missing_upstream(2)]);
-        // A stale tracking ref would claim ahead == 1; it must be ignored.
-        backend.set_upstream_now(1, 0);
+        backend.script_fetch([remote_with_stale_tracking(2)]);
+        // The stale tracking ref would claim ahead == 1; it must be ignored.
+        backend.set_ahead_now(1);
         backend.script_push([Ok(PushOutcome::Pushed)]);
         let (tx, mut events) = spawn_sync_worker(Arc::clone(&backend), test_cfg());
 
