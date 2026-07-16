@@ -130,10 +130,10 @@ vard watch list --format json
 
 ## sync
 
-Syncing is **off by default** (a watch is local-only until you opt in). `vard watch sync <name|path>` is that one-step opt-in: it writes `sync = true` on the watch (preserving your comments and formatting) and then runs **one** sync cycle for it — the very cycle [`vard sync <name>`](sync.md) runs. The first cycle **is** the confirmation, reported honestly:
+Syncing is **off by default** (a watch is local-only until you opt in). `vard watch sync <name|path>` is that one-step opt-in: it writes `sync = true` on the watch (preserving your comments and formatting) and then triggers **one** sync cycle for it — the very dispatch [`vard sync <name>`](sync.md) uses. The first cycle **is** the confirmation, reported honestly, and — exactly like `vard sync` — *where* it runs and *what* is reported depend on whether the daemon is up:
 
-- **No daemon running:** the cycle runs in-process under the single-instance lock and the real per-watch outcome is reported (`pushed`, `pulled`, `synced`, or `up to date`).
-- **The daemon is running:** it owns the repositories, so the cycle is handed to it and the command reports the hand-off.
+- **No daemon running:** the cycle runs in-process under the single-instance lock and the command reports the **real per-watch outcome** (`pushed`, `pulled`, `synced`, or `up to date`).
+- **The daemon is running:** it owns the repositories, so the cycle is handed to it and runs **asynchronously**. The command reports only that the request was **queued** (`sync request for <name> handed to the running daemon`), not the cycle result — check the daemon log or [`status`](status.md) for the outcome.
 
 There is no prompt in either direction — invoking the command is the consent.
 
@@ -158,7 +158,12 @@ Add the remote (`git remote add origin <url>`), then re-run `vard watch sync not
 disabled syncing for watch notes
 ```
 
-The selector, error messages, and exit codes match `pause`/`resume`: a name or path selects the watch, and an unresolved selector exits 2. The enable path's exit code mirrors [`sync`](sync.md) — 0 when the confirmation cycle synced (or was `up to date`), 1 when the watch has no remote yet, 2 on an operational failure.
+The selector and its errors match `pause`/`resume`: a name or path selects the watch, and an unresolved selector exits 2. The enable path's exit code mirrors [`sync`](sync.md):
+
+- **No daemon:** `0` when the confirmation cycle synced or was `up to date`, `1` when the watch has no remote yet (or a reconcile conflict), `2` on an operational failure.
+- **Daemon running:** `0` once the request is **queued** (the actual outcome is asynchronous), `1` when the up-front check refuses (the watch has no configured remote yet), `2` when its repository cannot be opened.
+
+`--off` always exits `0` on success — it only writes the config and runs no cycle.
 
 ## Output contract
 
@@ -170,6 +175,12 @@ added watch notes → ~/notes
 
 ```json
 {"name":"notes","path":"~/notes","initialized":false,"relinked":false}
+```
+
+`add --sync` reports the add **and** its confirmation cycle. In the records and JSONL forms these appear back to back (the add result, then the sync rows). In the single-document **JSON** form the confirmation rows are folded into the one add object under a `sync` array, so stdout stays one parseable document:
+
+```json
+{"name":"notes","path":"~/notes","initialized":false,"relinked":false,"sync":[{"name":"notes","status":"up to date","detail":null,"commits":null,"ref":null}]}
 ```
 
 ## Exit codes
