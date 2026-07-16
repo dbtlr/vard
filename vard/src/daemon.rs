@@ -1163,7 +1163,19 @@ async fn supervise(
                 // consumed here and answered by that last-good config. A request
                 // naming a watch this reload just removed fails honestly (logged
                 // and skipped), which is correct.
-                process_requests(&paths, &handle, &watches);
+                //
+                // BUT `try_rebuild` is awaited, and an external write can land a
+                // NEWER config (plus its own request) during that window. The
+                // engine we just built is then already stale, so draining here
+                // would answer the newer request against it — the same
+                // silent-drop class, through the rebuild-duration window. Re-read
+                // the fingerprint and drain only when the on-disk config still
+                // matches what this reload settled on; if it moved again, leave
+                // the request queued for the next poll's pending-hold + reload
+                // (held, not lost — stale-expiry still backstops).
+                if config_fingerprint(&paths.config_file) == config_debounce.settled() {
+                    process_requests(&paths, &handle, &watches);
+                }
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
@@ -1562,6 +1574,16 @@ impl ConfigDebounce {
     fn change_pending(&self) -> bool {
         self.pending.is_some()
     }
+
+    /// The fingerprint currently settled (the last confirmed change, or the
+    /// initial value). After an *awaited* rebuild the supervisor compares this
+    /// to the on-disk fingerprint before draining a deferred request: if the
+    /// config changed again while `try_rebuild` was in flight, the just-built
+    /// engine is already stale, so draining is skipped and the request is left
+    /// queued for the next poll's pending-hold and reload.
+    fn settled(&self) -> Option<ConfigFingerprint> {
+        self.stable
+    }
 }
 
 /// Exponential backoff for source-died rebuilds: doubles from a base toward a
@@ -1810,6 +1832,47 @@ mod tests {
         assert!(d.change_pending());
         assert!(!d.poll(Some(h1))); // back to the settled value h1
         assert!(!d.change_pending(), "a reverted change clears pending");
+    }
+
+    #[test]
+    fn settled_tracks_the_confirmed_fingerprint_for_the_post_rebuild_recheck() {
+        // The Reload arm drains a deferred request only when the on-disk config
+        // still matches what the reload settled on. This exercises that seam: a
+        // real config file drives the fingerprints, and `settled()` tracks the
+        // confirmed value — a NEWER write (the in-flight-rebuild window) differs
+        // from it, so the recheck (`config_fingerprint(disk) == settled()`) is
+        // false and the drain is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "version = 1\n").unwrap();
+        let fp0 = config_fingerprint(&cfg);
+        let mut d = ConfigDebounce::new(fp0);
+        assert_eq!(
+            d.settled(),
+            fp0,
+            "settled starts at the initial fingerprint"
+        );
+
+        // A change settles after its confirming poll; settled then tracks it.
+        std::fs::write(&cfg, "version = 1\n# edit A\n").unwrap();
+        let fp1 = config_fingerprint(&cfg);
+        assert!(!d.poll(fp1), "first sighting: pending, not settled");
+        assert!(d.poll(fp1), "second sighting: settles");
+        assert_eq!(d.settled(), fp1, "settled now tracks the confirmed change");
+        assert_eq!(
+            config_fingerprint(&cfg),
+            d.settled(),
+            "unchanged disk matches settled: the reload arm would drain"
+        );
+
+        // A newer write during the rebuild window no longer matches settled, so
+        // the recheck skips the drain (the request stays queued).
+        std::fs::write(&cfg, "version = 1\n# edit B (newer)\n").unwrap();
+        assert_ne!(
+            config_fingerprint(&cfg),
+            d.settled(),
+            "a newer write differs from settled: the reload arm would skip the drain"
+        );
     }
 
     // --- config fingerprint (VRD-35) -------------------------------------------
