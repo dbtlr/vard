@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
-use common::{Env, stderr, stdout};
+use common::{Env, code, stderr, stdout};
 
 /// Runs `git <args>` against the throwaway global git config, asserting success.
 fn run_git(git_config: &Path, args: &[&str]) {
@@ -604,5 +604,352 @@ fn add_registers_a_linked_worktree_writing_the_shared_exclude() {
         stdout(&list).contains("\"name\":\"wt\""),
         "got: {}",
         stdout(&list)
+    );
+}
+
+// --- sync opt-in (VRD-40) --------------------------------------------------
+
+#[test]
+fn watch_sync_enables_and_confirms_against_a_no_remote_repo() {
+    // The opt-in gesture: `watch sync <name>` writes sync = true, then runs one
+    // confirmation cycle. A repo with no configured remote is still enabled; the
+    // cycle honestly reports the missing remote (proving it ran for this watch)
+    // and the records output points at `git remote add`, exiting 1.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["--format", "records", "watch", "sync", "notes"]);
+    assert_eq!(
+        code(&out),
+        1,
+        "no-remote confirmation exits 1: {}",
+        stderr(&out)
+    );
+    assert!(
+        env.config_text().contains("sync = true"),
+        "enable must persist sync = true: {}",
+        env.config_text()
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("name     notes") && text.contains("status   disabled"),
+        "the cycle must run and report the notes watch: {text}"
+    );
+    assert!(
+        text.contains("no remote \"origin\" in the repository"),
+        "the no-remote reason must appear: {text}"
+    );
+    assert!(
+        text.contains("git remote add origin"),
+        "the records output must point at how to add a remote: {text}"
+    );
+}
+
+#[test]
+fn watch_sync_off_pins_sync_false_and_runs_no_cycle() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    env.vard(&["watch", "sync", "notes"]);
+
+    let out = env.vard(&["--format", "records", "watch", "sync", "notes", "--off"]);
+    assert!(out.status.success(), "--off must exit 0: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("disabled syncing for watch notes"),
+        "off reports plainly, no sync cycle: {}",
+        stdout(&out)
+    );
+    let cfg = env.config_text();
+    assert!(
+        cfg.contains("sync = false"),
+        "off must pin sync = false: {cfg}"
+    );
+    assert!(
+        !cfg.contains("sync = true"),
+        "no stale sync = true key: {cfg}"
+    );
+}
+
+#[test]
+fn watch_sync_selects_by_path() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    // By path (not name): the write must land on the notes watch.
+    let out = env.vard(&[
+        "--format",
+        "json",
+        "watch",
+        "sync",
+        path.to_str().unwrap(),
+        "--off",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("\"sync\":false"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert!(env.config_text().contains("sync = false"));
+}
+
+#[test]
+fn watch_sync_unknown_watch_is_an_error() {
+    // Consistent with pause/resume/remove: an unresolved selector exits 2 and
+    // names the selector.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["watch", "sync", "ghost"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("ghost"), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn watch_sync_enable_is_idempotent() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    env.vard(&["watch", "sync", "notes"]);
+    env.vard(&["watch", "sync", "notes"]);
+    let cfg = env.config_text();
+    assert_eq!(
+        cfg.matches("sync =").count(),
+        1,
+        "re-enabling must not duplicate the sync key: {cfg}"
+    );
+    assert!(cfg.contains("sync = true"), "got: {cfg}");
+}
+
+#[test]
+fn add_sync_writes_sync_true_in_the_new_entry() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    // The repo has no remote, so the confirmation cycle reports disabled (exit
+    // 1); the entry write is what this test asserts.
+    let out = env.vard(&[
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+        "--sync",
+    ]);
+    assert!(
+        env.config_text().contains("sync = true"),
+        "add --sync must write sync = true: {}",
+        env.config_text()
+    );
+    // The add itself succeeded; the confirmation cycle then flagged the missing
+    // remote (exit 1). Either way the write landed.
+    assert!(
+        stdout(&out).contains("added watch notes") || code(&out) == 1,
+        "stdout: {} / stderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+}
+
+#[test]
+fn add_sync_json_is_a_single_document() {
+    // Finding 2: `add --sync --format json` must fold the confirmation cycle
+    // into the single add object (nested under "sync"), never emit two
+    // top-level documents.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    let out = env.vard(&[
+        "--format",
+        "json",
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+        "--sync",
+    ]);
+    let s = stdout(&out);
+    let trimmed = s.trim();
+    // Compact JSON is a single line; two documents would be two lines (or two
+    // objects concatenated). Assert exactly one object carrying nested rows.
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "expected a single JSON document, got: {s}"
+    );
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "not one object: {s}"
+    );
+    assert!(
+        trimmed.contains(r#""sync":["#),
+        "the confirmation rows must be nested under \"sync\": {s}"
+    );
+    assert!(
+        trimmed.contains(r#""name":"notes""#),
+        "the add fields must be present: {s}"
+    );
+    // Lightweight balance check (no JSON parser in the test deps).
+    let opens = trimmed.matches('{').count() + trimmed.matches('[').count();
+    let closes = trimmed.matches('}').count() + trimmed.matches(']').count();
+    assert_eq!(opens, closes, "unbalanced JSON delimiters: {s}");
+}
+
+#[test]
+fn add_sync_conflicts_with_no_sync() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    let out = env.vard(&[
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+        "--sync",
+        "--no-sync",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("cannot be used with"),
+        "clap conflict message expected: {}",
+        stderr(&out)
+    );
+    // Nothing was written.
+    assert!(env.config_text().is_empty());
+}
+
+#[test]
+fn add_hint_present_on_plain_add_absent_with_sync_and_defaults() {
+    // Records-form plain add prints exactly one opt-in hint; --sync suppresses
+    // it (that add runs the confirmation cycle instead), and a defaults.sync =
+    // true config suppresses it (syncing resolves on).
+    let env = Env::new();
+    let plain = repo(&env, "plain");
+    let out = env.vard(&[
+        "--format",
+        "records",
+        "watch",
+        "add",
+        plain.to_str().unwrap(),
+        "--name",
+        "plain",
+    ]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("syncing is off — enable with: vard watch sync plain"),
+        "plain add must print the opt-in hint: {text}"
+    );
+
+    // --sync: no hint (the cycle is the confirmation).
+    let synced = repo(&env, "synced");
+    let out = env.vard(&[
+        "--format",
+        "records",
+        "watch",
+        "add",
+        synced.to_str().unwrap(),
+        "--name",
+        "synced",
+        "--sync",
+    ]);
+    assert!(
+        !stdout(&out).contains("syncing is off"),
+        "an --sync add must not print the hint: {}",
+        stdout(&out)
+    );
+
+    // JSON form: the hint is records-only.
+    let jpath = repo(&env, "asjson");
+    let out = env.vard(&[
+        "--format",
+        "json",
+        "watch",
+        "add",
+        jpath.to_str().unwrap(),
+        "--name",
+        "asjson",
+    ]);
+    assert!(
+        !stdout(&out).contains("syncing is off"),
+        "the hint must not appear in the machine form: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn relink_preserving_a_sync_pin_suppresses_the_off_hint() {
+    // Re-adding an existing `sync = true` watch at a new path (a relink) with no
+    // --sync preserves the pin; the opt-in hint must read the EFFECTIVE sync and
+    // stay silent — not falsely claim "syncing is off".
+    let env = Env::new();
+    let first = repo(&env, "one");
+    // Enable syncing on the watch. The repo has no remote, so the confirmation
+    // cycle exits 1, but the write lands `sync = true` regardless.
+    env.vard(&[
+        "watch",
+        "add",
+        first.to_str().unwrap(),
+        "--name",
+        "w",
+        "--sync",
+    ]);
+    assert!(
+        env.config_text().contains("sync = true"),
+        "setup: sync pin not written: {}",
+        env.config_text()
+    );
+
+    // Relink to a new path, records form, no --sync.
+    let second = repo(&env, "two");
+    let out = env.vard(&[
+        "--format",
+        "records",
+        "watch",
+        "add",
+        second.to_str().unwrap(),
+        "--name",
+        "w",
+    ]);
+    assert!(out.status.success(), "relink failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("relinked watch w"),
+        "expected a relink: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("syncing is off"),
+        "a relink preserving sync = true must not print the off hint: {}",
+        stdout(&out)
+    );
+    // The preserved pin survived the relink.
+    assert!(
+        env.config_text().contains("sync = true"),
+        "the relink must preserve the sync pin: {}",
+        env.config_text()
+    );
+}
+
+#[test]
+fn add_hint_absent_when_defaults_sync_is_on() {
+    let env = Env::new();
+    write_config(&env, "version = 1\n\n[defaults]\nsync = true\n");
+    let path = repo(&env, "notes");
+    let out = env.vard(&[
+        "--format",
+        "records",
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("syncing is off"),
+        "defaults.sync = true resolves sync on, so no hint: {}",
+        stdout(&out)
     );
 }

@@ -9,7 +9,9 @@ Reconcile a watch with its remote now: fetch the remote, reconcile local and rem
 
 The reconcile happens **out of tree**: local history is rebased onto the fetched remote inside a scratch worktree, never the working tree. A sync can never destroy uncommitted work: any uncommitted local work is committed by a pre-sync snapshot before it can be moved, and the step that makes the reconciled history live **refuses and retries rather than overwriting** if a local change (or a commit raced onto the branch) would be clobbered. The working tree only ever moves between fully-committed states.
 
-Syncing is **off by default**, so it must be enabled for the watch — set its `sync` key (or `defaults.sync`) to `true`, with a `branch` and `remote` configured — and its repository must actually have that remote. The remote is checked **live**, when the cycle runs (a cheap, non-network config lookup), not once at startup: a remote added after the daemon started is picked up on the next sync with no restart, and a request on a remote-less watch is answered honestly rather than silently dropped.
+Syncing is **off by default**, so it must be enabled for the watch — the one-step way is [`vard watch sync <name>`](watch.md#sync), which writes `sync = true` and runs a first confirming cycle; you can also set the `sync` key (or `defaults.sync`) to `true` by hand. Either way, a `branch` and `remote` must be configured, and the repository must actually have that remote. The remote is checked **live**, when the cycle runs (a cheap, non-network config lookup), not once at startup: a remote added after the daemon started is picked up on the next sync with no restart, and a request on a remote-less watch is answered honestly rather than silently dropped.
+
+> **Upgrading from a default-on build:** syncing used to be **on** by default; it is now off unless explicitly enabled (`DEFAULT_SYNC` flipped off). A watch that relied on the old default now needs a one-time opt-in — run `vard watch sync <name>` for it (or set `sync = true` in the config). Watches that already set `sync = true` explicitly are unaffected.
 
 With **no selector**, every sync-enabled watch gets a row: non-paused ones are synced; a paused one appears as an informational `paused` row (it is not synced, exactly as the daemon does not supervise it — and does not by itself change the exit code); one whose repository lacks the configured remote appears as an informational `disabled` row whose `detail` names the missing remote. Neither informational row makes the command fail — if every sync-enabled watch is paused, the command reports the paused rows and exits `0`. Asking for a watch **by name** that has syncing disabled, is paused (a paused watch never syncs, with or without a daemon), or whose repository has no such remote is reported and exits `1`.
 
@@ -73,6 +75,7 @@ vard sync notes --format json
 
 ## See also
 
+- [`watch sync`](watch.md#sync) — the one-step opt-in that turns syncing on for a watch and confirms it.
 - [`run`](run.md) — the daemon that syncs automatically.
 - [`snapshot`](snapshot.md) — commit local state; a successful snapshot also triggers a sync.
 - [`status`](status.md) — see whether a watch is `conflicted` or `sync-error`.

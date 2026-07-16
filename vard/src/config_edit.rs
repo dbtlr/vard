@@ -58,9 +58,11 @@ pub(crate) struct WatchEntry {
     pub interval: Option<String>,
     /// Explicit `quiesce` humantime string, when `--quiesce` was given.
     pub quiesce: Option<String>,
-    /// Whether `--no-sync` was given: writes `sync = false`. `false` leaves the
-    /// key unset so the watch inherits the default.
-    pub no_sync: bool,
+    /// An explicit `sync` pin to write, or `None` to leave the key unset so the
+    /// watch inherits the default. `--no-sync` sets `Some(false)` and `--sync`
+    /// sets `Some(true)`; both are explicit pins that also override
+    /// `defaults.sync`.
+    pub sync: Option<bool>,
 }
 
 /// Reads and parses `path` into an editable document, preserving all
@@ -193,8 +195,8 @@ fn apply_optional_fields(table: &mut Table, entry: &WatchEntry) {
     if let Some(quiesce) = &entry.quiesce {
         table["quiesce"] = value(quiesce.clone());
     }
-    if entry.no_sync {
-        table["sync"] = value(false);
+    if let Some(sync) = entry.sync {
+        table["sync"] = value(sync);
     }
 }
 
@@ -226,6 +228,25 @@ pub(crate) fn set_paused(doc: &mut DocumentMut, name: &str, paused: bool) -> boo
     } else {
         table.remove("paused");
     }
+    true
+}
+
+/// Writes an explicit `sync = <enabled>` on the watch named `name`, relocating
+/// it inside the document. Unlike [`set_paused`]'s resume (which removes the
+/// key), *both* values are written explicitly: `sync = true` is the opt-in, and
+/// `sync = false` is a deliberate pin that overrides a `defaults.sync = true`.
+/// Overwriting an existing `sync` key is idempotent — `toml_edit` replaces the
+/// value in place, so re-enabling an already-enabled watch adds no duplicate.
+/// Returns `false` when no watch by that name is present.
+pub(crate) fn set_sync(doc: &mut DocumentMut, name: &str, enabled: bool) -> bool {
+    let tables = watch_tables_mut(doc);
+    let Some(index) = watch_index(tables, name) else {
+        return false;
+    };
+    let table = tables
+        .get_mut(index)
+        .expect("index just located in this document");
+    table["sync"] = value(enabled);
     true
 }
 
@@ -672,7 +693,7 @@ mod tests {
             name: "proj".to_string(),
             path: "/p".to_string(),
             branch: Some("backup".to_string()),
-            no_sync: true,
+            sync: Some(false),
             ..Default::default()
         };
         append_watch(&mut doc, &entry);
@@ -735,6 +756,52 @@ path = "/home/u/notes"
         // The first watch's block (everything before the B table) is untouched.
         let a_block = text.split("name = \"B\"").next().unwrap();
         assert!(!a_block.contains("paused"), "got: {text}");
+    }
+
+    #[test]
+    fn set_sync_writes_an_explicit_pin_both_ways() {
+        // Enabling writes `sync = true`; disabling writes an explicit `sync =
+        // false` (a pin, not a removal — it must beat a `defaults.sync = true`),
+        // preserving the rest of the file byte-for-byte.
+        let original = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+
+        assert!(set_sync(&mut doc, "w", true));
+        assert!(doc.to_string().contains("sync = true"), "{doc}");
+
+        assert!(set_sync(&mut doc, "w", false));
+        let text = doc.to_string();
+        assert!(
+            text.contains("sync = false"),
+            "disable must pin false: {text}"
+        );
+        assert!(!text.contains("sync = true"), "no stale true key: {text}");
+    }
+
+    #[test]
+    fn set_sync_is_idempotent_and_preserves_comments() {
+        // Re-enabling an already-enabled watch overwrites the value in place: no
+        // duplicate key, and surrounding comments survive.
+        let original =
+            "version = 1\n\n# keep me\n[[watch]]\nname = \"w\"\npath = \"/p\"\nsync = true\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+        assert!(set_sync(&mut doc, "w", true));
+        let text = doc.to_string();
+        assert_eq!(
+            text.matches("sync =").count(),
+            1,
+            "duplicate sync key: {text}"
+        );
+        assert!(text.contains("sync = true"), "{text}");
+        assert!(text.contains("# keep me"), "comment lost: {text}");
+    }
+
+    #[test]
+    fn set_sync_returns_false_for_a_vanished_watch() {
+        let mut doc = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!set_sync(&mut doc, "ghost", true));
     }
 
     #[test]

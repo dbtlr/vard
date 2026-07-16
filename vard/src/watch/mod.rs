@@ -31,10 +31,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use vard_core::{GitBackend, TriggerMode, WatchSpec};
+use vard_core::{GitBackend, TriggerMode, VcsBackend, WatchSpec};
 
-use crate::cli::{ColorWhen, OutputFormat, WatchAddArgs, WatchCommand, WatchRemoveArgs};
-use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, finish};
+use crate::cli::{
+    ColorWhen, OutputFormat, SyncArgs, WatchAddArgs, WatchCommand, WatchRemoveArgs, WatchSyncArgs,
+};
+use crate::command::{
+    CmdError, CmdResult, OutCtx, emit_action, emit_records, finish, finish_write,
+};
 use crate::config::{Config, ResolvedWatch, WatchConfig, expand_tilde};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::instance::{CliLock, InstanceLock};
@@ -85,6 +89,7 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
         WatchCommand::List => cmd_list(&paths, &out),
         WatchCommand::Pause(args) => cmd_set_paused(&paths, &out, &args.target, true),
         WatchCommand::Resume(args) => cmd_set_paused(&paths, &out, &args.target, false),
+        WatchCommand::Sync(args) => cmd_sync(&paths, &out, &args, color, format),
     };
 
     finish(result)
@@ -157,13 +162,15 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     let interval = opt_duration(args.interval.as_deref())?;
     let quiesce = opt_duration(args.quiesce.as_deref())?;
     let trigger = args.trigger.map(|t| t.as_str());
+    // The explicit `sync` pin the entry will carry (see [`add_sync_pin`]).
+    let sync_pin = add_sync_pin(args.sync, args.no_sync);
     validate_watch(
         &name,
         &canonical,
         trigger,
         interval,
         quiesce,
-        args.no_sync,
+        sync_pin,
         args.remote.as_deref(),
         args.branch.as_deref(),
     )?;
@@ -176,7 +183,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
 
     // Serialize the whole read→plan→mutate→write cycle against concurrent
     // `vard watch` writers, so lost updates and stale relocations cannot race.
-    let _lock = ConfigLock::acquire(&paths.config_file)?;
+    let config_lock = ConfigLock::acquire(&paths.config_file)?;
 
     // Decide append-vs-relink against the current config, and load the editable
     // document, *before* any git init or exclude side effects — so a rejected
@@ -207,7 +214,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         trigger: trigger.map(str::to_string),
         interval: args.interval.clone(),
         quiesce: args.quiesce.clone(),
-        no_sync: args.no_sync,
+        sync: sync_pin,
     };
 
     match registration {
@@ -224,6 +231,13 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     // can never take a valid config to invalid and wedge the daemon's reloads.
     let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit.as_deref())?;
 
+    // The config write is durable now, and nothing below writes the config, so
+    // release the writer lock BEFORE the `--sync` confirmation cycle — otherwise
+    // a no-daemon confirmation would hold the config lock across a network
+    // fetch/reconcile/push, blocking every other `vard watch` writer for its
+    // duration. (The `vard watch sync` verb already scopes its lock this way.)
+    drop(config_lock);
+
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
     let record = Record {
@@ -235,8 +249,65 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
             RecordField::bool("relinked", relinked),
         ],
     };
+    // `--sync` reports the add result and its confirmation cycle together (folded
+    // into one document in the JSON form); the plain path emits the add result
+    // now, surfaces any still-invalid warning, and — when syncing stays off —
+    // prints the opt-in hint.
+    if args.sync {
+        return confirm_add_sync(paths, out, human, record, warning, &name);
+    }
+
     emit_action(out, &human, &record)?;
-    warning.map_or(Ok(()), Err)
+    // A write that landed but left the config still-invalid carries an attention
+    // warning; surface it now.
+    if let Some(w) = warning {
+        return Err(w);
+    }
+
+    // No `--sync`: when syncing resolves off for the resulting watch, print
+    // exactly one hint pointing at the opt-in verb. Records form only — the
+    // machine forms already carry the effective `sync` value via `watch list`.
+    // An explicit `--no-sync` suppresses it (the user just chose local-only),
+    // and the check reads the watch's EFFECTIVE sync after the write, so a
+    // relink that preserved a `sync = true` pin — or a `defaults.sync = true` —
+    // correctly suppresses it too rather than falsely claiming "syncing is off".
+    if !args.no_sync
+        && matches!(out.format, OutputFormat::Records)
+        && resulting_watch_syncs(paths, &name) == Some(false)
+    {
+        let mut w = io::stdout().lock();
+        let _ = writeln!(w, "syncing is off — enable with: vard watch sync {name}");
+    }
+    Ok(())
+}
+
+/// The explicit `sync` pin an `add` writes, from its `--sync` / `--no-sync`
+/// flags: `--sync` pins `true`, `--no-sync` pins `false`, and neither leaves the
+/// key unset (`None`) so the watch inherits `defaults.sync`. The two flags
+/// conflict at the clap layer, so at most one is ever set here.
+fn add_sync_pin(sync: bool, no_sync: bool) -> Option<bool> {
+    if sync {
+        Some(true)
+    } else if no_sync {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The resulting watch's EFFECTIVE `sync` after an `add` write — its own
+/// `sync` pin (an explicit `--no-sync`/`--sync`, or one preserved through a
+/// relink) resolved over `defaults.sync` and the core default. `Some(false)`
+/// gates the opt-in hint; `None` on any load/resolve failure suppresses the
+/// hint rather than risk a misleading claim. Reads the post-write config, so a
+/// relink that preserved a `sync = true` pin is seen as on.
+fn resulting_watch_syncs(paths: &WatchPaths, name: &str) -> Option<bool> {
+    let config = load_config(&paths.config_file).ok()??;
+    let resolved = config.resolve_all().ok()?;
+    resolved
+        .iter()
+        .find(|rw| rw.spec.name().eq_ignore_ascii_case(name))
+        .map(|rw| rw.spec.sync())
 }
 
 /// Resolves the repository decision for `path` *without holding the config
@@ -319,9 +390,18 @@ fn prompt_init(path: &Path) -> Result<bool, CmdError> {
     ))
 }
 
-/// Validates the watch against vard-core's invariants by building (and
-/// discarding) a [`WatchSpec`]. This surfaces a bad name, duration, or trigger
-/// with the same message the daemon would give, before anything is written.
+/// Validates the watch against vard-core's invariants by building a
+/// [`WatchSpec`]. This surfaces a bad name, duration, or trigger with the same
+/// message the daemon would give, before anything is written; the built spec is
+/// returned so callers (and the regression test) can inspect the resolved
+/// values.
+///
+/// `sync` is the explicit pin to be written (`None` leaves the key unset so the
+/// watch inherits the default). It is applied to the builder *only when set*, so
+/// validation mirrors the effective value being written: an absent flag no
+/// longer forces `sync = true` onto the validated spec (the pre-fix
+/// `sync(!no_sync)` did), which never matched the config the edit actually
+/// produces.
 #[allow(clippy::too_many_arguments)]
 fn validate_watch(
     name: &str,
@@ -329,10 +409,10 @@ fn validate_watch(
     trigger: Option<&str>,
     interval: Option<Duration>,
     quiesce: Option<Duration>,
-    no_sync: bool,
+    sync: Option<bool>,
     remote: Option<&str>,
     branch: Option<&str>,
-) -> Result<(), CmdError> {
+) -> Result<WatchSpec, CmdError> {
     let mut builder = WatchSpec::builder(name, path);
     if let Some(t) = trigger {
         let mode = t
@@ -346,7 +426,9 @@ fn validate_watch(
     if let Some(q) = quiesce {
         builder = builder.quiesce(q);
     }
-    builder = builder.sync(!no_sync);
+    if let Some(s) = sync {
+        builder = builder.sync(s);
+    }
     if let Some(r) = remote {
         builder = builder.remote(r);
     }
@@ -355,7 +437,6 @@ fn validate_watch(
     }
     builder
         .build()
-        .map(|_| ())
         .map_err(|e| CmdError::err(format!("invalid watch: {e}")))
 }
 
@@ -712,6 +793,174 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
     warning.map_or(Ok(()), Err)
 }
 
+// --- sync opt-in -----------------------------------------------------------
+
+/// `vard watch sync <name|path> [--off]` — the syncing opt-in gesture.
+///
+/// Without `--off`: writes `sync = true` on the watch (comment-preserving) and
+/// then runs one confirmation cycle through the exact `vard sync <name>`
+/// dispatch — the first cycle IS the confirmation. With `--off`: writes an
+/// explicit `sync = false` pin (which also overrides a `defaults.sync = true`)
+/// and runs no cycle, reporting plainly like pause/resume. The config write
+/// releases its lock before any cycle runs, since the cycle takes the separate
+/// instance lock.
+fn cmd_sync(
+    paths: &WatchPaths,
+    out: &OutCtx,
+    args: &WatchSyncArgs,
+    color: ColorWhen,
+    format: Option<OutputFormat>,
+) -> CmdResult {
+    let name = {
+        let _lock = ConfigLock::acquire(&paths.config_file)?;
+        let op = if args.off {
+            "disable syncing for"
+        } else {
+            "enable syncing for"
+        };
+        let config = require_config(paths, op)?;
+        let index = select::select_watch(&config, &args.target)
+            .map_err(|e| CmdError::err(e.to_string()))?;
+        let name = config.watches[index].name.clone();
+
+        let (mut doc, pre_edit) = config_edit::load_document_with_text(&paths.config_file)?
+            .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
+        if !config_edit::set_sync(&mut doc, &name, !args.off) {
+            return Err(CmdError::err(format!(
+                "watch {name:?} vanished from the config before it could be updated"
+            )));
+        }
+        // A write that lands but leaves the config still-invalid carries an
+        // attention warning; surface it and run no confirmation cycle against a
+        // config we could not fully validate.
+        if let Some(warning) =
+            config_edit::commit_document(&doc, &paths.config_file, Some(&pre_edit))?
+        {
+            return Err(warning);
+        }
+        name
+    }; // the config lock is released here, before any cycle takes the instance lock
+
+    if args.off {
+        let human = format!("disabled syncing for watch {name}");
+        let record = Record {
+            header: None,
+            fields: vec![
+                RecordField::str("name", &name),
+                RecordField::bool("sync", false),
+            ],
+        };
+        return emit_action(out, &human, &record);
+    }
+
+    confirm_sync(paths, out, &name, color, format)
+}
+
+/// Runs the confirmation sync cycle for a just-enabled watch through the exact
+/// `vard sync <name>` dispatch, then — in the records form only — points at how
+/// to add a remote when the watch has none (vard never creates remotes). Returns
+/// the cycle's own result, so `watch sync`'s (and `watch add --sync`'s) exit code
+/// mirrors `vard sync`.
+fn confirm_sync(
+    paths: &WatchPaths,
+    out: &OutCtx,
+    name: &str,
+    color: ColorWhen,
+    format: Option<OutputFormat>,
+) -> CmdResult {
+    let result = crate::cmd::sync::run_inner(
+        SyncArgs {
+            target: Some(name.to_string()),
+        },
+        color,
+        format,
+    );
+    print_missing_remote_hint(out, paths, name);
+    result
+}
+
+/// The `watch add --sync` confirmation: runs the same cycle as [`confirm_sync`]
+/// but through [`cmd::sync::collect`](crate::cmd::sync::collect), so the JSON
+/// form folds the cycle's rows into the single add object (`"sync": [...]`)
+/// rather than emitting a second top-level document. Records and JSONL emit the
+/// add result and the cycle output back to back (both formats allow multiple
+/// values), matching the standalone `vard sync` output.
+fn confirm_add_sync(
+    paths: &WatchPaths,
+    out: &OutCtx,
+    human: String,
+    add_record: Record,
+    warning: Option<CmdError>,
+    name: &str,
+) -> CmdResult {
+    // A write that landed still-invalid must not run a confirmation cycle; emit
+    // the add result plainly and surface the warning.
+    if let Some(w) = warning {
+        emit_action(out, &human, &add_record)?;
+        return Err(w);
+    }
+
+    let (result, emit) = crate::cmd::sync::collect(&SyncArgs {
+        target: Some(name.to_string()),
+    });
+
+    match out.format {
+        OutputFormat::Json => {
+            // One parseable document: the add object with the confirmation rows
+            // nested under `sync`.
+            let rows = emit.into_records();
+            let mut w = io::stdout().lock();
+            let write = record::write_json_object_with_records(&mut w, &add_record, "sync", &rows)
+                .and_then(|()| w.write_all(b"\n"));
+            finish_write(write)?;
+        }
+        OutputFormat::Jsonl => {
+            emit_action(out, &human, &add_record)?;
+            crate::cmd::sync::emit_sync(out, &emit)?;
+        }
+        OutputFormat::Records => {
+            emit_action(out, &human, &add_record)?;
+            crate::cmd::sync::emit_sync(out, &emit)?;
+            print_missing_remote_hint(out, paths, name);
+        }
+    }
+    result
+}
+
+/// In the records form, when `name`'s repository lacks its configured remote,
+/// print a one-line pointer at how to add it — vard never creates remotes. Best
+/// effort: a probe failure or a write error is silently dropped so it can never
+/// mask the confirmation cycle's own result.
+fn print_missing_remote_hint(out: &OutCtx, paths: &WatchPaths, name: &str) {
+    if !matches!(out.format, OutputFormat::Records) {
+        return;
+    }
+    if let Some(remote) = watch_missing_remote(paths, name) {
+        let mut w = io::stdout().lock();
+        let _ = writeln!(
+            w,
+            "  no {remote:?} remote in the repository yet — add one, then re-sync: \
+             git remote add {remote} <url>"
+        );
+    }
+}
+
+/// The watch's configured remote name when its repository does NOT define that
+/// remote, or `None` when it does (or the check could not run). Best-effort: any
+/// load/resolve/open failure yields `None`, so guidance is offered only when the
+/// remote is positively known missing — the confirmation cycle's own row is the
+/// authoritative outcome regardless.
+fn watch_missing_remote(paths: &WatchPaths, name: &str) -> Option<String> {
+    let config = load_config(&paths.config_file).ok()??;
+    let index = select::select_watch(&config, name).ok()?;
+    let mut resolved = config.resolve_all().ok()?;
+    let rw = resolved.swap_remove(index);
+    match vard_core::open_git_backend(&rw.spec).ok()?.has_remote() {
+        Ok(false) => Some(rw.spec.remote().to_string()),
+        Ok(true) | Err(_) => None,
+    }
+}
+
 // --- shared helpers --------------------------------------------------------
 
 /// Loads and validates the config, or `None` when the file does not exist.
@@ -895,6 +1144,33 @@ mod tests {
             Ok(true)
         )));
         assert!(!journal.path().exists(), "a clean journal is safe to purge");
+    }
+
+    #[test]
+    fn validate_watch_mirrors_the_effective_sync_value() {
+        // Regression for the `sync(!no_sync)` quirk: with no explicit pin the
+        // validated spec must NOT be forced to `sync = true` — it mirrors what
+        // the edit writes (an absent key, i.e. the core default), not a value the
+        // config never carries. An explicit pin is reflected faithfully.
+        let path = Path::new("/some/watch");
+        let sync_of = |pin| match validate_watch("w", path, None, None, None, pin, None, None) {
+            Ok(spec) => spec.sync(),
+            Err(e) => panic!("validate_watch rejected a valid watch: {}", e.message()),
+        };
+
+        assert_eq!(
+            sync_of(None),
+            vard_core::DEFAULT_SYNC,
+            "an absent pin must not force sync on"
+        );
+        assert!(
+            sync_of(Some(true)),
+            "an explicit sync=true pin validates on"
+        );
+        assert!(
+            !sync_of(Some(false)),
+            "an explicit sync=false pin validates off"
+        );
     }
 
     #[test]

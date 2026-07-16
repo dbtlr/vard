@@ -134,7 +134,8 @@ selectors accept either.
   remove  unregister a watch (never touching the repository or its history)
   list    show every watch and its settings
   pause   stop snapshotting a watch without unregistering it
-  resume  resume a paused watch")]
+  resume  resume a paused watch
+  sync    turn syncing on for a watch (or `--off` to turn it off) and confirm it")]
     Watch {
         /// The chosen watch subcommand. Absent (a bare `vard watch`) prints
         /// this command's short help.
@@ -626,6 +627,32 @@ Clears the watch's paused flag so the daemon resumes snapshotting it on its next
 reload. Resuming a watch that is not paused is a no-op. The watch may be named by \
 its stable name or by its path.")]
     Resume(WatchSelectArgs),
+
+    /// Turn syncing on for a watch and run a first sync to confirm, or `--off`
+    /// to turn it off.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Turn syncing on for a watch and immediately run one sync cycle to confirm it.
+
+Syncing is off by default — a new watch is local-only until you opt in. This is \
+that one-step opt-in: it writes `sync = true` on the watch in the config file \
+(preserving your comments and formatting) and then runs a single sync cycle for \
+it, the very cycle `vard sync <name>` runs. The first cycle IS the confirmation, \
+reported honestly: with no daemon running it runs in-process and reports the real \
+per-watch outcome (`pushed`, `pulled`, `synced`, or `up to date`); if the vard \
+daemon is running it owns the repositories, so the cycle is handed to it and the \
+command reports the hand-off.
+
+Opting in never creates a remote — vard does not touch remotes. A watch whose \
+repository has no configured remote is still enabled; the confirmation cycle \
+reports the missing remote and points at `git remote add <remote> <url>`. Add the \
+remote, then re-run to sync.
+
+`--off` turns syncing off instead: it writes an explicit `sync = false` — a pin \
+that also overrides a `defaults.sync = true` — and runs no cycle. There is no \
+prompt in either direction; invoking the command is the consent. The watch may be \
+named by its stable name or by its path.")]
+    Sync(WatchSyncArgs),
 }
 
 /// Arguments to `vard watch add`.
@@ -663,6 +690,11 @@ pub struct WatchAddArgs {
     #[arg(long = "no-sync")]
     pub no_sync: bool,
 
+    /// Enable syncing for the new watch and run a first sync to confirm it.
+    /// Conflicts with `--no-sync`.
+    #[arg(long, conflicts_with = "no_sync")]
+    pub sync: bool,
+
     /// If the directory is not a git repository, initialize one without
     /// prompting. The script-friendly escape hatch for non-interactive use.
     #[arg(long)]
@@ -688,6 +720,19 @@ pub struct WatchSelectArgs {
     /// The watch to act on, by name or by path.
     #[arg(value_name = "NAME|PATH")]
     pub target: String,
+}
+
+/// Arguments to `vard watch sync`.
+#[derive(Debug, Args)]
+pub struct WatchSyncArgs {
+    /// The watch to enable (or disable) syncing for, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// Turn syncing off instead: write an explicit `sync = false` and run no
+    /// sync cycle.
+    #[arg(long)]
+    pub off: bool,
 }
 
 /// Which automatic snapshot triggers a watch arms. The CLI mirror of
