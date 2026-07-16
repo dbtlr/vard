@@ -173,7 +173,7 @@ impl WatchSpec {
     /// [`Duration::ZERO`] disables the timer: the watch is not synced on a
     /// cadence, though push-driven (post-snapshot) and manual syncs are
     /// unaffected. A nonzero value is the base period; the engine jitters each
-    /// tick ±10% so a fleet never phase-locks (see the scheduler).
+    /// tick ±10%, de-correlating a fleet's cadence (see the scheduler).
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval
     }

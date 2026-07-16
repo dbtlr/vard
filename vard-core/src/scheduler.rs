@@ -223,7 +223,7 @@ fn jittered_period(base: Duration, fraction: f64, rng: &mut fastrand::Rng) -> Du
 /// instance runs per armed jittered schedule.
 ///
 /// Each period is a fresh [`jittered_period`] draw, so the cadence is
-/// activity-blind (like [`run_schedule`]) but never phase-locked across
+/// activity-blind (like [`run_schedule`]) but de-correlated across
 /// watches. The first tick is one jittered period after the loop starts, never
 /// at arm — the same anti-stampede rule as [`run_schedule`]. The next deadline
 /// is anchored off the wake (`Instant::now()`), not the deadline just met, so a
@@ -364,8 +364,8 @@ impl Scheduler {
     /// never at arm, a slept-through window collapsed to a single tick, no
     /// same-watch deduplication, and disarm on handle drop — differing only in
     /// the per-tick jitter (see the [module docs](self)). Each schedule seeds a
-    /// fresh independent [`fastrand::Rng`], so two watches armed together never
-    /// phase-lock.
+    /// fresh independent [`fastrand::Rng`], so two watches armed together draw
+    /// de-correlated cadences.
     ///
     /// Fails with [`SchedulerError::ZeroInterval`] if `period` is zero. A
     /// disabled pull timer (`sync_interval = 0`) is simply never armed by the
