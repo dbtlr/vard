@@ -121,6 +121,22 @@ grep -q 'sync = false' "$XDG_CONFIG_HOME/vard/config.toml" \
   || fail "vard watch sync --off did not pin sync = false"
 "$VARD" watch remove hintcheck </dev/null >/dev/null || fail "cleanup: remove hintcheck failed"
 
+# vard watch set (VRD-48): edit a setting on an existing watch, then clear it.
+# Help renders through the same v2 path, and a bare `set` with no flags is a
+# usage error.
+"$VARD" watch set -h | grep -q 'For full help, run' || fail "vard watch set -h missing the v2 short-help footer"
+"$VARD" watch set --help | grep -q 'settable' || fail "vard watch set --help missing its prose"
+"$VARD" watch set smoke --interval 45m </dev/null >/dev/null || fail "vard watch set failed"
+grep -q 'interval = "45m"' "$XDG_CONFIG_HOME/vard/config.toml" \
+  || fail "vard watch set did not persist interval = 45m"
+"$VARD" watch set smoke --unset interval </dev/null >/dev/null || fail "vard watch set --unset failed"
+if grep -q 'interval = "45m"' "$XDG_CONFIG_HOME/vard/config.toml"; then
+  fail "vard watch set --unset did not remove the interval key"
+fi
+if "$VARD" watch set smoke </dev/null >/dev/null 2>&1; then
+  fail "vard watch set with no flags must exit non-zero"
+fi
+
 # vard status (VRD-17): no daemon runs in the smoke env, so status reports the
 # stopped daemon and exits 1. With nothing monitoring it, the configured watch
 # projects to `unknown` (not `ok` — that would falsely imply it is being watched).

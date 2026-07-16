@@ -97,7 +97,7 @@ fn classify_key(key: &str, mode: KeyMode) -> Result<(), CmdError> {
                 "watch settings are inspected with `vard watch list`, not `vard config get`"
             }
             KeyMode::Write => {
-                "watch settings are not edited with `vard config`; use `vard watch add|remove|pause|resume`"
+                "watch settings are not edited with `vard config`; use `vard watch set` (or `vard watch add|remove|pause|resume`)"
             }
         }));
     }

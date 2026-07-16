@@ -152,7 +152,12 @@ fn set_on_a_watch_key_points_at_the_watch_verbs() {
     env.write_config("version = 1\n");
     let out = env.vard(&["config", "set", "watch.0.name", "notes"]);
     assert_eq!(code(&out), 2);
-    assert!(stderr(&out).contains("vard watch"), "got: {}", stderr(&out));
+    // The write pointer names the setting-editing verb specifically.
+    assert!(
+        stderr(&out).contains("vard watch set"),
+        "got: {}",
+        stderr(&out)
+    );
 }
 
 #[test]

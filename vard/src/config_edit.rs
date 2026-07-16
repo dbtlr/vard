@@ -58,6 +58,9 @@ pub(crate) struct WatchEntry {
     pub interval: Option<String>,
     /// Explicit `quiesce` humantime string, when `--quiesce` was given.
     pub quiesce: Option<String>,
+    /// Explicit `sync_interval` humantime string, when `--sync-interval` was
+    /// given (`0s` means the pull timer is off).
+    pub sync_interval: Option<String>,
     /// An explicit `sync` pin to write, or `None` to leave the key unset so the
     /// watch inherits the default. `--no-sync` sets `Some(false)` and `--sync`
     /// sets `Some(true)`; both are explicit pins that also override
@@ -195,6 +198,9 @@ fn apply_optional_fields(table: &mut Table, entry: &WatchEntry) {
     if let Some(quiesce) = &entry.quiesce {
         table["quiesce"] = value(quiesce.clone());
     }
+    if let Some(sync_interval) = &entry.sync_interval {
+        table["sync_interval"] = value(sync_interval.clone());
+    }
     if let Some(sync) = entry.sync {
         table["sync"] = value(sync);
     }
@@ -248,6 +254,42 @@ pub(crate) fn set_sync(doc: &mut DocumentMut, name: &str, enabled: bool) -> bool
         .expect("index just located in this document");
     table["sync"] = value(enabled);
     true
+}
+
+/// The `[[watch]]` table named `name` (matched case-insensitively), relocated
+/// inside the given document so an index from a different parse can never be
+/// used against it. `None` when no watch by that name is present.
+fn watch_table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> Option<&'a mut Table> {
+    let tables = watch_tables_mut(doc);
+    let index = watch_index(tables, name)?;
+    Some(
+        tables
+            .get_mut(index)
+            .expect("index just located in this document"),
+    )
+}
+
+/// Sets the string-valued scalar `key` on the watch named `name` (the settable
+/// `vard watch set` keys — `trigger`, `interval`, `quiesce`, `sync_interval`,
+/// `remote`, `branch` — are all TOML strings), preserving the rest of the file.
+/// Overwriting an existing value replaces it in place (no duplicate key).
+/// Returns `false` when no watch by that name is present.
+pub(crate) fn set_watch_field(doc: &mut DocumentMut, name: &str, key: &str, val: &str) -> bool {
+    let Some(table) = watch_table_mut(doc, name) else {
+        return false;
+    };
+    table[key] = value(val);
+    true
+}
+
+/// Removes the scalar `key` from the watch named `name`, so it re-inherits its
+/// default. `None` when no watch by that name is present; `Some(false)` when the
+/// watch does not set that key (the parity-with-`config unset` case the caller
+/// turns into an exit-2 report); `Some(true)` when the key was present and
+/// removed.
+pub(crate) fn unset_watch_field(doc: &mut DocumentMut, name: &str, key: &str) -> Option<bool> {
+    let table = watch_table_mut(doc, name)?;
+    Some(table.remove(key).is_some())
 }
 
 // --- generic dotted scalar keys (`vard config get/set/unset`) --------------
@@ -802,6 +844,49 @@ path = "/home/u/notes"
             .parse::<DocumentMut>()
             .unwrap();
         assert!(!set_sync(&mut doc, "ghost", true));
+    }
+
+    #[test]
+    fn set_watch_field_sets_and_overwrites_preserving_comments() {
+        // Setting a key writes it into the table; setting an existing key
+        // overwrites in place (no duplicate), and surrounding comments survive.
+        let original = "version = 1\n\n# keep me\n[[watch]]\nname = \"w\"\npath = \"/p\"\ninterval = \"15m\"\n";
+        let mut doc = original.parse::<DocumentMut>().unwrap();
+        assert!(set_watch_field(&mut doc, "w", "trigger", "both"));
+        assert!(set_watch_field(&mut doc, "w", "interval", "30m"));
+        let text = doc.to_string();
+        assert!(text.contains("trigger = \"both\""), "{text}");
+        assert!(text.contains("interval = \"30m\""), "{text}");
+        assert_eq!(
+            text.matches("interval =").count(),
+            1,
+            "duplicate key: {text}"
+        );
+        assert!(text.contains("# keep me"), "comment lost: {text}");
+    }
+
+    #[test]
+    fn set_watch_field_returns_false_for_a_vanished_watch() {
+        let mut doc = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!set_watch_field(&mut doc, "ghost", "trigger", "both"));
+    }
+
+    #[test]
+    fn unset_watch_field_reports_present_absent_and_vanished() {
+        let mut doc = "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/p\"\ninterval = \"15m\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        // Present ⇒ removed, Some(true); the sibling required keys survive.
+        assert_eq!(unset_watch_field(&mut doc, "w", "interval"), Some(true));
+        let text = doc.to_string();
+        assert!(!text.contains("interval"), "{text}");
+        assert!(text.contains("name = \"w\""), "{text}");
+        // A key the watch does not set ⇒ Some(false), for the caller's exit-2 report.
+        assert_eq!(unset_watch_field(&mut doc, "w", "interval"), Some(false));
+        // No such watch ⇒ None.
+        assert_eq!(unset_watch_field(&mut doc, "ghost", "interval"), None);
     }
 
     #[test]

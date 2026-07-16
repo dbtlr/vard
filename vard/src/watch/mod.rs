@@ -1,4 +1,4 @@
-//! The `vard watch` command set: add, remove, list, pause, resume.
+//! The `vard watch` command set: add, remove, list, set, pause, resume.
 //!
 //! These are the first commands that *mutate* vard's configuration. They edit
 //! `config.toml` in place through the comment-preserving
@@ -34,7 +34,8 @@ use std::time::Duration;
 use vard_core::{GitBackend, TriggerMode, VcsBackend, WatchSpec};
 
 use crate::cli::{
-    ColorWhen, OutputFormat, SyncArgs, WatchAddArgs, WatchCommand, WatchRemoveArgs, WatchSyncArgs,
+    ColorWhen, OutputFormat, SyncArgs, WatchAddArgs, WatchCommand, WatchRemoveArgs, WatchSetArgs,
+    WatchSyncArgs,
 };
 use crate::command::{
     CmdError, CmdResult, OutCtx, emit_action, emit_records, finish, finish_write,
@@ -87,6 +88,7 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
         WatchCommand::Add(args) => cmd_add(&paths, &out, args),
         WatchCommand::Remove(args) => cmd_remove(&paths, &out, args),
         WatchCommand::List => cmd_list(&paths, &out),
+        WatchCommand::Set(args) => cmd_set(&paths, &out, args),
         WatchCommand::Pause(args) => cmd_set_paused(&paths, &out, &args.target, true),
         WatchCommand::Resume(args) => cmd_set_paused(&paths, &out, &args.target, false),
         WatchCommand::Sync(args) => cmd_sync(&paths, &out, &args, color, format),
@@ -161,6 +163,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     // before touching the filesystem or config, so a bad flag fails cleanly.
     let interval = opt_duration(args.interval.as_deref())?;
     let quiesce = opt_duration(args.quiesce.as_deref())?;
+    let sync_interval = opt_duration(args.sync_interval.as_deref())?;
     let trigger = args.trigger.map(|t| t.as_str());
     // The explicit `sync` pin the entry will carry (see [`add_sync_pin`]).
     let sync_pin = add_sync_pin(args.sync, args.no_sync);
@@ -170,6 +173,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         trigger,
         interval,
         quiesce,
+        sync_interval,
         sync_pin,
         args.remote.as_deref(),
         args.branch.as_deref(),
@@ -214,6 +218,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         trigger: trigger.map(str::to_string),
         interval: args.interval.clone(),
         quiesce: args.quiesce.clone(),
+        sync_interval: args.sync_interval.clone(),
         sync: sync_pin,
     };
 
@@ -409,6 +414,7 @@ fn validate_watch(
     trigger: Option<&str>,
     interval: Option<Duration>,
     quiesce: Option<Duration>,
+    sync_interval: Option<Duration>,
     sync: Option<bool>,
     remote: Option<&str>,
     branch: Option<&str>,
@@ -425,6 +431,9 @@ fn validate_watch(
     }
     if let Some(q) = quiesce {
         builder = builder.quiesce(q);
+    }
+    if let Some(si) = sync_interval {
+        builder = builder.sync_interval(si);
     }
     if let Some(s) = sync {
         builder = builder.sync(s);
@@ -793,6 +802,147 @@ fn cmd_set_paused(paths: &WatchPaths, out: &OutCtx, target: &str, paused: bool) 
     warning.map_or(Ok(()), Err)
 }
 
+// --- set -------------------------------------------------------------------
+
+/// A validated `vard watch set` plan: the keys to set (with their new string
+/// values) and the keys to unset. Sets are collected in a fixed canonical order
+/// so the reported output is deterministic regardless of flag order. Built
+/// *before* the config lock is taken, so a bad value or a usage error fails
+/// without touching the file.
+struct SetPlan {
+    /// `(key, new value)` for each `--<key>` flag given, all TOML strings.
+    sets: Vec<(&'static str, String)>,
+    /// Each `--unset <key>`, deduped in first-seen order.
+    unsets: Vec<&'static str>,
+}
+
+impl SetPlan {
+    /// Validates and reconciles the flags into a plan, or returns a usage error
+    /// (exit 2): a bad duration, no change requested, or the same key both set
+    /// and unset.
+    fn from_args(args: &WatchSetArgs) -> Result<SetPlan, CmdError> {
+        // Sets, in canonical key order. Durations are parse-validated here (the
+        // same parse `watch add` applies) so a bad value fails cleanly before the
+        // lock; the raw spelling is what gets written, exactly as `add` writes it.
+        let mut sets: Vec<(&'static str, String)> = Vec::new();
+        if let Some(trigger) = args.trigger {
+            sets.push(("trigger", trigger.as_str().to_string()));
+        }
+        if let Some(interval) = &args.interval {
+            opt_duration(Some(interval))?;
+            sets.push(("interval", interval.clone()));
+        }
+        if let Some(quiesce) = &args.quiesce {
+            opt_duration(Some(quiesce))?;
+            sets.push(("quiesce", quiesce.clone()));
+        }
+        if let Some(sync_interval) = &args.sync_interval {
+            opt_duration(Some(sync_interval))?;
+            sets.push(("sync_interval", sync_interval.clone()));
+        }
+        if let Some(remote) = &args.remote {
+            sets.push(("remote", remote.clone()));
+        }
+        if let Some(branch) = &args.branch {
+            sets.push(("branch", branch.clone()));
+        }
+
+        // Unsets, deduped (a repeated `--unset trigger` is harmless).
+        let mut unsets: Vec<&'static str> = Vec::new();
+        for key in &args.unset {
+            let key = key.as_str();
+            if !unsets.contains(&key) {
+                unsets.push(key);
+            }
+        }
+
+        if sets.is_empty() && unsets.is_empty() {
+            return Err(CmdError::err(
+                "nothing to set: pass at least one of --trigger, --interval, --quiesce, \
+                 --sync-interval, --remote, --branch, or --unset <key>",
+            ));
+        }
+        // Setting and unsetting the same key in one invocation is a usage error.
+        if let Some((key, _)) = sets.iter().find(|(k, _)| unsets.contains(k)) {
+            return Err(CmdError::err(format!(
+                "cannot both set and --unset {key} in one command"
+            )));
+        }
+        Ok(SetPlan { sets, unsets })
+    }
+}
+
+/// `vard watch set <name|path>` — edit an existing watch's settings in place.
+///
+/// Applies each `--<key>` and `--unset <key>` to the watch's `[[watch]]` table
+/// through the comment-preserving editor, under the config lock, and validates
+/// the whole result before it lands (via [`config_edit::commit_document`]) — so a bad value
+/// leaves the config untouched and the daemon's reloads are never wedged. Sync,
+/// the paused flag, the path, and the name are not settable here (each has its
+/// own verb); the settable keys mirror `watch add`'s vocabulary.
+fn cmd_set(paths: &WatchPaths, out: &OutCtx, args: WatchSetArgs) -> CmdResult {
+    let plan = SetPlan::from_args(&args)?;
+
+    let _lock = ConfigLock::acquire(&paths.config_file)?;
+    let config = require_config(paths, "set")?;
+    let index =
+        select::select_watch(&config, &args.target).map_err(|e| CmdError::err(e.to_string()))?;
+    let name = config.watches[index].name.clone();
+
+    let (mut doc, pre_edit) = config_edit::load_document_with_text(&paths.config_file)?
+        .ok_or_else(|| CmdError::err("config file vanished while updating".to_string()))?;
+
+    let vanished = || {
+        CmdError::err(format!(
+            "watch {name:?} vanished from the config before it could be updated"
+        ))
+    };
+
+    // Apply the sets.
+    for (key, val) in &plan.sets {
+        if !config_edit::set_watch_field(&mut doc, &name, key, val) {
+            return Err(vanished());
+        }
+    }
+    // Apply the unsets. Removing a key the watch does not set is reported and
+    // exits 2 (parity with `vard config unset`) — and, because it returns before
+    // the commit below, the config is left untouched.
+    for key in &plan.unsets {
+        match config_edit::unset_watch_field(&mut doc, &name, key) {
+            None => return Err(vanished()),
+            Some(false) => {
+                return Err(CmdError::err(format!(
+                    "watch {name} does not set {key}; nothing to unset"
+                )));
+            }
+            Some(true) => {}
+        }
+    }
+
+    let warning = config_edit::commit_document(&doc, &paths.config_file, Some(&pre_edit))?;
+
+    // Report the applied changes: a one-line summary in the records form, and a
+    // single flat object in the machine forms — the watch name plus one field per
+    // changed key (its new value for a set, `null` for an unset).
+    let mut fields = vec![RecordField::str("name", &name)];
+    let mut changes: Vec<String> = Vec::new();
+    for (key, val) in &plan.sets {
+        fields.push(RecordField::str(key, val.clone()));
+        changes.push(format!("{key} = {val}"));
+    }
+    for key in &plan.unsets {
+        fields.push(RecordField::opt(key, None::<String>));
+        changes.push(format!("unset {key}"));
+    }
+    let human = format!("updated watch {name}: {}", changes.join(", "));
+    let record = Record {
+        header: None,
+        fields,
+    };
+    emit_action(out, &human, &record)?;
+    warning.map_or(Ok(()), Err)
+}
+
 // --- sync opt-in -----------------------------------------------------------
 
 /// `vard watch sync <name|path> [--off]` — the syncing opt-in gesture.
@@ -1153,7 +1303,8 @@ mod tests {
         // the edit writes (an absent key, i.e. the core default), not a value the
         // config never carries. An explicit pin is reflected faithfully.
         let path = Path::new("/some/watch");
-        let sync_of = |pin| match validate_watch("w", path, None, None, None, pin, None, None) {
+        let sync_of = |pin| match validate_watch("w", path, None, None, None, None, pin, None, None)
+        {
             Ok(spec) => spec.sync(),
             Err(e) => panic!("validate_watch rejected a valid watch: {}", e.message()),
         };

@@ -114,7 +114,8 @@ source dies (with exponential backoff), and shuts down cleanly on SIGINT or \
 SIGTERM.")]
     Run,
 
-    /// Manage the set of watched directories: add, remove, list, pause, resume.
+    /// Manage the set of watched directories: add, remove, list, set, pause,
+    /// resume.
     //
     // The teaching prose lives in `long_about`. A bare `vard watch` (no
     // subcommand) prints this command's short help, mirroring a bare `vard`, so
@@ -133,6 +134,7 @@ selectors accept either.
   add     register a directory (offering `git init` when it is not yet a repo)
   remove  unregister a watch (never touching the repository or its history)
   list    show every watch and its settings
+  set     change a setting on an existing watch (or `--unset` to clear one)
   pause   stop snapshotting a watch without unregistering it
   resume  resume a paused watch
   sync    turn syncing on for a watch (or `--off` to turn it off) and confirm it")]
@@ -368,9 +370,9 @@ reloads a clean, whole config every time.
   path   print the config file's path
 
 The set of watched directories is NOT edited here — a `watch.*` key is refused \
-with a pointer to the `vard watch` verbs (`add`, `remove`, `pause`, `resume`), \
-which understand watch identity. The top-level `version` is managed by vard and \
-is not settable either. Every write is validated before it lands: an edit that \
+with a pointer to `vard watch set` (and the `vard watch` verbs `add`, `remove`, \
+`pause`, `resume`), which understand watch identity. The top-level `version` is \
+managed by vard and is not settable either. Every write is validated before it lands: an edit that \
 would turn a valid config invalid is refused, so the CLI can never wedge the \
 daemon's reloads (a config already invalid on disk may still be repaired).")]
     Config {
@@ -606,6 +608,42 @@ reports its name, path, branch and remote, trigger and interval, whether it \
 syncs, and whether it is paused.")]
     List,
 
+    /// Change one or more settings on an existing watch, or `--unset` to clear
+    /// one so it re-inherits its default.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Edit an existing watch's settings.
+
+Changes one or more settings on a watch that is already registered, editing the \
+config file in place (preserving your comments and formatting); the running \
+daemon reloads the change on its own. The watch may be named by its stable name \
+or by its path.
+
+Each flag sets one key, using the same vocabulary as `vard watch add`:
+
+  --trigger <MODE>            events, interval, or both
+  --interval <DURATION>       periodic snapshot interval, e.g. 15m or 1h30m
+  --quiesce <DURATION>        how long activity must settle, e.g. 10s
+  --sync-interval <DURATION>  pull-sync cadence; 0s turns the pull timer off
+  --remote <REMOTE>           the remote the watch pushes to and pulls from
+  --branch <BRANCH>           the branch the watch commits to
+
+`--unset <key>` (repeatable) removes a key so it re-inherits its default; its \
+keys are the long names of the flags above (trigger, interval, quiesce, \
+sync_interval, remote, branch). Unsetting a key the watch does not set is \
+reported and exits 2, and setting and unsetting the same key at once is a usage \
+error. At least one `--<key>` or `--unset` is required.
+
+Values are parsed and validated exactly as `vard watch add` parses them, and \
+the edit lands only if the result still resolves to a valid watch — an invalid \
+value is refused (exit 2) and the config is left untouched.
+
+Syncing (`sync`), the paused flag, the path, and the name are deliberately not \
+settable here: turn syncing on or off with `vard watch sync`, pause and resume \
+with `vard watch pause`/`resume`, and relink a moved directory by re-running \
+`vard watch add` at its new path.")]
+    Set(WatchSetArgs),
+
     /// Pause a watch without unregistering it.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
@@ -686,6 +724,10 @@ pub struct WatchAddArgs {
     #[arg(long, value_name = "DURATION")]
     pub quiesce: Option<String>,
 
+    /// Pull-sync cadence, e.g. 20m; 0s turns the pull timer off.
+    #[arg(long = "sync-interval", value_name = "DURATION")]
+    pub sync_interval: Option<String>,
+
     /// Register the watch as local-only: never sync to a remote.
     #[arg(long = "no-sync")]
     pub no_sync: bool,
@@ -733,6 +775,79 @@ pub struct WatchSyncArgs {
     /// sync cycle.
     #[arg(long)]
     pub off: bool,
+}
+
+/// Arguments to `vard watch set`.
+#[derive(Debug, Args)]
+pub struct WatchSetArgs {
+    /// The watch to edit, by name or by path.
+    #[arg(value_name = "NAME|PATH")]
+    pub target: String,
+
+    /// Set the remote the watch pushes to and pulls from.
+    #[arg(long, value_name = "REMOTE")]
+    pub remote: Option<String>,
+
+    /// Set the branch the watch commits to.
+    #[arg(long, value_name = "BRANCH")]
+    pub branch: Option<String>,
+
+    /// Set which automatic triggers arm snapshots.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub trigger: Option<TriggerArg>,
+
+    /// Set the interval between periodic snapshots, e.g. 15m or 1h30m.
+    #[arg(long, value_name = "DURATION")]
+    pub interval: Option<String>,
+
+    /// Set how long file activity must settle before a snapshot, e.g. 10s.
+    #[arg(long, value_name = "DURATION")]
+    pub quiesce: Option<String>,
+
+    /// Set the pull-sync cadence, e.g. 20m; 0s turns the pull timer off.
+    #[arg(long = "sync-interval", value_name = "DURATION")]
+    pub sync_interval: Option<String>,
+
+    /// Remove a key so it re-inherits its default (repeatable): trigger,
+    /// interval, quiesce, sync_interval, remote, branch.
+    #[arg(long = "unset", value_name = "KEY")]
+    pub unset: Vec<UnsetKey>,
+}
+
+/// A watch setting `vard watch set --unset` can clear. The value spellings match
+/// the config keys exactly (so `--unset sync_interval` names the `sync_interval`
+/// key), and each maps to the flag that sets it.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsetKey {
+    /// The `trigger` key.
+    Trigger,
+    /// The `interval` key.
+    Interval,
+    /// The `quiesce` key.
+    Quiesce,
+    /// The `sync_interval` key.
+    #[value(name = "sync_interval")]
+    SyncInterval,
+    /// The `remote` key.
+    Remote,
+    /// The `branch` key.
+    Branch,
+}
+
+impl UnsetKey {
+    /// The config key this clears (`trigger`, `interval`, `quiesce`,
+    /// `sync_interval`, `remote`, `branch`) — the string written to and removed
+    /// from the `[[watch]]` table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnsetKey::Trigger => "trigger",
+            UnsetKey::Interval => "interval",
+            UnsetKey::Quiesce => "quiesce",
+            UnsetKey::SyncInterval => "sync_interval",
+            UnsetKey::Remote => "remote",
+            UnsetKey::Branch => "branch",
+        }
+    }
 }
 
 /// Which automatic snapshot triggers a watch arms. The CLI mirror of
