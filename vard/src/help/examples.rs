@@ -53,6 +53,10 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "watch locally under a custom name, never pushing".to_string(),
             ),
             (
+                format!("{watch} add ~/notes --sync"),
+                "watch ~/notes and turn syncing on, confirming with a first sync".to_string(),
+            ),
+            (
                 format!("{watch} add /srv/data --init --branch backup"),
                 "init a repo on branch backup, non-interactively".to_string(),
             ),
@@ -83,6 +87,17 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
             format!("{watch} resume notes"),
             "resume a paused watch".to_string(),
         )]
+    } else if cmd_path == format!("{watch} sync") {
+        vec![
+            (
+                format!("{watch} sync notes"),
+                "turn syncing on for notes and run a first sync".to_string(),
+            ),
+            (
+                format!("{watch} sync notes --off"),
+                "turn syncing back off (an explicit local-only pin)".to_string(),
+            ),
+        ]
     } else if cmd_path == format!("{BIN_NAME} snapshot") {
         vec![
             (
@@ -262,6 +277,7 @@ mod tests {
             "vard watch list",
             "vard watch pause",
             "vard watch resume",
+            "vard watch sync",
         ] {
             assert!(
                 !examples_for(path).is_empty(),

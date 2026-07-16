@@ -137,7 +137,15 @@ pub(crate) fn run(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>
     super::finish(run_inner(args, color, format))
 }
 
-fn run_inner(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>) -> CmdResult {
+/// Runs one `vard sync` invocation and returns its outcome without mapping to an
+/// exit code. Shared with the `watch sync` opt-in gesture, which reuses the
+/// exact same dispatch (daemon request when a daemon runs, in-process cycle
+/// otherwise) as the confirmation cycle for a just-enabled watch.
+pub(crate) fn run_inner(
+    args: SyncArgs,
+    color: ColorWhen,
+    format: Option<OutputFormat>,
+) -> CmdResult {
     let paths = CmdPaths::from_xdg().map_err(|e| CmdError::err(e.to_string()))?;
     let out = OutCtx::resolve(color, format);
 

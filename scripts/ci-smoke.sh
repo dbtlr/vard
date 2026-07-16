@@ -62,6 +62,9 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 # Help for the watch command tree must render through the custom v2 path.
 "$VARD" watch -h | grep -q 'For full help, run' || fail "vard watch -h missing the v2 short-help footer"
 "$VARD" watch add --help | grep -q 'canonicalized path' || fail "vard watch add --help missing its prose"
+# The watch sync opt-in verb (VRD-40) renders help through the same v2 path.
+"$VARD" watch sync -h | grep -q 'For full help, run' || fail "vard watch sync -h missing the v2 short-help footer"
+"$VARD" watch sync --help | grep -q 'opt-in' || fail "vard watch sync --help missing its prose"
 
 # The snapshot/history commands (VRD-16) render help through the same v2 path.
 "$VARD" snapshot -h | grep -q 'For full help, run' || fail "vard snapshot -h missing the v2 short-help footer"
@@ -99,6 +102,24 @@ grep -q 'vard managed excludes' "$WDIR/.git/info/exclude" || fail "vard watch ad
 "$VARD" watch pause smoke >/dev/null || fail "vard watch pause failed"
 grep -q 'paused = true' "$XDG_CONFIG_HOME/vard/config.toml" || fail "vard watch pause did not persist paused = true"
 "$VARD" watch resume smoke >/dev/null || fail "vard watch resume failed"
+
+# vard watch sync (VRD-40): the syncing opt-in gesture. A plain records-form add
+# prints the one-line hint pointing at it; `watch sync --off` writes an explicit
+# sync = false pin. The no-remote enable confirmation cycle is covered by the CLI
+# test suite (it needs a controlled remote), so the smoke sticks to the
+# deterministic hint and --off assertions.
+HINTREPO="$SMOKE_TMP/hintrepo"
+mkdir -p "$HINTREPO"
+git -C "$HINTREPO" init -q -b main
+"$VARD" --format records watch add "$HINTREPO" --name hintcheck </dev/null \
+  | grep -q 'enable with: vard watch sync hintcheck' \
+  || fail "vard watch add did not print the sync opt-in hint"
+"$VARD" --format records watch sync hintcheck --off </dev/null \
+  | grep -q 'disabled syncing for watch hintcheck' \
+  || fail "vard watch sync --off did not report disabling"
+grep -q 'sync = false' "$XDG_CONFIG_HOME/vard/config.toml" \
+  || fail "vard watch sync --off did not pin sync = false"
+"$VARD" watch remove hintcheck </dev/null >/dev/null || fail "cleanup: remove hintcheck failed"
 
 # vard status (VRD-17): no daemon runs in the smoke env, so status reports the
 # stopped daemon and exits 1. With nothing monitoring it, the configured watch
