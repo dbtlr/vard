@@ -776,6 +776,7 @@ dependencies = [
 name = "vard-core"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "ignore",
  "notify",
  "rustix",

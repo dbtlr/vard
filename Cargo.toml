@@ -18,6 +18,11 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # patterns filter events exactly as git would ignore them.
 notify = "8"
 ignore = "0.4"
+# Small, dependency-free PRNG backing the pull-driven sync interval's per-tick
+# jitter (vard-core). A seedable `Rng` keeps the jitter deterministic under
+# test; production seeds a fresh instance per schedule so watches never
+# phase-lock their cadence into a thundering herd.
+fastrand = "2"
 # serde derive + toml back the binary's file-config layer (vard only). Duration
 # strings deserialize through vard-core's parser, so no humantime crate is
 # needed. `toml` is trimmed to parse+serde for the read path; `toml_edit` backs

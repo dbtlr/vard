@@ -65,18 +65,34 @@
 //!
 //! # One scheduler per purpose
 //!
-//! A `Scheduler` carries one kind of tick. A second timed purpose — the
-//! pull-driven sync interval expected later, with its own period and jitter —
-//! arms a second `Scheduler` instance with its own receiver; the separate
-//! channel is the routing, so a tick never needs a purpose label.
+//! A `Scheduler` carries one kind of tick. The engine runs two instances: the
+//! snapshot-interval scheduler ([`arm`](Scheduler::arm), a fixed un-jittered
+//! cadence) and the pull-driven sync-interval scheduler
+//! ([`arm_jittered`](Scheduler::arm_jittered), the same first-tick/coalesce
+//! semantics but with ±10% per-tick jitter). Each has its own receiver — the
+//! separate channel is the routing, so a tick never needs a purpose label.
+//!
+//! # Per-tick jitter (the sync-interval path)
+//!
+//! [`arm_jittered`](Scheduler::arm_jittered) draws a fresh period per tick,
+//! `interval × uniform[0.9, 1.1]`, from a per-schedule seedable
+//! [`fastrand::Rng`]. It exists to de-correlate a fleet's cadence: watches
+//! armed together at daemon start would otherwise fire their cadence-driven
+//! syncs in lockstep. The ±10% fraction is a constant, not a config knob. The
+//! snapshot-interval [`arm`](Scheduler::arm) path is un-jittered and unchanged.
 
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
-use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 
 use crate::event::TroubleKind;
+
+/// The fixed ±fraction the pull-driven sync interval jitters each tick by (10%).
+/// A constant rather than a config knob: it exists only to de-correlate a
+/// fleet's cadence, which needs no per-watch tuning.
+const SYNC_JITTER_FRACTION: f64 = 0.10;
 
 /// What the scheduler reports on its one stream: an elapsed interval or trouble.
 ///
@@ -127,11 +143,14 @@ pub type SchedulerRx = mpsc::UnboundedReceiver<SchedulerSignal>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SchedulerError {
-    /// The requested period was zero. A zero period cannot be scheduled — the
-    /// underlying timer panics on one — so the schedule is refused here
-    /// rather than spawning a task that would die. A period read off a
-    /// [`WatchSpec`](crate::WatchSpec) never trips this (its builder rejects
-    /// zero durations); a raw duration from any other source can.
+    /// The requested period was zero. A zero period cannot be scheduled, so the
+    /// schedule is refused here rather than spawning a task that would never
+    /// tick. The engine never trips this: the snapshot
+    /// [`interval`](crate::WatchSpec::interval) is builder-rejected when zero,
+    /// and a zero [`sync_interval`](crate::WatchSpec::sync_interval) (a valid
+    /// value meaning "pull timer off") is guarded before
+    /// [`arm_jittered`](Scheduler::arm_jittered) is ever called. A raw duration
+    /// from any other source can trip it.
     ZeroInterval {
         /// Stable name of the watch whose period was zero.
         watch: String,
@@ -186,6 +205,60 @@ async fn run_schedule(
         {
             break;
         }
+    }
+}
+
+/// Draws one jittered period: `base × uniform[1 - fraction, 1 + fraction)`.
+///
+/// `rng.f64()` is in `[0, 1)`, so the factor lands in
+/// `[1 - fraction, 1 + fraction)` and the returned period in
+/// `[0.9 × base, 1.1 × base)` for the 10% fraction. A fresh draw per call is
+/// what de-correlates a fleet's cadence.
+fn jittered_period(base: Duration, fraction: f64, rng: &mut fastrand::Rng) -> Duration {
+    let factor = (1.0 - fraction) + rng.f64() * (2.0 * fraction);
+    base.mul_f64(factor)
+}
+
+/// The per-schedule tick loop for the **jittered** (sync-interval) path: one
+/// instance runs per armed jittered schedule.
+///
+/// Each period is a fresh [`jittered_period`] draw, so the cadence is
+/// activity-blind (like [`run_schedule`]) but never phase-locked across
+/// watches. The first tick is one jittered period after the loop starts, never
+/// at arm — the same anti-stampede rule as [`run_schedule`]. The next deadline
+/// is anchored off the wake (`Instant::now()`), not the deadline just met, so a
+/// task that slept through several intervals — laptop suspend on the monotonic
+/// clock, or a starved executor — ticks **once** here and its next deadline is
+/// one fresh full interval ahead, never a backlog. Each tick sends one
+/// [`SchedulerSignal::Tick`]; the loop ends when the send fails, meaning the
+/// consumer dropped its [`SchedulerRx`].
+async fn run_schedule_jittered(
+    watch: String,
+    period: Duration,
+    fraction: f64,
+    mut rng: fastrand::Rng,
+    signal_tx: mpsc::UnboundedSender<SchedulerSignal>,
+) {
+    // First tick one (jittered) interval out, not at arm: arming happens across
+    // every watch at daemon start, and an at-arm tick would stampede them all.
+    let mut next = Instant::now() + jittered_period(period, fraction, &mut rng);
+
+    loop {
+        sleep_until(next).await;
+        // A send failure means the consumer dropped its receiver: nothing left
+        // to tick for, so end cleanly (a normal end, not trouble).
+        if signal_tx
+            .send(SchedulerSignal::Tick {
+                watch: watch.clone(),
+            })
+            .is_err()
+        {
+            break;
+        }
+        // Anchor off the wake, not the deadline just met, so a slept-through
+        // window collapses to the single tick above rather than replaying one
+        // tick per missed deadline. A fresh jitter draw per period.
+        next = Instant::now() + jittered_period(period, fraction, &mut rng);
     }
 }
 
@@ -279,6 +352,56 @@ impl Scheduler {
 
         Ok(ScheduleHandle { task: abort })
     }
+
+    /// Arms a **jittered** schedule ticking as `watch` on a cadence of
+    /// `period × uniform[0.9, 1.1]`, a fresh draw per tick, and returns its
+    /// handle.
+    ///
+    /// This is the pull-driven sync-interval twin of [`arm`](Self::arm): the
+    /// engine arms one of each per syncing watch (the un-jittered snapshot
+    /// interval, and this jittered sync interval). It shares [`arm`](Self::arm)'s
+    /// contract exactly — first tick one (jittered) period after arming and
+    /// never at arm, a slept-through window collapsed to a single tick, no
+    /// same-watch deduplication, and disarm on handle drop — differing only in
+    /// the per-tick jitter (see the [module docs](self)). Each schedule seeds a
+    /// fresh independent [`fastrand::Rng`], so two watches armed together never
+    /// phase-lock.
+    ///
+    /// Fails with [`SchedulerError::ZeroInterval`] if `period` is zero. A
+    /// disabled pull timer (`sync_interval = 0`) is simply never armed by the
+    /// engine, so this guard mirrors [`arm`](Self::arm)'s defensively rather
+    /// than being a path the engine exercises.
+    ///
+    /// # Runtime
+    ///
+    /// Must be called from within a Tokio runtime: it spawns the schedule's
+    /// tick task and its supervisor.
+    pub fn arm_jittered(
+        &self,
+        watch: impl Into<String>,
+        period: Duration,
+    ) -> Result<ScheduleHandle, SchedulerError> {
+        let watch = watch.into();
+        if period.is_zero() {
+            return Err(SchedulerError::ZeroInterval { watch });
+        }
+
+        // A fresh, independently-seeded Rng per schedule: production jitter must
+        // differ per watch and per run. Tests drive `run_schedule_jittered`
+        // directly with a seeded Rng for determinism.
+        let rng = fastrand::Rng::new();
+        let task = tokio::spawn(run_schedule_jittered(
+            watch.clone(),
+            period,
+            SYNC_JITTER_FRACTION,
+            rng,
+            self.signal_tx.clone(),
+        ));
+        let abort = task.abort_handle();
+        supervise(watch, task, self.signal_tx.clone());
+
+        Ok(ScheduleHandle { task: abort })
+    }
 }
 
 /// A live schedule. Dropping it disarms the schedule (see
@@ -331,6 +454,33 @@ mod tests {
             SchedulerSignal::Tick { watch: w } => assert_eq!(w, watch),
             other => panic!("expected Tick, got {other:?}"),
         }
+    }
+
+    /// Spawns a bare **jittered** tick loop with its own channel and a seeded
+    /// Rng (so the schedule is deterministic), returning the receiver and task.
+    fn spawn_jittered(
+        watch: &str,
+        period: Duration,
+        rng: fastrand::Rng,
+    ) -> (SchedulerRx, JoinHandle<()>) {
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_schedule_jittered(
+            watch.to_string(),
+            period,
+            SYNC_JITTER_FRACTION,
+            rng,
+            signal_tx,
+        ));
+        (signal_rx, task)
+    }
+
+    /// Drains every pending tick and returns how many there were.
+    fn drain_ticks(rx: &mut SchedulerRx) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
     }
 
     // --- tick cadence (paused time) ------------------------------------------
@@ -482,6 +632,122 @@ mod tests {
         assert!(rx_slow.try_recv().is_err());
     }
 
+    // --- per-tick jitter (the sync-interval path) ----------------------------
+
+    #[test]
+    fn jittered_period_stays_within_ten_percent_and_varies() {
+        let base = Duration::from_secs(20 * 60);
+        let lo = base.mul_f64(0.9);
+        let hi = base.mul_f64(1.1);
+        let mut rng = fastrand::Rng::with_seed(0xC0FFEE);
+        let mut periods = Vec::new();
+        for _ in 0..1000 {
+            let p = jittered_period(base, SYNC_JITTER_FRACTION, &mut rng);
+            assert!(
+                p >= lo && p <= hi,
+                "jittered period {p:?} outside [{lo:?}, {hi:?}]"
+            );
+            periods.push(p);
+        }
+        // A fresh draw per tick: the periods are not all identical.
+        assert!(
+            periods.iter().any(|p| *p != periods[0]),
+            "jitter must vary tick to tick"
+        );
+    }
+
+    #[test]
+    fn jittered_period_is_deterministic_for_a_seed() {
+        let base = Duration::from_secs(20 * 60);
+        let mut a = fastrand::Rng::with_seed(42);
+        let mut b = fastrand::Rng::with_seed(42);
+        for _ in 0..256 {
+            assert_eq!(
+                jittered_period(base, SYNC_JITTER_FRACTION, &mut a),
+                jittered_period(base, SYNC_JITTER_FRACTION, &mut b),
+                "the same seed must produce the same jitter sequence"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jittered_first_tick_comes_after_one_interval_not_at_arm() {
+        let period = Duration::from_secs(60);
+        let (mut rx, _task) = spawn_jittered("w", period, fastrand::Rng::with_seed(1));
+
+        // Nothing at arm.
+        settle().await;
+        assert!(rx.try_recv().is_err(), "must not tick at arm");
+
+        // Nothing before the minimum jittered period (0.9 × 60s = 54s): the
+        // first draw is >= 54s regardless of seed.
+        tokio::time::advance(period * 9 / 10 - Duration::from_millis(1)).await;
+        settle().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not tick before the minimum jittered interval"
+        );
+
+        // Well past the maximum jittered period (< 66s): exactly one tick has
+        // fired, and the next deadline is a fresh interval out (no backlog).
+        tokio::time::advance(period).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+        assert!(rx.try_recv().is_err(), "exactly one tick per interval");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jittered_missed_intervals_coalesce_into_one_tick() {
+        let period = Duration::from_secs(60);
+        let (mut rx, _task) = spawn_jittered("w", period, fastrand::Rng::with_seed(7));
+        settle().await;
+
+        // Sleep through several intervals in one monotonic jump (laptop suspend
+        // on the monotonic clock, or executor starvation): one tick, never a
+        // backlog of one-per-missed-deadline.
+        tokio::time::advance(period * 5).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+        assert!(
+            rx.try_recv().is_err(),
+            "a slept-through window collapses to a single tick"
+        );
+
+        // Cadence resumes: the next tick is one fresh (jittered) interval later.
+        tokio::time::advance(period * 2).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+        assert!(
+            rx.try_recv().is_err(),
+            "cadence resumes at one tick per period"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_seed_yields_the_same_jittered_schedule() {
+        let period = Duration::from_secs(60);
+        let (mut rx1, _t1) = spawn_jittered("w", period, fastrand::Rng::with_seed(99));
+        let (mut rx2, _t2) = spawn_jittered("w", period, fastrand::Rng::with_seed(99));
+        settle().await;
+
+        // Advance in half-period steps and record each schedule's tick count per
+        // step: two schedules seeded alike, on the same paused clock, must tick
+        // in lockstep regardless of task-interleaving.
+        let mut counts1 = Vec::new();
+        let mut counts2 = Vec::new();
+        for _ in 0..40 {
+            tokio::time::advance(period / 2).await;
+            settle().await;
+            counts1.push(drain_ticks(&mut rx1));
+            counts2.push(drain_ticks(&mut rx2));
+        }
+        assert_eq!(counts1, counts2, "same seed => identical tick schedule");
+        assert!(
+            counts1.iter().sum::<usize>() >= 10,
+            "the schedule must actually have ticked"
+        );
+    }
+
     // --- arm / disarm through the public surface (paused time) ---------------
 
     #[tokio::test(start_paused = true)]
@@ -515,6 +781,38 @@ mod tests {
             Err(SchedulerError::ZeroInterval { watch }) => assert_eq!(watch, "w"),
             other => panic!("expected ZeroInterval, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_period_is_refused_at_arm_jittered() {
+        let (scheduler, _rx) = Scheduler::new();
+        match scheduler.arm_jittered("w", Duration::ZERO) {
+            Err(SchedulerError::ZeroInterval { watch }) => assert_eq!(watch, "w"),
+            other => panic!("expected ZeroInterval, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn armed_jittered_schedule_is_silent_until_one_period_then_ticks() {
+        let period = Duration::from_secs(20 * 60);
+        let (scheduler, mut rx) = Scheduler::new();
+        let _handle = scheduler.arm_jittered("w", period).unwrap();
+
+        // Nothing at arm, and nothing before the minimum jittered period.
+        settle().await;
+        assert!(rx.try_recv().is_err(), "must not tick at arm");
+        tokio::time::advance(period * 9 / 10 - Duration::from_millis(1)).await;
+        settle().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "must not tick before the minimum jittered period"
+        );
+
+        // Past the maximum jittered period, exactly one tick has fired.
+        tokio::time::advance(period).await;
+        settle().await;
+        expect_tick(&mut rx, "w");
+        assert!(rx.try_recv().is_err(), "exactly one tick at the period");
     }
 
     #[tokio::test(start_paused = true)]
