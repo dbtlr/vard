@@ -1097,11 +1097,27 @@ async fn supervise(
                 Action::Continue
             }
             _ = poll.tick() => {
-                process_requests(&paths, &handle, &watches);
+                // Check the config BEFORE draining requests, and hold requests
+                // while a config change is in flight, so a request is always
+                // answered against the *current* config rather than a pre-reload
+                // engine. This closes a whole race class — any request that
+                // follows a config write within a tick (most visibly `vard watch
+                // sync`, which flips `sync` off→on and then queues a confirming
+                // sync). VRD-35's content fingerprint guarantees the config
+                // change that preceded a request is observed no later than the
+                // request itself, and a single atomic CLI write settles one poll
+                // later (the debounce needs two stable samples), so deferring the
+                // drain to the reload below (see the `Reload` arm) loses nothing.
                 if config_debounce.poll(config_fingerprint(&paths.config_file)) {
                     info!("config file changed; reloading");
                     Action::Reload
+                } else if config_debounce.change_pending() {
+                    // A change was seen once and is settling; its reload lands on
+                    // the next poll and drains any deferred request against the
+                    // rebuilt engine. Hold requests until then.
+                    Action::Continue
                 } else {
+                    process_requests(&paths, &handle, &watches);
                     Action::Continue
                 }
             }
@@ -1137,6 +1153,13 @@ async fn supervise(
                 if outcome.failure_seen {
                     schedule_rebuild(&mut backoff, &mut rebuild_at, "engine failed during swap");
                 }
+                // Drain any request the poll tick deferred while this config
+                // change settled, now against the rebuilt engine — so a
+                // control-plane request that accompanied a config edit (e.g.
+                // `vard watch sync` enabling sync) is answered by the new config.
+                // A request naming a watch this reload just removed now fails
+                // honestly (logged and skipped), which is correct.
+                process_requests(&paths, &handle, &watches);
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
@@ -1527,6 +1550,14 @@ impl ConfigDebounce {
             false
         }
     }
+
+    /// Whether a new fingerprint has been seen once and is awaiting its
+    /// confirming poll. The supervisor holds request draining while this is
+    /// true, so a request that followed a config write is answered only after
+    /// the change settles and the reload rebuilds the engine.
+    fn change_pending(&self) -> bool {
+        self.pending.is_some()
+    }
 }
 
 /// Exponential backoff for source-died rebuilds: doubles from a base toward a
@@ -1749,6 +1780,32 @@ mod tests {
         assert!(!d.poll(Some(h1)));
         assert!(!d.poll(Some(h0)));
         assert!(!d.poll(Some(h0)));
+    }
+
+    #[test]
+    fn config_debounce_reports_a_pending_change_until_it_settles() {
+        // The supervisor holds request draining while a change is pending (so a
+        // request that followed a config write is answered only after the reload
+        // lands). The flag must set on first sighting and clear once the change
+        // settles or reverts.
+        let h0: ConfigFingerprint = (0, 0);
+        let h1: ConfigFingerprint = (0, 1);
+        let h2: ConfigFingerprint = (0, 2);
+        let mut d = ConfigDebounce::new(Some(h0));
+
+        assert!(!d.change_pending(), "settled at start: nothing pending");
+        // First sighting of a new value: a change is now pending.
+        assert!(!d.poll(Some(h1)));
+        assert!(d.change_pending(), "a first-seen change is pending");
+        // The confirming poll settles it: no longer pending.
+        assert!(d.poll(Some(h1)));
+        assert!(!d.change_pending(), "a settled change is no longer pending");
+
+        // A flicker that reverts before confirming clears pending too.
+        assert!(!d.poll(Some(h2)));
+        assert!(d.change_pending());
+        assert!(!d.poll(Some(h1))); // back to the settled value h1
+        assert!(!d.change_pending(), "a reverted change clears pending");
     }
 
     // --- config fingerprint (VRD-35) -------------------------------------------
@@ -2249,6 +2306,99 @@ mod tests {
         assert!(
             pushed,
             "a remote added after daemon start must be picked up with no restart"
+        );
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_request_after_a_config_write_runs_against_the_reloaded_spec() {
+        // Regression (VRD-40 review, finding 1): the `vard watch sync` daemon
+        // path. The CLI writes the config (flipping `sync` off→on) and THEN drops
+        // a sync request, both within one poll window. The daemon must answer
+        // that request against the reloaded, sync-ENABLED spec — never the
+        // pre-reload engine that still sees `sync = false` (which accepts the
+        // request and does nothing, silently dropping the confirmation). Proven
+        // by a real push to the remote.
+        let root = tempfile::tempdir().unwrap();
+        let origin = bare_origin(&root.path().join("origin.git"));
+        let notes = root.path().join("notes");
+        synced_repo(&notes, &origin);
+        // Uncommitted local work the eventual sync snapshots and pushes.
+        std::fs::write(notes.join("draft.txt"), "local work\n").unwrap();
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        // Interval-only, 24h: nothing but the request ever drives a sync.
+        let watch_block = |sync: bool| {
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"notes\"\npath = {notes:?}\nsync = {sync}\n\
+                 branch = \"main\"\nremote = \"origin\"\ntrigger = \"interval\"\ninterval = \"24h\"\n",
+            )
+        };
+        // Starts with syncing OFF.
+        std::fs::write(&config_file, watch_block(false)).unwrap();
+
+        let paths = DaemonPaths {
+            config_file: config_file.clone(),
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+        let health_file = paths.health_file.clone();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(150),
+        ));
+
+        // Wait until the daemon captured its initial (sync = false) fingerprint,
+        // so the edit below is guaranteed to register as a change.
+        for i in 0..200 {
+            if health_file.exists() {
+                break;
+            }
+            assert!(i < 199, "daemon never reached its supervise loop");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Mimic `vard watch sync notes`: flip sync on, THEN queue the request.
+        std::fs::write(&config_file, watch_block(true)).unwrap();
+        request::write(
+            &paths.request_dir,
+            &request::Request::sync(Some("notes".to_string())),
+        )
+        .unwrap();
+
+        // The request, held until the reload lands, runs against the sync-enabled
+        // spec and pushes the pre-sync snapshot — origin moves from 1 commit to 2.
+        let mut pushed = false;
+        for _ in 0..400 {
+            if remote_commit_count(&origin) >= 2 {
+                pushed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            pushed,
+            "a sync request that followed the sync-enabling config write must run \
+             against the reloaded spec and push, not be dropped by the pre-reload engine"
         );
 
         shutdown.notify_one();
