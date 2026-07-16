@@ -40,13 +40,15 @@
 //!
 //! # One worker per watch
 //!
-//! [`start`](Engine::start) arms the [`Watcher`] and [`Scheduler`] once for the
-//! whole engine (each exposes a single multiplexed receiver) and spawns exactly
-//! one **worker** task per watch. Two dispatcher tasks fan the shared
+//! [`start`](Engine::start) arms the [`Watcher`] and two [`Scheduler`]s once for
+//! the whole engine — one for the snapshot interval, one for the pull-driven
+//! sync interval, each exposing a single multiplexed receiver — and spawns
+//! exactly one **worker** task per watch. Three dispatcher tasks fan the shared
 //! [`WatcherSignal`]/[`SchedulerSignal`] streams out to the right worker by
-//! watch name. Watches therefore run concurrently, while every operation within
-//! a watch is strictly serialized — a worker is a single task, so it is doing at
-//! most one thing at a time.
+//! watch name (the watcher, the snapshot scheduler, and the sync scheduler,
+//! each on its own channel). Watches therefore run concurrently, while every
+//! operation within a watch is strictly serialized — a worker is a single task,
+//! so it is doing at most one thing at a time.
 //!
 //! # The per-watch worker
 //!
@@ -98,9 +100,11 @@
 //!
 //! A syncing watch reconciles with its remote on the *same serialized worker*,
 //! so a sync never overlaps a snapshot on that watch. A cycle is requested via
-//! [`EngineHandle::request_sync`] (manual) or
-//! [`EngineHandle::request_auto_sync`] (the automatic cadence a future interval
-//! or post-snapshot trigger will use); it runs under two hard invariants.
+//! [`EngineHandle::request_sync`] (manual) or automatically — after a successful
+//! snapshot (the post-snapshot enqueue), on the pull-driven sync-interval
+//! cadence (a jittered [`Scheduler`] tick), and on the failure-backoff retry;
+//! [`EngineHandle::request_auto_sync`] is the external entry point for the same
+//! automatic path. It runs under two hard invariants.
 //!
 //! **Lock/network separation.** The network-facing steps — [`fetch`](VcsBackend::fetch)
 //! and [`push`](VcsBackend::push) — run **outside** the per-watch op lock, each
@@ -753,8 +757,13 @@ struct Worker {
     /// op-lock-backed gate.
     gate: SharedGate,
     mute: MuteSource,
-    // Kept only to hold the interval schedule armed for this worker's lifetime.
+    // Kept only to hold the snapshot-interval schedule armed for this worker's
+    // lifetime.
     _schedule: Option<ScheduleHandle>,
+    // Kept only to hold the pull-driven sync-interval schedule armed for this
+    // worker's lifetime. `None` when the watch does not sync, or its
+    // `sync_interval` is zero (the timer is disabled).
+    _sync_schedule: Option<ScheduleHandle>,
     bus: EventBus,
     cfg: EngineConfig,
 
@@ -2519,10 +2528,16 @@ impl Engine {
 
         let (watcher, watcher_rx) = Watcher::new();
         let (scheduler, scheduler_rx) = Scheduler::new();
+        // A second, independent scheduler for the pull-driven sync interval: its
+        // ticks are jittered and its stream routes to a separate dispatcher, so a
+        // sync tick never needs a purpose label (see the `scheduler` module docs).
+        let (sync_scheduler, sync_scheduler_rx) = Scheduler::new();
 
         let mut prepared: Vec<(Worker, mpsc::UnboundedReceiver<WatchInput>)> = Vec::new();
         let mut watcher_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> = HashMap::new();
         let mut scheduler_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> =
+            HashMap::new();
+        let mut sync_scheduler_routes: HashMap<String, mpsc::UnboundedSender<WatchInput>> =
             HashMap::new();
         // The handle keeps its own clone of every worker's input sender so it can
         // inject manual triggers ([`EngineHandle::trigger`]). Held per watch
@@ -2566,12 +2581,29 @@ impl Engine {
             let sync_enabled = cw.spec.sync() && scratch_dir.is_some();
             let remote = cw.spec.remote().to_string();
 
+            // Arm the pull-driven sync-interval schedule only for a watch that
+            // actually syncs and whose `sync_interval` is nonzero (zero disables
+            // the cadence timer). Its jittered ticks route to `dispatch_sync_
+            // scheduler`, which delivers them as automatic sync requests. The
+            // snapshot `trigger` mode does not gate this: even an `events`-only
+            // watch syncs on its cadence — the mode governs snapshots, not sync.
+            let sync_schedule = if sync_enabled && !cw.spec.sync_interval().is_zero() {
+                let handle = sync_scheduler
+                    .arm_jittered(name.clone(), cw.spec.sync_interval())
+                    .map_err(EngineError::Scheduler)?;
+                sync_scheduler_routes.insert(name.clone(), tx.clone());
+                Some(handle)
+            } else {
+                None
+            };
+
             let worker = Worker {
                 name,
                 backend: cw.backend,
                 gate: cw.gate,
                 mute,
                 _schedule: schedule,
+                _sync_schedule: sync_schedule,
                 bus: bus.clone(),
                 cfg,
                 pending: None,
@@ -2602,6 +2634,10 @@ impl Engine {
         let dispatchers = vec![
             tokio::spawn(dispatch_watcher(watcher_rx, watcher_routes)),
             tokio::spawn(dispatch_scheduler(scheduler_rx, scheduler_routes)),
+            tokio::spawn(dispatch_sync_scheduler(
+                sync_scheduler_rx,
+                sync_scheduler_routes,
+            )),
         ];
 
         bus.emit(Event::DaemonStarted);
@@ -2734,8 +2770,9 @@ impl EngineHandle {
         }
     }
 
-    /// Requests an **automatic** sync cycle for the named watch (the cadence a
-    /// future interval timer or post-snapshot trigger uses). Identical to
+    /// Requests an **automatic** sync cycle for the named watch — the same path
+    /// the post-snapshot enqueue and the pull-driven sync-interval timer drive.
+    /// Identical to
     /// [`request_sync`](Self::request_sync) except it is **suppressed while the
     /// watch is [`Conflicted`](WatchState::Conflicted)** — auto-sync stops for a
     /// conflicted watch until a manual request resolves it.
@@ -2765,16 +2802,17 @@ impl EngineHandle {
     ///    that once the dispatchers' senders go too, each worker channel is truly
     ///    senderless and closes. (Skipping this would wedge the drain until the
     ///    timeout.)
-    /// 1. **Stop the dispatchers.** Both dispatch tasks are aborted and joined,
-    ///    which drops every per-watch route sender they held. No new trigger can
-    ///    reach a worker after this point.
+    /// 1. **Stop the dispatchers.** All three dispatch tasks (watcher, snapshot
+    ///    scheduler, sync scheduler) are aborted and joined, which drops every
+    ///    per-watch route sender they held. No new trigger can reach a worker
+    ///    after this point.
     /// 2. **Drain the workers.** With the dispatchers gone, each worker's input
     ///    channel has no senders left, so its run loop observes the close and
     ///    exits *after* finishing any pass already in flight — a snapshot mid-commit
     ///    is never abandoned. A worker parked on its retry timer simply drains and
-    ///    exits. As each worker task ends it drops its [`WatchHandle`] and
-    ///    [`ScheduleHandle`], whose `Drop` impls disarm the notify backend and the
-    ///    tick task.
+    ///    exits. As each worker task ends it drops its [`WatchHandle`] and its
+    ///    [`ScheduleHandle`]s, whose `Drop` impls disarm the notify backend and the
+    ///    tick tasks.
     /// 3. **Emit [`Event::DaemonStopped`].** Every task has joined, so no further
     ///    event can be emitted after it.
     ///
@@ -2873,7 +2911,7 @@ async fn dispatch_watcher(
     }
 }
 
-/// Fans the shared scheduler stream out to per-watch workers by name.
+/// Fans the shared snapshot-scheduler stream out to per-watch workers by name.
 async fn dispatch_scheduler(
     mut rx: SchedulerRx,
     routes: HashMap<String, mpsc::UnboundedSender<WatchInput>>,
@@ -2881,6 +2919,39 @@ async fn dispatch_scheduler(
     while let Some(signal) = rx.recv().await {
         let (watch, input) = match signal {
             SchedulerSignal::Tick { watch } => (watch, WatchInput::Trigger(Provenance::interval())),
+            SchedulerSignal::Trouble {
+                watch,
+                kind,
+                detail,
+            } => (watch, WatchInput::Trouble { kind, detail }),
+        };
+        if let Some(tx) = routes.get(&watch) {
+            let _ = tx.send(input);
+        }
+    }
+}
+
+/// Fans the shared sync-scheduler stream out to per-watch workers by name.
+///
+/// A [`Tick`](SchedulerSignal::Tick) becomes an **automatic** sync request
+/// ([`WatchInput::RequestSync`] with `manual: false`) — the worker's own gating
+/// (suppressed while Conflicted, respects the sync-error backoff, a no-op when
+/// the watch cannot sync) decides what it does. [`Trouble`](SchedulerSignal::Trouble)
+/// is handled exactly as the snapshot scheduler's is: it surfaces the schedule's
+/// death as a watch [`Trouble`](WatchInput::Trouble).
+async fn dispatch_sync_scheduler(
+    mut rx: SchedulerRx,
+    routes: HashMap<String, mpsc::UnboundedSender<WatchInput>>,
+) {
+    while let Some(signal) = rx.recv().await {
+        let (watch, input) = match signal {
+            SchedulerSignal::Tick { watch } => (
+                watch,
+                WatchInput::RequestSync {
+                    manual: false,
+                    ack: None,
+                },
+            ),
             SchedulerSignal::Trouble {
                 watch,
                 kind,
@@ -3759,6 +3830,7 @@ mod tests {
             gate,
             mute: MuteSource::Counter(Arc::clone(&counter)),
             _schedule: None,
+            _sync_schedule: None,
             bus,
             cfg,
             pending: None,
@@ -3831,6 +3903,7 @@ mod tests {
             gate,
             mute: MuteSource::Silent,
             _schedule: None,
+            _sync_schedule: None,
             bus,
             cfg,
             pending: None,
@@ -7186,6 +7259,121 @@ mod tests {
         );
         assert_eq!(backend.advance_calls(), 1, "the first advance was refused");
         assert_eq!(backend.fetch_calls(), 2, "the cycle was re-attempted once");
+    }
+
+    // --- pull-driven sync interval wiring ------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_interval_tick_drives_an_automatic_sync() {
+        // A syncing watch with a nonzero sync_interval arms a jittered sync
+        // schedule; its tick reaches the worker as an AUTOMATIC sync request. No
+        // manual sync is issued, so an observed SyncPushed proves the cadence
+        // timer drove the cycle. Interval-only + a long snapshot interval keeps
+        // the snapshot scheduler quiet, so the only driver is the sync tick.
+        let backend = FakeBackend::new();
+        backend.script_fetch([remote(1, 0)]); // local ahead => push-only
+        backend.script_push([Ok(PushOutcome::Pushed)]);
+        let spec = WatchSpec::builder("w", "/tmp")
+            .trigger(TriggerMode::Interval)
+            .interval(Duration::from_secs(3600))
+            .sync(true)
+            .sync_interval(Duration::from_secs(60))
+            .scratch_dir("/tmp/vard-test-scratch")
+            .build()
+            .unwrap();
+        let engine = Engine::builder()
+            .watch_with_backend(spec, Arc::clone(&backend) as SharedBackend)
+            .shutdown_drain_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let mut events = engine.subscribe();
+        let handle = engine.start().await.unwrap();
+
+        match advance_until_matching(&mut events, Duration::from_secs(5), |e| {
+            matches!(e, Event::SyncPushed { .. })
+        })
+        .await
+        {
+            Event::SyncPushed { commits, .. } => assert_eq!(commits, 1),
+            other => panic!("expected SyncPushed from the cadence tick, got {other:?}"),
+        }
+        assert!(backend.fetch_calls() >= 1, "the cadence tick ran a cycle");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_sync_interval_arms_no_sync_schedule() {
+        // sync_interval = 0 disables the cadence timer: no sync schedule is
+        // armed, so no automatic sync runs however far time advances
+        // (fetch_calls stays 0). Push-driven and manual sync are unaffected.
+        let backend = FakeBackend::new();
+        let spec = WatchSpec::builder("w", "/tmp")
+            .trigger(TriggerMode::Interval)
+            .interval(Duration::from_secs(3600))
+            .sync(true)
+            .sync_interval(Duration::ZERO)
+            .scratch_dir("/tmp/vard-test-scratch")
+            .build()
+            .unwrap();
+        let handle = Engine::builder()
+            .watch_with_backend(spec, Arc::clone(&backend) as SharedBackend)
+            .shutdown_drain_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+
+        // Advance well past many nominal 60s intervals; nothing should fetch.
+        for _ in 0..30 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+        settle().await;
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "a zero sync_interval arms no pull timer"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_syncing_watch_arms_no_sync_schedule() {
+        // sync = false, even with a nonzero sync_interval and a scratch dir: the
+        // watch does not sync, so no cadence timer is armed.
+        let backend = FakeBackend::new();
+        let spec = WatchSpec::builder("w", "/tmp")
+            .trigger(TriggerMode::Interval)
+            .interval(Duration::from_secs(3600))
+            .sync(false)
+            .sync_interval(Duration::from_secs(60))
+            .scratch_dir("/tmp/vard-test-scratch")
+            .build()
+            .unwrap();
+        let handle = Engine::builder()
+            .watch_with_backend(spec, Arc::clone(&backend) as SharedBackend)
+            .shutdown_drain_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+
+        for _ in 0..30 {
+            settle().await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+        }
+        settle().await;
+        assert_eq!(
+            backend.fetch_calls(),
+            0,
+            "a non-syncing watch arms no pull timer"
+        );
+
+        handle.shutdown().await;
     }
 
     // --- watch_states projection ---------------------------------------------

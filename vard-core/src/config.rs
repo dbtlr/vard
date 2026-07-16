@@ -168,7 +168,12 @@ impl WatchSpec {
         self.sync
     }
 
-    /// Interval between background syncs.
+    /// Interval between pull-driven background syncs (the cadence timer).
+    ///
+    /// [`Duration::ZERO`] disables the timer: the watch is not synced on a
+    /// cadence, though push-driven (post-snapshot) and manual syncs are
+    /// unaffected. A nonzero value is the base period; the engine jitters each
+    /// tick ±10%, de-correlating a fleet's cadence (see the scheduler).
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval
     }
@@ -290,7 +295,8 @@ impl WatchSpecBuilder {
         self
     }
 
-    /// Sets the background sync interval.
+    /// Sets the pull-driven background sync interval. [`Duration::ZERO`]
+    /// disables the cadence timer (see [`WatchSpec::sync_interval`]).
     pub fn sync_interval(mut self, sync_interval: Duration) -> Self {
         self.sync_interval = sync_interval;
         self
@@ -336,8 +342,10 @@ impl WatchSpecBuilder {
     ///
     /// Enforces: non-empty name; a name limited to ASCII alphanumerics and
     /// `-`, `_`, `.` and not the path-special `.` or `..` (safe for state-file
-    /// names); non-empty path; strictly positive `quiesce`, `interval`, and
-    /// `sync_interval`; and a strictly positive `poll_interval` when one is set.
+    /// names); non-empty path; strictly positive `quiesce` and `interval`; and a
+    /// strictly positive `poll_interval` when one is set. `sync_interval` is
+    /// **not** constrained: zero is valid and disables the pull-driven sync
+    /// timer (see [`WatchSpec::sync_interval`]).
     pub fn build(self) -> Result<WatchSpec, ConfigError> {
         if self.name.is_empty() {
             return Err(ConfigError::EmptyName);
@@ -364,11 +372,9 @@ impl WatchSpecBuilder {
         if self.interval.is_zero() {
             return Err(ConfigError::ZeroDuration { field: "interval" });
         }
-        if self.sync_interval.is_zero() {
-            return Err(ConfigError::ZeroDuration {
-                field: "sync_interval",
-            });
-        }
+        // `sync_interval` is deliberately NOT validated nonzero: a zero value is
+        // valid and means "pull timer off" (the engine arms no sync schedule for
+        // the watch). Push-driven and manual sync are unaffected.
         if let Some(period) = self.poll_interval
             && period.is_zero()
         {
@@ -697,20 +703,25 @@ mod tests {
         );
         assert_eq!(
             WatchSpec::builder("n", "/p")
-                .sync_interval(Duration::ZERO)
-                .build(),
-            Err(ConfigError::ZeroDuration {
-                field: "sync_interval"
-            })
-        );
-        assert_eq!(
-            WatchSpec::builder("n", "/p")
                 .poll_interval(Duration::ZERO)
                 .build(),
             Err(ConfigError::ZeroDuration {
                 field: "poll_interval"
             })
         );
+    }
+
+    #[test]
+    fn zero_sync_interval_builds_and_means_pull_timer_off() {
+        // Unlike quiesce/interval, a zero sync_interval is valid: it disables the
+        // pull-driven cadence timer (the engine arms no sync schedule), leaving
+        // push-driven and manual sync untouched. The field stays a plain
+        // Duration (no Option), so ZERO is the sentinel.
+        let spec = WatchSpec::builder("n", "/p")
+            .sync_interval(Duration::ZERO)
+            .build()
+            .expect("a zero sync_interval must build");
+        assert_eq!(spec.sync_interval(), Duration::ZERO);
     }
 
     #[test]
@@ -724,6 +735,15 @@ mod tests {
             Duration::from_secs(3600 + 1800)
         );
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn parse_duration_accepts_a_zero_spelling() {
+        // A zero duration is spelled with a unit ("0s"), like every other value
+        // the parser accepts — a bare "0" has no unit and is rejected. This is
+        // the spelling that disables the pull-driven sync timer.
+        assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("0m").unwrap(), Duration::ZERO);
     }
 
     #[test]

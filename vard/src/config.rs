@@ -778,8 +778,58 @@ sync = false
         let specs = config.resolve().unwrap();
         let spec = &specs[0];
         assert!(!spec.sync());
-        // sync_interval is still validated (> 0) even with sync off.
+        // sync_interval falls back to its default even with sync off.
         assert_eq!(spec.sync_interval(), DEFAULT_SYNC_INTERVAL);
+    }
+
+    #[test]
+    fn zero_sync_interval_parses_and_disables_the_pull_timer() {
+        // "0s" is the accepted zero spelling; it resolves to Duration::ZERO
+        // (a zero sync_interval means the pull timer is off).
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "manual-sync"
+path = "/data/manual"
+sync = true
+sync_interval = "0s"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].sync_interval(), Duration::ZERO);
+    }
+
+    #[test]
+    fn explicit_zero_sync_interval_overrides_a_nonzero_default() {
+        // An explicit "0s" is a real value, never "unset": it must win over a
+        // nonzero [defaults] sync_interval, while a sibling watch with no value
+        // still inherits the default.
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+sync_interval = "45m"
+
+[[watch]]
+name = "no-timer"
+path = "/data/no-timer"
+sync = true
+sync_interval = "0s"
+
+[[watch]]
+name = "inherits"
+path = "/data/inherits"
+sync = true
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].sync_interval(), Duration::ZERO);
+        assert_eq!(specs[1].sync_interval(), Duration::from_secs(45 * 60));
     }
 
     #[test]

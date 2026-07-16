@@ -16,6 +16,8 @@ repository.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 notify = { workspace = true }
 ignore = { workspace = true }
+# Per-tick jitter for the pull-driven sync interval scheduler (see `scheduler`).
+fastrand = { workspace = true }
 
 # On unix, a timed-out `fetch`/`push` kills the git child's whole process group
 # (`kill_process_group`) so an ssh transport's children die with it rather than
