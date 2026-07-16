@@ -36,7 +36,9 @@ use vard_core::{GitBackend, TriggerMode, VcsBackend, WatchSpec};
 use crate::cli::{
     ColorWhen, OutputFormat, SyncArgs, WatchAddArgs, WatchCommand, WatchRemoveArgs, WatchSyncArgs,
 };
-use crate::command::{CmdError, CmdResult, OutCtx, emit_action, emit_records, finish};
+use crate::command::{
+    CmdError, CmdResult, OutCtx, emit_action, emit_records, finish, finish_write,
+};
 use crate::config::{Config, ResolvedWatch, WatchConfig, expand_tilde};
 use crate::config_edit::{self, ConfigLock, WatchEntry};
 use crate::instance::{CliLock, InstanceLock};
@@ -82,7 +84,7 @@ pub(crate) fn run(cmd: WatchCommand, color: ColorWhen, format: Option<OutputForm
     let out = OutCtx::resolve(color, format);
 
     let result = match cmd {
-        WatchCommand::Add(args) => cmd_add(&paths, &out, args, color, format),
+        WatchCommand::Add(args) => cmd_add(&paths, &out, args),
         WatchCommand::Remove(args) => cmd_remove(&paths, &out, args),
         WatchCommand::List => cmd_list(&paths, &out),
         WatchCommand::Pause(args) => cmd_set_paused(&paths, &out, &args.target, true),
@@ -116,13 +118,7 @@ enum RepoPlan {
     Init,
 }
 
-fn cmd_add(
-    paths: &WatchPaths,
-    out: &OutCtx,
-    args: WatchAddArgs,
-    color: ColorWhen,
-    format: Option<OutputFormat>,
-) -> CmdResult {
+fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     // Canonicalize the path (which requires it to exist); this is the watch's
     // identity. A non-existent directory is a clear, early error.
     let canonical = std::fs::canonicalize(&args.path)
@@ -246,18 +242,19 @@ fn cmd_add(
             RecordField::bool("relinked", relinked),
         ],
     };
-    emit_action(out, &human, &record)?;
-    // A write that landed but left the config still-invalid carries an attention
-    // warning; surface it now, before any confirmation cycle runs against a
-    // config we could not fully validate.
-    if let Some(w) = warning {
-        return Err(w);
+    // `--sync` reports the add result and its confirmation cycle together (folded
+    // into one document in the JSON form); the plain path emits the add result
+    // now, surfaces any still-invalid warning, and — when syncing stays off —
+    // prints the opt-in hint.
+    if args.sync {
+        return confirm_add_sync(paths, out, human, record, warning, &name);
     }
 
-    if args.sync {
-        // `--sync` runs the same opt-in confirmation flow as `vard watch sync`:
-        // the freshly-written `sync = true` is confirmed by one real cycle.
-        return confirm_sync(paths, out, &name, color, format);
+    emit_action(out, &human, &record)?;
+    // A write that landed but left the config still-invalid carries an attention
+    // warning; surface it now.
+    if let Some(w) = warning {
+        return Err(w);
     }
 
     // No `--sync`: when syncing resolves off for this watch, print exactly one
@@ -861,11 +858,67 @@ fn confirm_sync(
         color,
         format,
     );
-    if matches!(out.format, OutputFormat::Records)
-        && let Some(remote) = watch_missing_remote(paths, name)
-    {
-        // Best-effort guidance; a write failure here must not mask the cycle's
-        // own result, so its outcome is deliberately dropped.
+    print_missing_remote_hint(out, paths, name);
+    result
+}
+
+/// The `watch add --sync` confirmation: runs the same cycle as [`confirm_sync`]
+/// but through [`cmd::sync::collect`](crate::cmd::sync::collect), so the JSON
+/// form folds the cycle's rows into the single add object (`"sync": [...]`)
+/// rather than emitting a second top-level document. Records and JSONL emit the
+/// add result and the cycle output back to back (both formats allow multiple
+/// values), matching the standalone `vard sync` output.
+fn confirm_add_sync(
+    paths: &WatchPaths,
+    out: &OutCtx,
+    human: String,
+    add_record: Record,
+    warning: Option<CmdError>,
+    name: &str,
+) -> CmdResult {
+    // A write that landed still-invalid must not run a confirmation cycle; emit
+    // the add result plainly and surface the warning.
+    if let Some(w) = warning {
+        emit_action(out, &human, &add_record)?;
+        return Err(w);
+    }
+
+    let (result, emit) = crate::cmd::sync::collect(&SyncArgs {
+        target: Some(name.to_string()),
+    });
+
+    match out.format {
+        OutputFormat::Json => {
+            // One parseable document: the add object with the confirmation rows
+            // nested under `sync`.
+            let rows = emit.into_records();
+            let mut w = io::stdout().lock();
+            let write = record::write_json_object_with_records(&mut w, &add_record, "sync", &rows)
+                .and_then(|()| w.write_all(b"\n"));
+            finish_write(write)?;
+        }
+        OutputFormat::Jsonl => {
+            emit_action(out, &human, &add_record)?;
+            crate::cmd::sync::emit_sync(out, &emit)?;
+        }
+        OutputFormat::Records => {
+            emit_action(out, &human, &add_record)?;
+            crate::cmd::sync::emit_sync(out, &emit)?;
+            print_missing_remote_hint(out, paths, name);
+        }
+    }
+    result
+}
+
+/// In the records form, when `name`'s repository lacks its configured remote,
+/// print a one-line pointer at how to add it — vard never creates remotes. Best
+/// effort: a probe failure or a write error is silently dropped so it can never
+/// mask the confirmation cycle's own result.
+fn print_missing_remote_hint(out: &OutCtx, paths: &WatchPaths, name: &str) {
+    if !matches!(out.format, OutputFormat::Records) {
+        return;
+    }
+    if let Some(remote) = watch_missing_remote(paths, name) {
         let mut w = io::stdout().lock();
         let _ = writeln!(
             w,
@@ -873,7 +926,6 @@ fn confirm_sync(
              git remote add {remote} <url>"
         );
     }
-    result
 }
 
 /// The watch's configured remote name when its repository does NOT define that

@@ -171,14 +171,48 @@ pub(crate) fn write_json_object(out: &mut dyn Write, record: &Record) -> io::Res
         }
         write_json_string(out, field.key)?;
         out.write_all(b":")?;
-        match &field.cell {
-            Cell::Str(s) => write_json_string(out, s)?,
-            Cell::Bool(b) => out.write_all(if *b { b"true" } else { b"false" })?,
-            Cell::Int(n) => write!(out, "{n}")?,
-            Cell::Absent => out.write_all(b"null")?,
-        }
+        write_cell(out, &field.cell)?;
     }
     out.write_all(b"}")
+}
+
+/// Writes `record` as a compact JSON object with one extra trailing field `key`
+/// whose value is the JSON array of `rows`. This lets a command fold a
+/// sub-result into a single parseable document — `watch add --sync` nests its
+/// confirmation cycle's rows under `"sync"`, so the JSON form stays one object
+/// rather than two top-level documents.
+pub(crate) fn write_json_object_with_records(
+    out: &mut dyn Write,
+    record: &Record,
+    key: &'static str,
+    rows: &[Record],
+) -> io::Result<()> {
+    out.write_all(b"{")?;
+    for field in &record.fields {
+        write_json_string(out, field.key)?;
+        out.write_all(b":")?;
+        write_cell(out, &field.cell)?;
+        out.write_all(b",")?;
+    }
+    write_json_string(out, key)?;
+    out.write_all(b":[")?;
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
+        }
+        write_json_object(out, row)?;
+    }
+    out.write_all(b"]}")
+}
+
+/// Writes a single cell's JSON value (shared by the object writers).
+fn write_cell(out: &mut dyn Write, cell: &Cell) -> io::Result<()> {
+    match cell {
+        Cell::Str(s) => write_json_string(out, s),
+        Cell::Bool(b) => out.write_all(if *b { b"true" } else { b"false" }),
+        Cell::Int(n) => write!(out, "{n}"),
+        Cell::Absent => out.write_all(b"null"),
+    }
 }
 
 /// The records-form display string for a cell.
@@ -278,6 +312,30 @@ mod tests {
         assert_eq!(
             s,
             r#"{"path":"/home/u/notes","branch":"main","remote":null,"sync":true,"paused":false}"#
+        );
+    }
+
+    #[test]
+    fn json_object_with_records_nests_a_rows_array() {
+        let add = Record {
+            header: None,
+            fields: vec![
+                RecordField::str("name", "notes"),
+                RecordField::bool("initialized", false),
+            ],
+        };
+        let row = Record {
+            header: None,
+            fields: vec![
+                RecordField::str("name", "notes"),
+                RecordField::str("status", "up to date"),
+            ],
+        };
+        let mut out = Vec::new();
+        write_json_object_with_records(&mut out, &add, "sync", &[row]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"name":"notes","initialized":false,"sync":[{"name":"notes","status":"up to date"}]}"#
         );
     }
 

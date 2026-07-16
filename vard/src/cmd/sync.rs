@@ -137,6 +137,49 @@ pub(crate) fn run(args: SyncArgs, color: ColorWhen, format: Option<OutputFormat>
     super::finish(run_inner(args, color, format))
 }
 
+/// What a sync dispatch decided to print, kept separate from the *doing* so a
+/// caller can render it — or fold it into another document — rather than having
+/// the dispatch emit inline. `vard sync` (via [`run_inner`]) renders it exactly
+/// as before; `watch add --sync` nests the records in its single JSON object.
+pub(crate) enum SyncEmit {
+    /// Per-watch result rows under the `syncs` noun (the in-process path, and
+    /// the empty/error rows the no-daemon path pre-decides).
+    Rows(Vec<Record>),
+    /// A single action — a human sentence plus one record — for a daemon
+    /// hand-off (fire-and-forget).
+    Action {
+        /// The human-readable line (records form).
+        human: String,
+        /// The single result record (machine forms).
+        record: Record,
+    },
+    /// Nothing to print (a lock-contention or path-resolution error carried
+    /// entirely on stderr via the returned [`CmdError`]).
+    Nothing,
+}
+
+impl SyncEmit {
+    /// The result rows, for folding into another document. A daemon-hand-off
+    /// action becomes a single-element array; `Nothing` is empty.
+    pub(crate) fn into_records(self) -> Vec<Record> {
+        match self {
+            SyncEmit::Rows(rows) => rows,
+            SyncEmit::Action { record, .. } => vec![record],
+            SyncEmit::Nothing => Vec::new(),
+        }
+    }
+}
+
+/// Renders a [`SyncEmit`] the way `vard sync` always has: a `syncs` list, a
+/// single action, or nothing.
+pub(crate) fn emit_sync(out: &OutCtx, emit: &SyncEmit) -> CmdResult {
+    match emit {
+        SyncEmit::Rows(records) => emit_records(out, records, "syncs"),
+        SyncEmit::Action { human, record } => emit_action(out, human, record),
+        SyncEmit::Nothing => Ok(()),
+    }
+}
+
 /// Runs one `vard sync` invocation and returns its outcome without mapping to an
 /// exit code. Shared with the `watch sync` opt-in gesture, which reuses the
 /// exact same dispatch (daemon request when a daemon runs, in-process cycle
@@ -146,8 +189,21 @@ pub(crate) fn run_inner(
     color: ColorWhen,
     format: Option<OutputFormat>,
 ) -> CmdResult {
-    let paths = CmdPaths::from_xdg().map_err(|e| CmdError::err(e.to_string()))?;
     let out = OutCtx::resolve(color, format);
+    let (result, emit) = collect(&args);
+    emit_sync(&out, &emit)?;
+    result
+}
+
+/// Runs the sync dispatch and returns its outcome plus what to print, WITHOUT
+/// emitting — so a caller (`watch add --sync`) can fold the records into a
+/// single document. [`run_inner`] renders the [`SyncEmit`] as `vard sync`
+/// always has.
+pub(crate) fn collect(args: &SyncArgs) -> (CmdResult, SyncEmit) {
+    let paths = match CmdPaths::from_xdg() {
+        Ok(paths) => paths,
+        Err(e) => return (Err(CmdError::err(e.to_string())), SyncEmit::Nothing),
+    };
 
     // The same instance-lock role discrimination `snapshot` uses:
     //   * we hold it        ⇒ no daemon ⇒ sync in-process while holding it
@@ -155,22 +211,44 @@ pub(crate) fn run_inner(
     //   * a peer CLI holds it past the budget ⇒ honest "another command is running"
     match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
-            let result = in_process(&paths, &out, &args);
+            let (result, rows) = in_process(&paths, args);
             // Hold the lock across the whole in-process sync; drop it only now.
             drop(lock);
-            result
+            (result, SyncEmit::Rows(rows))
         }
-        Ok(CliLock::DaemonHeld) => via_request(&paths, &out, &args),
-        Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
-            "another vard command is running; retry in a moment",
-        )),
-        Err(e) => Err(CmdError::err(format!("acquiring instance lock: {e}"))),
+        Ok(CliLock::DaemonHeld) => via_request(&paths, args),
+        Ok(CliLock::BusyPeerCli) => (
+            Err(CmdError::err(
+                "another vard command is running; retry in a moment",
+            )),
+            SyncEmit::Nothing,
+        ),
+        Err(e) => (
+            Err(CmdError::err(format!("acquiring instance lock: {e}"))),
+            SyncEmit::Nothing,
+        ),
     }
 }
 
 /// In-process path (no daemon): run one sync cycle per targeted, sync-enabled
-/// watch under the held instance lock, and report per watch.
-fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
+/// watch under the held instance lock. Returns the overall outcome plus the
+/// per-watch result rows, WITHOUT emitting — the caller renders or folds them.
+fn in_process(paths: &CmdPaths, args: &SyncArgs) -> (CmdResult, Vec<Record>) {
+    match in_process_collect(paths, args) {
+        Ok(reported) => reported,
+        // An error decided before any row exists (config load, an unresolved
+        // selector, an engine that could not start) carries only the stderr
+        // message — there is nothing to print on stdout.
+        Err(e) => (Err(e), Vec::new()),
+    }
+}
+
+/// The fallible core of [`in_process`]: `?` short-circuits the row-less errors,
+/// while the paths that have decided rows return them alongside the outcome.
+fn in_process_collect(
+    paths: &CmdPaths,
+    args: &SyncArgs,
+) -> Result<(CmdResult, Vec<Record>), CmdError> {
     let config = load_config(&paths.config_file)?;
     let named = args.target.is_some();
 
@@ -232,8 +310,12 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
                 }
             }
             if !any_sync_enabled {
-                emit_records(out, &[], "syncs")?;
-                return Err(CmdError::attention("no sync-enabled watches configured"));
+                // An empty `syncs` list plus an attention outcome — the caller
+                // still renders the (empty) rows.
+                return Ok((
+                    Err(CmdError::attention("no sync-enabled watches configured")),
+                    Vec::new(),
+                ));
             }
             (candidates, pre_rows)
         }
@@ -248,11 +330,10 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
             Ok(results) => results,
             Err(e) => {
                 // The engine could not run at all (a runtime/start failure):
-                // the rows already decided are still the truth — emit them
-                // before propagating, never silently discard them.
+                // the rows already decided are still the truth — return them
+                // with the error, never silently discard them.
                 let records: Vec<Record> = pre_rows.into_iter().map(|(r, _)| r).collect();
-                emit_records(out, &records, "syncs")?;
-                return Err(CmdError::err(e));
+                return Ok((Err(CmdError::err(e)), records));
             }
         }
     };
@@ -268,15 +349,14 @@ fn in_process(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
         worst = CmdError::worse(worst, code);
         records.push(record);
     }
-    emit_records(out, &records, "syncs")?;
-
-    match worst {
+    let result = match worst {
         0 => Ok(()),
         1 => Err(CmdError::attention(
             "one or more watches need attention (see above)",
         )),
         _ => Err(CmdError::err("one or more syncs failed (see above)")),
-    }
+    };
+    Ok((result, records))
 }
 
 /// Builds a minimal engine over `targets` — injecting each watch's
@@ -347,8 +427,19 @@ fn run_cycles(
 
 /// Request path (a daemon is running): hand the sync to the daemon via a request
 /// file. The outcome is asynchronous, so the command reports only that the
-/// request was queued.
-fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
+/// request was queued. Refusals and I/O errors carry only a stderr message
+/// ([`SyncEmit::Nothing`]); a queued request reports a single action.
+fn via_request(paths: &CmdPaths, args: &SyncArgs) -> (CmdResult, SyncEmit) {
+    match via_request_inner(paths, args) {
+        Ok((human, record)) => (Ok(()), SyncEmit::Action { human, record }),
+        Err(e) => (Err(e), SyncEmit::Nothing),
+    }
+}
+
+/// The fallible core of [`via_request`]: `?`/refusals short-circuit to the
+/// stderr-only error; a queued request returns the human line and record to
+/// print.
+fn via_request_inner(paths: &CmdPaths, args: &SyncArgs) -> Result<(String, Record), CmdError> {
     // Resolve a selector to the watch's *name* (the daemon routes by name) and
     // pre-check a NAMED target's eligibility here as fast-path UX. The daemon
     // answers every request honestly on its own — an ineligible watch's cycle
@@ -420,7 +511,7 @@ fn via_request(paths: &CmdPaths, out: &OutCtx, args: &SyncArgs) -> CmdResult {
             requested_record("(all)"),
         ),
     };
-    emit_action(out, &human, &record)
+    Ok((human, record))
 }
 
 /// Builds the per-watch result record and its exit code from the engine's

@@ -755,6 +755,50 @@ fn add_sync_writes_sync_true_in_the_new_entry() {
 }
 
 #[test]
+fn add_sync_json_is_a_single_document() {
+    // Finding 2: `add --sync --format json` must fold the confirmation cycle
+    // into the single add object (nested under "sync"), never emit two
+    // top-level documents.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    let out = env.vard(&[
+        "--format",
+        "json",
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+        "--sync",
+    ]);
+    let s = stdout(&out);
+    let trimmed = s.trim();
+    // Compact JSON is a single line; two documents would be two lines (or two
+    // objects concatenated). Assert exactly one object carrying nested rows.
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "expected a single JSON document, got: {s}"
+    );
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "not one object: {s}"
+    );
+    assert!(
+        trimmed.contains(r#""sync":["#),
+        "the confirmation rows must be nested under \"sync\": {s}"
+    );
+    assert!(
+        trimmed.contains(r#""name":"notes""#),
+        "the add fields must be present: {s}"
+    );
+    // Lightweight balance check (no JSON parser in the test deps).
+    let opens = trimmed.matches('{').count() + trimmed.matches('[').count();
+    let closes = trimmed.matches('}').count() + trimmed.matches(']').count();
+    assert_eq!(opens, closes, "unbalanced JSON delimiters: {s}");
+}
+
+#[test]
 fn add_sync_conflicts_with_no_sync() {
     let env = Env::new();
     let path = repo(&env, "notes");
