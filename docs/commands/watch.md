@@ -16,6 +16,7 @@ This is where you declare *what* to watch. [`snapshot`](snapshot.md) and [`run`]
 | `vard watch add <path>` | Register a directory (offering `git init` when it is not yet a repo). |
 | `vard watch remove <name\|path>` | Unregister a watch, never touching the repository or its history. |
 | `vard watch list` | Show every watch and its settings. |
+| `vard watch set <name\|path>` | Change one or more settings on an existing watch (or `--unset` to clear one). |
 | `vard watch pause <name\|path>` | Stop snapshotting a watch without unregistering it. |
 | `vard watch resume <name\|path>` | Resume a paused watch. |
 | `vard watch sync <name\|path> [--off]` | Turn syncing on for a watch (and confirm with a first sync), or `--off` to turn it off. |
@@ -31,6 +32,12 @@ vard watch add ~/project --no-sync --init
 
 vard watch list
 # show every watch and its settings
+
+vard watch set notes --interval 30m --trigger both
+# change settings on the "notes" watch in place
+
+vard watch set notes --unset interval
+# clear a setting so it re-inherits its default
 
 vard watch pause notes
 # stop the daemon snapshotting "notes" (metadata is kept)
@@ -64,6 +71,7 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 | `--trigger <MODE>` | Which automatic triggers arm snapshots: `events`, `interval`, or `both`. |
 | `--interval <DURATION>` | Interval between periodic snapshots, e.g. `15m` or `1h30m`. |
 | `--quiesce <DURATION>` | How long file activity must settle before a snapshot, e.g. `10s`. |
+| `--sync-interval <DURATION>` | Pull-sync cadence, e.g. `20m`; `0s` turns the pull timer off. Written into the new entry when given. |
 | `--no-sync` | Force the watch local-only: never sync to a remote, even if `defaults.sync = true`. Writes an explicit `sync = false` pin. Conflicts with `--sync`. |
 | `--sync` | Turn syncing on for the new watch and run a first sync to confirm — the same opt-in flow as [`vard watch sync`](#sync). Writes `sync = true`. Conflicts with `--no-sync`. |
 | `--init` | If the directory is not a git repository, `git init` it without prompting (the non-interactive escape hatch). |
@@ -124,6 +132,61 @@ vard watch list --format json
 
 (The `sync` field is the effective value: `no`/`false` here because a default-added watch is local-only until syncing is enabled in the config.)
 
+## set
+
+Change one or more settings on a watch that is already registered. The edit is applied to the watch's `[[watch]]` table in the config file in place, preserving your comments and formatting; the running daemon reloads it on its own. The watch is chosen by the same `<name|path>` selector as `remove`/`pause`/`resume`, and an unresolved selector exits `2`.
+
+```bash
+vard watch set notes --interval 30m
+```
+
+```text
+updated watch notes: interval = 30m
+```
+
+Each flag sets one key, using the same vocabulary — and the same parsing and validation — as [`add`](#add):
+
+| Flag | Key set |
+|---|---|
+| `--trigger <MODE>` | `trigger` (`events`, `interval`, or `both`). |
+| `--interval <DURATION>` | `interval`, e.g. `15m` or `1h30m`. |
+| `--quiesce <DURATION>` | `quiesce`, e.g. `10s`. |
+| `--sync-interval <DURATION>` | `sync_interval`, e.g. `20m`; `0s` turns the pull timer off. |
+| `--remote <REMOTE>` | `remote`. |
+| `--branch <BRANCH>` | `branch`. |
+
+Several flags may be combined in one invocation; the machine forms report the change as a single flat object (the watch name plus one field per changed key — its new value for a set, `null` for an unset):
+
+```bash
+vard watch set notes --trigger both --sync-interval 20m --format json
+```
+
+```json
+{"name":"notes","trigger":"both","sync_interval":"20m"}
+```
+
+### `--unset <key>`
+
+`--unset <key>` (repeatable) removes a key from the watch's entry so it re-inherits its default. Its keys are the config-key names of the flags above: `trigger`, `interval`, `quiesce`, `sync_interval`, `remote`, `branch`.
+
+```bash
+vard watch set notes --unset interval --unset quiesce
+```
+
+- Unsetting a key the watch does not set is reported and **exits `2`** (parity with [`vard config unset`](config.md#unset)), leaving the config untouched.
+- Setting and unsetting the same key in one invocation is a usage error (**exit `2`**).
+
+At least one `--<key>` flag or `--unset` is required; a bare `vard watch set <name|path>` with no changes is a usage error (**exit `2`**) that lists what can be set. An invalid value (a bad trigger or duration) is refused (**exit `2`**) and the config is left untouched — the edit lands only if the result still resolves to a valid watch.
+
+### What `set` deliberately does not touch
+
+Syncing, the paused flag, the path, and the name each have their own verb and are **not** settable here:
+
+- **syncing** — [`vard watch sync <name>`](#sync) (or `--off`); enabling it is a consent gesture that runs a confirmation cycle.
+- **paused** — [`vard watch pause`](#pause--resume) / `resume`.
+- **path** — re-run [`vard watch add`](#add) at the new location to relink a moved directory.
+- **name** and **exclude** — not editable through `set`.
+
 ## pause / resume
 
 `pause` stops the daemon snapshotting a watch until it is resumed. The watch stays registered and keeps all of its metadata; the pause is recorded as `paused = true` in the config file, so it survives a daemon restart and applies on the next reload. `resume` clears the flag; resuming a watch that is not paused is a no-op. A paused watch is reported by [`status`](status.md) but stays silent in [`notify`](notify.md) — a deliberate pause is not a problem.
@@ -169,7 +232,7 @@ The selector and its errors match `pause`/`resume`: a name or path selects the w
 
 ## Output contract
 
-`list` is a list surface (records/json/jsonl). The mutating verbs (`add`, `remove`, `pause`, `resume`) report their result the same way — a record on a terminal, JSON when piped:
+`list` is a list surface (records/json/jsonl). The mutating verbs (`add`, `remove`, `set`, `pause`, `resume`) report their result the same way — a record on a terminal, JSON when piped:
 
 ```text
 added watch notes → ~/notes

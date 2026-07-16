@@ -7,7 +7,7 @@ description: Read and edit vard's TOML configuration — get, set, unset, edit, 
 
 Read and edit vard's TOML configuration file. These commands address scalar keys in the `[daemon]`, `[defaults]`, `[ai]`, and `[update]` sections by their dotted names (`daemon.log_level`, `defaults.interval`, `ai.model`). Edits preserve your comments and formatting and are written atomically, so the running [daemon](run.md) — which watches the file — reloads a clean, whole config every time.
 
-The set of watched directories is **not** edited here: a `watch.*` key is refused with a pointer to the [`vard watch`](watch.md) verbs (`add`, `remove`, `pause`, `resume`), which understand watch identity. The top-level `version` is managed by vard and is not settable either.
+Watch settings are **not** edited here: a `watch.*` key is refused with a pointer to [`vard watch set`](watch.md#set) — the verb that edits a watch's settings by identity — and the other [`vard watch`](watch.md) verbs (`add`, `remove`, `pause`, `resume`). The top-level `version` is managed by vard and is not settable either.
 
 ## Subcommands
 
@@ -59,7 +59,7 @@ Pass `--format json` for the `{key, value}` object:
 
 ## set
 
-Set a config key to a value. The value's type is inferred (`true`/`false` a boolean, a bare integer a number, otherwise a string) and then validated: the edit is applied to a comment-preserving copy of the file and the result must still parse as a valid config. An edit that would turn a valid config invalid is **refused (exit `2`)** — for example a non-integer `daemon.log_retention_days`. A `watch.*` key is refused with a pointer to [`vard watch`](watch.md); `version` is not settable.
+Set a config key to a value. The value's type is inferred (`true`/`false` a boolean, a bare integer a number, otherwise a string) and then validated: the edit is applied to a comment-preserving copy of the file and the result must still parse as a valid config. An edit that would turn a valid config invalid is **refused (exit `2`)** — for example a non-integer `daemon.log_retention_days`. A `watch.*` key is refused with a pointer to [`vard watch set`](watch.md#set); `version` is not settable.
 
 ```text
 set defaults.interval = 30m
