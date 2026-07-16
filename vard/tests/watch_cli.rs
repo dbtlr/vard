@@ -880,6 +880,59 @@ fn add_hint_present_on_plain_add_absent_with_sync_and_defaults() {
 }
 
 #[test]
+fn relink_preserving_a_sync_pin_suppresses_the_off_hint() {
+    // Re-adding an existing `sync = true` watch at a new path (a relink) with no
+    // --sync preserves the pin; the opt-in hint must read the EFFECTIVE sync and
+    // stay silent — not falsely claim "syncing is off".
+    let env = Env::new();
+    let first = repo(&env, "one");
+    // Enable syncing on the watch. The repo has no remote, so the confirmation
+    // cycle exits 1, but the write lands `sync = true` regardless.
+    env.vard(&[
+        "watch",
+        "add",
+        first.to_str().unwrap(),
+        "--name",
+        "w",
+        "--sync",
+    ]);
+    assert!(
+        env.config_text().contains("sync = true"),
+        "setup: sync pin not written: {}",
+        env.config_text()
+    );
+
+    // Relink to a new path, records form, no --sync.
+    let second = repo(&env, "two");
+    let out = env.vard(&[
+        "--format",
+        "records",
+        "watch",
+        "add",
+        second.to_str().unwrap(),
+        "--name",
+        "w",
+    ]);
+    assert!(out.status.success(), "relink failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("relinked watch w"),
+        "expected a relink: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("syncing is off"),
+        "a relink preserving sync = true must not print the off hint: {}",
+        stdout(&out)
+    );
+    // The preserved pin survived the relink.
+    assert!(
+        env.config_text().contains("sync = true"),
+        "the relink must preserve the sync pin: {}",
+        env.config_text()
+    );
+}
+
+#[test]
 fn add_hint_absent_when_defaults_sync_is_on() {
     let env = Env::new();
     write_config(&env, "version = 1\n\n[defaults]\nsync = true\n");

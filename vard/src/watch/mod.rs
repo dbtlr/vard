@@ -183,7 +183,7 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
 
     // Serialize the whole read→plan→mutate→write cycle against concurrent
     // `vard watch` writers, so lost updates and stale relocations cannot race.
-    let _lock = ConfigLock::acquire(&paths.config_file)?;
+    let config_lock = ConfigLock::acquire(&paths.config_file)?;
 
     // Decide append-vs-relink against the current config, and load the editable
     // document, *before* any git init or exclude side effects — so a rejected
@@ -231,6 +231,13 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
     // can never take a valid config to invalid and wedge the daemon's reloads.
     let warning = config_edit::commit_document(&doc, &paths.config_file, pre_edit.as_deref())?;
 
+    // The config write is durable now, and nothing below writes the config, so
+    // release the writer lock BEFORE the `--sync` confirmation cycle — otherwise
+    // a no-daemon confirmation would hold the config lock across a network
+    // fetch/reconcile/push, blocking every other `vard watch` writer for its
+    // duration. (The `vard watch sync` verb already scopes its lock this way.)
+    drop(config_lock);
+
     let verb = if relinked { "relinked" } else { "added" };
     let human = format!("{verb} watch {name} → {}", canonical.display());
     let record = Record {
@@ -257,14 +264,16 @@ fn cmd_add(paths: &WatchPaths, out: &OutCtx, args: WatchAddArgs) -> CmdResult {
         return Err(w);
     }
 
-    // No `--sync`: when syncing resolves off for this watch, print exactly one
-    // hint pointing at the opt-in verb. Records form only — the machine forms
-    // already carry the effective `sync` value via `watch list`. A watch that
-    // resolves sync ON (via `defaults.sync = true`), or an explicit `--no-sync`,
-    // gets no hint.
+    // No `--sync`: when syncing resolves off for the resulting watch, print
+    // exactly one hint pointing at the opt-in verb. Records form only — the
+    // machine forms already carry the effective `sync` value via `watch list`.
+    // An explicit `--no-sync` suppresses it (the user just chose local-only),
+    // and the check reads the watch's EFFECTIVE sync after the write, so a
+    // relink that preserved a `sync = true` pin — or a `defaults.sync = true` —
+    // correctly suppresses it too rather than falsely claiming "syncing is off".
     if !args.no_sync
         && matches!(out.format, OutputFormat::Records)
-        && !defaults_sync_on(config.as_ref())
+        && resulting_watch_syncs(paths, &name) == Some(false)
     {
         let mut w = io::stdout().lock();
         let _ = writeln!(w, "syncing is off — enable with: vard watch sync {name}");
@@ -286,11 +295,19 @@ fn add_sync_pin(sync: bool, no_sync: bool) -> Option<bool> {
     }
 }
 
-/// Whether `[defaults].sync = true` is set — the one config-level way a
-/// no-flag `watch add` resolves syncing ON, in which case the opt-in hint is
-/// suppressed.
-fn defaults_sync_on(config: Option<&Config>) -> bool {
-    config.and_then(|c| c.defaults.sync).unwrap_or(false)
+/// The resulting watch's EFFECTIVE `sync` after an `add` write — its own
+/// `sync` pin (an explicit `--no-sync`/`--sync`, or one preserved through a
+/// relink) resolved over `defaults.sync` and the core default. `Some(false)`
+/// gates the opt-in hint; `None` on any load/resolve failure suppresses the
+/// hint rather than risk a misleading claim. Reads the post-write config, so a
+/// relink that preserved a `sync = true` pin is seen as on.
+fn resulting_watch_syncs(paths: &WatchPaths, name: &str) -> Option<bool> {
+    let config = load_config(&paths.config_file).ok()??;
+    let resolved = config.resolve_all().ok()?;
+    resolved
+        .iter()
+        .find(|rw| rw.spec.name().eq_ignore_ascii_case(name))
+        .map(|rw| rw.spec.sync())
 }
 
 /// Resolves the repository decision for `path` *without holding the config
