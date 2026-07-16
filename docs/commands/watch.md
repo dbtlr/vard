@@ -68,7 +68,7 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 | `--sync` | Turn syncing on for the new watch and run a first sync to confirm — the same opt-in flow as [`vard watch sync`](#sync). Writes `sync = true`. Conflicts with `--no-sync`. |
 | `--init` | If the directory is not a git repository, `git init` it without prompting (the non-interactive escape hatch). |
 
-Syncing is **off by default**: a newly added watch is local-only until you turn it on. Pass `--sync` to opt in at add time (it writes `sync = true` and runs a confirmation cycle), or turn it on later with [`vard watch sync <name>`](#sync). Either way, configure a `remote` and `branch` for the sync to have somewhere to go. See [`sync`](sync.md).
+Syncing is **off by default**: a newly added watch is local-only until you turn it on. Pass `--sync` to opt in at add time (it writes `sync = true` and runs a confirmation cycle), or turn it on later with [`vard watch sync <name>`](#sync). The `--remote` and `--branch` flags are **optional** — they default to `origin` and the repository's current branch — so what a sync actually needs is that the selected remote **exists in the repository** (`git remote add origin <url>`), not that you pass the flags. See [`sync`](sync.md).
 
 When an `add` leaves syncing **off** — neither `--sync` nor a `defaults.sync = true` — the records-form output ends with a single hint line:
 
@@ -160,8 +160,10 @@ disabled syncing for watch notes
 
 The selector and its errors match `pause`/`resume`: a name or path selects the watch, and an unresolved selector exits 2. The enable path's exit code mirrors [`sync`](sync.md):
 
-- **No daemon:** `0` when the confirmation cycle synced or was `up to date`, `1` when the watch has no remote yet (or a reconcile conflict), `2` on an operational failure.
-- **Daemon running:** `0` once the request is **queued** (the actual outcome is asynchronous), `1` when the up-front check refuses (the watch has no configured remote yet), `2` when its repository cannot be opened.
+- **No daemon:** `0` when the confirmation cycle synced or was `up to date`, `1` when the watch is **paused**, has no remote yet, or a reconcile conflict latched, `2` on an operational failure.
+- **Daemon running:** `0` once the request is **queued** (the actual outcome is asynchronous), `1` when the up-front check refuses (the watch is **paused** — the daemon will not sync it — or has no configured remote yet), `2` when its repository cannot be opened.
+
+(Enabling still writes `sync = true` even for a paused watch; the confirmation just reports that it is paused. Resume it, then re-sync.)
 
 `--off` always exits `0` on success — it only writes the config and runs no cycle.
 
@@ -188,6 +190,7 @@ added watch notes → ~/notes
 | Code | Meaning |
 |---|---|
 | `0` | The change was applied. |
+| `1` | Attention — the change was applied but its `sync` confirmation could not complete: the watch is paused, has no configured remote yet, or a reconcile conflict latched (only `sync` / `add --sync` produce this). |
 | `2` | The change was refused (e.g. a name/path that does not resolve, or `add` declining a non-repo non-interactively). |
 
 ## See also
