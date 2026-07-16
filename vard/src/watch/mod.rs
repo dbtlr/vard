@@ -1,4 +1,4 @@
-//! The `vard watch` command set: add, remove, list, set, pause, resume.
+//! The `vard watch` command set: add, remove, list, set, pause, resume, sync.
 //!
 //! These are the first commands that *mutate* vard's configuration. They edit
 //! `config.toml` in place through the comment-preserving

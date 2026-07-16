@@ -115,7 +115,7 @@ SIGTERM.")]
     Run,
 
     /// Manage the set of watched directories: add, remove, list, set, pause,
-    /// resume.
+    /// resume, sync.
     //
     // The teaching prose lives in `long_about`. A bare `vard watch` (no
     // subcommand) prints this command's short help, mirroring a bare `vard`, so
