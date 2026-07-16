@@ -1154,11 +1154,15 @@ async fn supervise(
                     schedule_rebuild(&mut backoff, &mut rebuild_at, "engine failed during swap");
                 }
                 // Drain any request the poll tick deferred while this config
-                // change settled, now against the rebuilt engine — so a
-                // control-plane request that accompanied a config edit (e.g.
-                // `vard watch sync` enabling sync) is answered by the new config.
-                // A request naming a watch this reload just removed now fails
-                // honestly (logged and skipped), which is correct.
+                // change settled — so a control-plane request that accompanied a
+                // config edit (e.g. `vard watch sync` enabling sync) is answered
+                // against the current config, not the pre-reload engine. On a
+                // successful rebuild that is the new engine and watch set; when
+                // the reload FAILED (an invalid config), `try_rebuild` retained
+                // the last-good engine and watch set, so the request is still
+                // consumed here and answered by that last-good config. A request
+                // naming a watch this reload just removed fails honestly (logged
+                // and skipped), which is correct.
                 process_requests(&paths, &handle, &watches);
             }
             Action::BackoffRebuild => {
