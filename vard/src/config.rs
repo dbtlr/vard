@@ -778,8 +778,28 @@ sync = false
         let specs = config.resolve().unwrap();
         let spec = &specs[0];
         assert!(!spec.sync());
-        // sync_interval is still validated (> 0) even with sync off.
+        // sync_interval falls back to its default even with sync off.
         assert_eq!(spec.sync_interval(), DEFAULT_SYNC_INTERVAL);
+    }
+
+    #[test]
+    fn zero_sync_interval_parses_and_disables_the_pull_timer() {
+        // "0s" is the accepted zero spelling; it resolves to Duration::ZERO and
+        // passes validation (a zero sync_interval means the pull timer is off).
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "manual-sync"
+path = "/data/manual"
+sync = true
+sync_interval = "0s"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].sync_interval(), Duration::ZERO);
     }
 
     #[test]
