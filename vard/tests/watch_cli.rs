@@ -953,3 +953,222 @@ fn add_hint_absent_when_defaults_sync_is_on() {
         stdout(&out)
     );
 }
+
+// --- watch set -------------------------------------------------------------
+
+#[test]
+fn set_writes_a_key_preserving_comments() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    // Inject a hand-written comment ahead of the config.
+    let cfg = env.config_path();
+    let original = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("# keep this note\n{original}")).unwrap();
+
+    let out = env.vard(&["watch", "set", "notes", "--interval", "30m"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = env.config_text();
+    assert!(text.contains("interval = \"30m\""), "got: {text}");
+    assert!(text.contains("# keep this note"), "comment lost: {text}");
+}
+
+#[test]
+fn set_multiple_keys_in_one_invocation() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&[
+        "watch",
+        "set",
+        "notes",
+        "--trigger",
+        "both",
+        "--interval",
+        "30m",
+        "--sync-interval",
+        "20m",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = env.config_text();
+    assert!(text.contains("trigger = \"both\""), "got: {text}");
+    assert!(text.contains("interval = \"30m\""), "got: {text}");
+    assert!(text.contains("sync_interval = \"20m\""), "got: {text}");
+}
+
+#[test]
+fn set_json_reports_the_applied_changes() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&[
+        "--format", "json", "watch", "set", "notes", "--branch", "backup",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let json = stdout(&out);
+    assert!(json.contains("\"name\":\"notes\""), "got: {json}");
+    assert!(json.contains("\"branch\":\"backup\""), "got: {json}");
+}
+
+#[test]
+fn set_zero_sync_interval_turns_the_pull_timer_off() {
+    // `0s` is a valid sync_interval (pull timer off) — it must be accepted, not
+    // rejected as a zero duration the way interval/quiesce are.
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["watch", "set", "notes", "--sync-interval", "0s"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        env.config_text().contains("sync_interval = \"0s\""),
+        "got: {}",
+        env.config_text()
+    );
+}
+
+#[test]
+fn set_a_bad_duration_is_refused_and_leaves_the_config_untouched() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    let before = env.config_text();
+
+    let out = env.vard(&["watch", "set", "notes", "--interval", "5x"]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert_eq!(env.config_text(), before, "config must be untouched");
+}
+
+#[test]
+fn set_unset_removes_a_key_so_it_re_inherits_the_default() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    env.vard(&[
+        "watch",
+        "set",
+        "notes",
+        "--interval",
+        "30m",
+        "--quiesce",
+        "10s",
+    ]);
+
+    let out = env.vard(&["watch", "set", "notes", "--unset", "interval"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = env.config_text();
+    assert!(
+        !text.lines().any(|l| l.trim_start().starts_with("interval")),
+        "interval must be gone: {text}"
+    );
+    assert!(text.contains("quiesce = \"10s\""), "sibling kept: {text}");
+}
+
+#[test]
+fn set_unset_of_an_unset_key_is_an_error() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+    let before = env.config_text();
+
+    let out = env.vard(&["watch", "set", "notes", "--unset", "quiesce"]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("does not set quiesce"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(env.config_text(), before, "config must be untouched");
+}
+
+#[test]
+fn set_and_unset_the_same_key_is_a_usage_error() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&[
+        "watch",
+        "set",
+        "notes",
+        "--trigger",
+        "events",
+        "--unset",
+        "trigger",
+    ]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("set and --unset"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn set_with_no_flags_is_a_usage_error() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["watch", "set", "notes"]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("nothing to set"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn set_on_an_unknown_watch_is_an_error() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["watch", "set", "ghost", "--trigger", "both"]);
+    assert_eq!(code(&out), 2, "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no watch named or rooted at"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn set_selects_by_path() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    env.vard(&["watch", "add", path.to_str().unwrap(), "--name", "notes"]);
+
+    let out = env.vard(&["watch", "set", path.to_str().unwrap(), "--remote", "backup"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        env.config_text().contains("remote = \"backup\""),
+        "got: {}",
+        env.config_text()
+    );
+}
+
+#[test]
+fn add_sync_interval_writes_the_key() {
+    let env = Env::new();
+    let path = repo(&env, "notes");
+    let out = env.vard(&[
+        "watch",
+        "add",
+        path.to_str().unwrap(),
+        "--name",
+        "notes",
+        "--sync-interval",
+        "20m",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        env.config_text().contains("sync_interval = \"20m\""),
+        "got: {}",
+        env.config_text()
+    );
+}

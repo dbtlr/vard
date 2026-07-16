@@ -77,6 +77,21 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
             format!("{watch} list --format json"),
             "emit the watch list as JSON for a script".to_string(),
         )]
+    } else if cmd_path == format!("{watch} set") {
+        vec![
+            (
+                format!("{watch} set notes --interval 30m"),
+                "snapshot notes every 30 minutes".to_string(),
+            ),
+            (
+                format!("{watch} set notes --trigger both --sync-interval 20m"),
+                "change several settings at once".to_string(),
+            ),
+            (
+                format!("{watch} set notes --unset interval"),
+                "clear the interval so it re-inherits the default".to_string(),
+            ),
+        ]
     } else if cmd_path == format!("{watch} pause") {
         vec![(
             format!("{watch} pause notes"),
@@ -275,6 +290,7 @@ mod tests {
             "vard watch add",
             "vard watch remove",
             "vard watch list",
+            "vard watch set",
             "vard watch pause",
             "vard watch resume",
             "vard watch sync",
