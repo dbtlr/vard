@@ -605,3 +605,57 @@ fn sync_all_syncs_enabled_and_skips_disabled() {
         "disabled watch shown: {text}"
     );
 }
+
+#[test]
+fn pre_dispatch_errors_emit_nothing_while_zero_sync_enabled_emits_an_empty_document() {
+    // The dispatch/render split must preserve `vard sync`'s row-less error
+    // contract: an error decided BEFORE the cycle (an unresolved selector, a
+    // broken config) prints NOTHING on stdout (exit 2) — never an empty `[]` /
+    // `0 syncs` that a JSON consumer could misread as a benign "zero syncs".
+    // The legitimately-empty no-selector zero-sync-enabled result, by contrast,
+    // still emits its empty document (exit 1), exactly as before the split.
+    let env = Env::new();
+
+    // (a) Unresolved selector against a valid config with no watch named "ghost".
+    env.write_config(
+        "version = 1\n\n[[watch]]\nname = \"notes\"\npath = \"/tmp/vard-nonexistent-notes\"\n",
+    );
+    for fmt in ["json", "records"] {
+        let out = env.vard(&["--format", fmt, "sync", "ghost"]);
+        assert_eq!(code(&out), 2, "an unresolved selector exits 2 ({fmt})");
+        assert!(
+            stdout(&out).is_empty(),
+            "a pre-dispatch error must print nothing on stdout ({fmt}): {:?}",
+            stdout(&out)
+        );
+    }
+
+    // (b) Broken config (not valid TOML): the load fails before any dispatch.
+    env.write_config("this is = = not toml\n");
+    for fmt in ["json", "records"] {
+        let out = env.vard(&["--format", fmt, "sync", "notes"]);
+        assert_eq!(code(&out), 2, "a broken config exits 2 ({fmt})");
+        assert!(
+            stdout(&out).is_empty(),
+            "a broken config must print nothing on stdout ({fmt}): {:?}",
+            stdout(&out)
+        );
+    }
+
+    // The legitimately-empty result still emits its empty document.
+    env.write_config("version = 1\n");
+    let out = env.vard(&["--format", "json", "sync"]);
+    assert_eq!(code(&out), 1, "zero sync-enabled exits 1 (json)");
+    assert_eq!(
+        stdout(&out).trim(),
+        "[]",
+        "the no-selector zero-sync-enabled case still emits an empty JSON array"
+    );
+    let out = env.vard(&["--format", "records", "sync"]);
+    assert_eq!(code(&out), 1, "zero sync-enabled exits 1 (records)");
+    assert!(
+        stdout(&out).contains("0 syncs"),
+        "records still emits the empty count line: {:?}",
+        stdout(&out)
+    );
+}

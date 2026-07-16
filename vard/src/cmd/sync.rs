@@ -211,10 +211,10 @@ pub(crate) fn collect(args: &SyncArgs) -> (CmdResult, SyncEmit) {
     //   * a peer CLI holds it past the budget ⇒ honest "another command is running"
     match InstanceLock::acquire_for_cli(&paths.lock_file, CLI_LOCK_BUDGET) {
         Ok(CliLock::Acquired(lock)) => {
-            let (result, rows) = in_process(&paths, args);
+            let reported = in_process(&paths, args);
             // Hold the lock across the whole in-process sync; drop it only now.
             drop(lock);
-            (result, SyncEmit::Rows(rows))
+            reported
         }
         Ok(CliLock::DaemonHeld) => via_request(&paths, args),
         Ok(CliLock::BusyPeerCli) => (
@@ -231,15 +231,20 @@ pub(crate) fn collect(args: &SyncArgs) -> (CmdResult, SyncEmit) {
 }
 
 /// In-process path (no daemon): run one sync cycle per targeted, sync-enabled
-/// watch under the held instance lock. Returns the overall outcome plus the
-/// per-watch result rows, WITHOUT emitting — the caller renders or folds them.
-fn in_process(paths: &CmdPaths, args: &SyncArgs) -> (CmdResult, Vec<Record>) {
+/// watch under the held instance lock. Returns the overall outcome plus what to
+/// print, WITHOUT emitting — the caller renders or folds it.
+fn in_process(paths: &CmdPaths, args: &SyncArgs) -> (CmdResult, SyncEmit) {
     match in_process_collect(paths, args) {
-        Ok(reported) => reported,
-        // An error decided before any row exists (config load, an unresolved
-        // selector, an engine that could not start) carries only the stderr
-        // message — there is nothing to print on stdout.
-        Err(e) => (Err(e), Vec::new()),
+        // A path that decided rows prints them — including the legitimately
+        // *empty* result sets (the no-selector zero-sync-enabled case and an
+        // engine-start failure), which emitted `[]` / `0 syncs` before the
+        // dispatch/render split and must keep doing so.
+        Ok((result, rows)) => (result, SyncEmit::Rows(rows)),
+        // An error decided BEFORE dispatch (config load failure, an unresolved
+        // selector) printed NOTHING before this split, and must stay silent:
+        // emitting an empty `[]` / `0 syncs` here would let a JSON consumer
+        // misread a hard failure (exit 2) as a benign "zero syncs".
+        Err(e) => (Err(e), SyncEmit::Nothing),
     }
 }
 
