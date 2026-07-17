@@ -34,13 +34,13 @@
 //! `VARD_FILES_CHANGED`, `VARD_ERROR`. An unset variable is absent from the
 //! environment, never an empty string. See [`hook_env`].
 //!
-//! # State for observability (checkpoint 3)
+//! # State for observability
 //!
 //! The runner accumulates per-watch suppression totals and per-key
 //! consecutive-failure counts. [`HooksRunnerHandle::snapshot`] is a cheap, pure
-//! read of that state ([`RunnerSnapshot`]) — the projection a later checkpoint
-//! folds into the health file. This module builds the state; it does not report
-//! it.
+//! read of that state ([`RunnerSnapshot`]) — the projection the daemon folds into
+//! the health file (`hook-failing` problems and per-watch suppression telemetry,
+//! see [`crate::health`]). This module builds the state; it does not report it.
 
 mod exec;
 mod limiter;
@@ -59,10 +59,8 @@ use exec::{HookInvocation, HookOutcome, exec_hook};
 use limiter::{Fire, Limiter};
 
 /// Consecutive-failure count at which a hook key is surfaced as a health problem.
-/// A constant — a configurable knob waits for demand.
-// Consumed by the health projection in a later checkpoint; the runner already
-// tracks against it here.
-#[allow(dead_code)]
+/// A constant — a configurable knob waits for demand. The daemon projects every
+/// [`FailingHook`] at or beyond this count into a `hook-failing` health problem.
 pub(crate) const FAILURE_THRESHOLD: u64 = 3;
 
 /// A hook's scope: a specific watch, or the daemon-global `[hooks]` section.
@@ -168,11 +166,8 @@ impl HooksConfig {
 }
 
 /// A cheap, point-in-time read of the runner's accumulated state — the pure
-/// projection a later checkpoint folds into the health file. Building it is a
-/// lock, clone, and unlock.
-// The projection surface is consumed by a later checkpoint; the runner builds
-// and maintains the underlying state now.
-#[allow(dead_code)]
+/// projection the daemon folds into the health file (`hook-failing` problems and
+/// per-watch suppression telemetry). Building it is a lock, clone, and unlock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunnerSnapshot {
     /// Total coalesced (suppressed) event counts per watch name.
@@ -183,7 +178,6 @@ pub(crate) struct RunnerSnapshot {
 }
 
 /// One persistently-failing hook, for the health projection.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct FailingHook {
     /// The watch name, or `None` for a daemon-global hook.
@@ -220,16 +214,14 @@ struct Failure {
 /// (the daemon's re-arm on engine rebuild/reload), while any hook already
 /// executing on a blocking task still runs to completion and reaps its child.
 pub(crate) struct HooksRunnerHandle {
-    // Read by `snapshot`, which a later checkpoint calls to build the health
-    // projection; the runner task writes it throughout.
-    #[allow(dead_code)]
+    // Read by `snapshot`, which the daemon calls to build the health projection;
+    // the runner task writes it throughout.
     state: Arc<Mutex<SharedState>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HooksRunnerHandle {
     /// A cheap, pure read of the runner's state for the health projection.
-    #[allow(dead_code)]
     pub(crate) fn snapshot(&self) -> RunnerSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut failing: Vec<FailingHook> = state

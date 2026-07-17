@@ -179,6 +179,7 @@ fn join_rows(
     include_orphans: bool,
 ) -> Vec<WatchRow> {
     let problems = problems_map(report);
+    let suppressions = suppression_map(report);
     // A running daemon (even under a stale file) is monitoring; a starting or
     // stopped daemon is not, so an unpaused watch is `unknown`, not `ok`.
     let monitoring = matches!(report, HealthReport::Running { .. });
@@ -188,13 +189,26 @@ fn join_rows(
             let alias_of = aliases
                 .get(&rw.spec.name().to_lowercase())
                 .map(String::as_str);
-            WatchRow::project(rw, &problems, monitoring, alias_of)
+            let mut row = WatchRow::project(rw, &problems, monitoring, alias_of);
+            // Overlay this watch's hook suppression telemetry (VRD-21) when
+            // nonzero — it is not a problem, so it rides alongside whatever state
+            // the watch already has (including `ok`) and never changes it.
+            if let Some(&count) = suppressions.get(&rw.spec.name().to_lowercase())
+                && count > 0
+            {
+                row.suppressed = Some(count);
+            }
+            row
         })
         .collect();
 
     if include_orphans && let HealthReport::Running { problems, .. } = report {
         for p in problems {
-            if !configured_names.contains(&p.watch.to_lowercase()) {
+            if p.watch.is_empty() {
+                // An empty watch marks a daemon-global (`[hooks]`) hook failure
+                // (VRD-21): it has no watch row to join, so it stands alone.
+                rows.push(WatchRow::global_hook(p));
+            } else if !configured_names.contains(&p.watch.to_lowercase()) {
                 rows.push(WatchRow::orphan(p));
             }
         }
@@ -222,6 +236,19 @@ fn problems_map(report: &HealthReport) -> HashMap<String, &HealthProblem> {
         HealthReport::Running { problems, .. } => problems
             .iter()
             .map(|p| (p.watch.to_lowercase(), p))
+            .collect(),
+        HealthReport::Starting | HealthReport::NotRunning { .. } => HashMap::new(),
+    }
+}
+
+/// Indexes the per-watch hook suppression telemetry (VRD-21) by lowercased watch
+/// name, the same case-insensitive identity as [`problems_map`]. Empty unless a
+/// daemon is running.
+fn suppression_map(report: &HealthReport) -> HashMap<String, u64> {
+    match report {
+        HealthReport::Running { suppressions, .. } => suppressions
+            .iter()
+            .map(|s| (s.watch.to_lowercase(), s.count))
             .collect(),
         HealthReport::Starting | HealthReport::NotRunning { .. } => HashMap::new(),
     }
@@ -294,6 +321,9 @@ struct WatchRow {
     summary: Option<String>,
     /// Unix seconds the problem state was entered, else `None`.
     since: Option<u64>,
+    /// This watch's hook suppression count (VRD-21), when nonzero — pure
+    /// telemetry shown alongside the state, never itself a problem.
+    suppressed: Option<u64>,
 }
 
 impl WatchRow {
@@ -331,6 +361,7 @@ impl WatchRow {
             kind: Some("aliased".to_string()),
             summary: Some(format!("path aliases watch '{winner}'; not supervised")),
             since: None,
+            suppressed: None,
         }
     }
 
@@ -343,6 +374,22 @@ impl WatchRow {
             kind: Some(p.kind.clone()),
             summary: Some(format!("{} (watch not in the current config)", p.summary)),
             since: Some(p.since),
+            suppressed: None,
+        }
+    }
+
+    /// A row for a daemon-global (`[hooks]`) hook problem (VRD-21): it has no
+    /// watch, so it is labeled `[hooks]` — a token no real watch name can be
+    /// (names are ASCII alphanumerics plus `-_.`) — rather than shown as an
+    /// orphaned watch.
+    fn global_hook(p: &HealthProblem) -> WatchRow {
+        WatchRow {
+            name: "[hooks]".to_string(),
+            state: p.state.clone(),
+            kind: Some(p.kind.clone()),
+            summary: Some(format!("{} (daemon-global hook)", p.summary)),
+            since: Some(p.since),
+            suppressed: None,
         }
     }
 
@@ -354,6 +401,7 @@ impl WatchRow {
             kind: Some(p.kind.clone()),
             summary: Some(p.summary.clone()),
             since: Some(p.since),
+            suppressed: None,
         }
     }
 
@@ -365,6 +413,7 @@ impl WatchRow {
             kind: None,
             summary: None,
             since: None,
+            suppressed: None,
         }
     }
 
@@ -454,6 +503,12 @@ fn human_line(row: &WatchRow, palette: &Palette, now: u64, ascii: bool) -> Strin
     if let Some(summary) = &row.summary {
         line.push_str(&format!(" — {}", clean_line(summary)));
     }
+    // Hook suppression telemetry (VRD-21) trails the line when nonzero, so a
+    // healthy watch that has only coalesced hooks reads e.g. `notes: ok
+    // (12 hook events coalesced)`.
+    if let Some(count) = row.suppressed {
+        line.push_str(&format!(" ({count} hook events coalesced)"));
+    }
     line
 }
 
@@ -477,6 +532,8 @@ fn daemon_record(daemon: &DaemonStatus, now: u64) -> Record {
         None,
         Some(daemon.summary.as_str()),
         daemon.since,
+        // The daemon row is not a watch and carries no suppression telemetry.
+        None,
         now,
         true,
     )
@@ -489,6 +546,7 @@ fn watch_record(row: &WatchRow, now: u64) -> Record {
         row.kind.as_deref(),
         row.summary.as_deref(),
         row.since,
+        row.suppressed,
         now,
         false,
     )
@@ -496,7 +554,8 @@ fn watch_record(row: &WatchRow, now: u64) -> Record {
 
 /// Builds one fixed-shape record. `elapsed_seconds` is derived so a consumer
 /// need not know the current time; timestamps are bare numbers (or null). The
-/// `daemon` boolean distinguishes the liveness row from a watch row.
+/// `daemon` boolean distinguishes the liveness row from a watch row. `suppressed`
+/// is the watch's hook-suppression count (VRD-21), null when zero or N/A.
 #[allow(clippy::too_many_arguments)]
 fn row_record(
     name: Option<&str>,
@@ -504,6 +563,7 @@ fn row_record(
     kind: Option<&str>,
     summary: Option<&str>,
     since: Option<u64>,
+    suppressed: Option<u64>,
     now: u64,
     is_daemon: bool,
 ) -> Record {
@@ -517,6 +577,7 @@ fn row_record(
             RecordField::opt("summary", summary.map(str::to_string)),
             RecordField::opt_int("since", since.map(|s| s as i64)),
             RecordField::opt_int("elapsed_seconds", elapsed),
+            RecordField::opt_int("suppressed", suppressed.map(|s| s as i64)),
             RecordField::bool("daemon", is_daemon),
         ],
     }
@@ -668,6 +729,7 @@ mod tests {
         // A problem whose watch is not in the config must not be dropped.
         let report = HealthReport::Running {
             problems: vec![problem("ghost", "conflicted", 100)],
+            suppressions: vec![],
             written_at: 1000,
         };
         let configured: HashSet<String> = ["kept".to_string()].into_iter().collect();
@@ -700,6 +762,7 @@ mod tests {
     fn join_skips_orphans_when_a_selector_is_in_play() {
         let report = HealthReport::Running {
             problems: vec![problem("ghost", "conflicted", 100)],
+            suppressions: vec![],
             written_at: 1000,
         };
         let configured: HashSet<String> = ["kept".to_string()].into_iter().collect();
@@ -718,6 +781,7 @@ mod tests {
     fn daemon_running_fresh_is_not_attention() {
         let report = HealthReport::Running {
             problems: vec![],
+            suppressions: vec![],
             written_at: 1000,
         };
         let d = DaemonStatus::from_report(&report, 1000 + 5);
@@ -729,6 +793,7 @@ mod tests {
     fn daemon_running_stale_is_attention() {
         let report = HealthReport::Running {
             problems: vec![],
+            suppressions: vec![],
             written_at: 1000,
         };
         let d = DaemonStatus::from_report(&report, 1000 + health::STALE_AFTER_SECS + 1);
@@ -760,6 +825,7 @@ mod tests {
             kind: Some("conflicted".to_string()),
             summary: Some("a sync conflict is blocking progress".to_string()),
             since: Some(1000),
+            suppressed: None,
         };
         let line = human_line(&row, &Palette::off(), 1000 + 7200, false);
         assert!(line.contains("vault: conflicted"), "got: {line}");
@@ -782,6 +848,7 @@ mod tests {
             kind: Some("attention".to_string()),
             summary: Some("evil\x1b[31m\x07".to_string()),
             since: Some(10),
+            suppressed: None,
         };
         let line = human_line(&row, &Palette::off(), 20, false);
         assert!(!line.contains('\x1b'), "raw ESC must not survive: {line:?}");
@@ -812,5 +879,111 @@ mod tests {
         let daemon = DaemonStatus::from_report(&HealthReport::Starting, 5);
         let recs = records(&daemon, &[], 5);
         assert_eq!(recs.len(), 1, "just the daemon row");
+    }
+
+    fn hook_failing(watch: &str, since: u64) -> HealthProblem {
+        HealthProblem {
+            watch: watch.to_string(),
+            state: "attention".to_string(),
+            kind: "hook-failing".to_string(),
+            summary: "hook for snapshot.completed has failed 3 times".to_string(),
+            since,
+        }
+    }
+
+    #[test]
+    fn a_hook_failing_problem_makes_its_watch_attention() {
+        // A watch-scoped hook failure joins onto the watch row like any other
+        // problem and folds into the exit code.
+        let p = hook_failing("notes", 100);
+        let map = map_of(std::slice::from_ref(&p));
+        let row = WatchRow::project(&resolved("notes", false), &map, true, None);
+        assert_eq!(row.state, "attention");
+        assert_eq!(row.kind.as_deref(), Some("hook-failing"));
+        assert!(row.is_problem());
+    }
+
+    #[test]
+    fn suppression_telemetry_rides_an_ok_watch_and_is_never_a_problem() {
+        let report = HealthReport::Running {
+            problems: vec![],
+            suppressions: vec![health::HookSuppression {
+                watch: "notes".to_string(),
+                count: 12,
+            }],
+            written_at: 1000,
+        };
+        let rows = join_rows(
+            &report,
+            &[resolved("notes", false)],
+            &["notes".to_string()].into_iter().collect(),
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "ok", "suppression never changes the state");
+        assert_eq!(rows[0].suppressed, Some(12));
+        assert!(
+            !rows[0].is_problem(),
+            "suppression telemetry is not attention"
+        );
+        let line = human_line(&rows[0], &Palette::off(), 1000, false);
+        assert!(line.contains("12 hook events coalesced"), "got: {line}");
+    }
+
+    #[test]
+    fn a_zero_suppression_count_is_omitted() {
+        let report = HealthReport::Running {
+            problems: vec![],
+            suppressions: vec![health::HookSuppression {
+                watch: "notes".to_string(),
+                count: 0,
+            }],
+            written_at: 1000,
+        };
+        let rows = join_rows(
+            &report,
+            &[resolved("notes", false)],
+            &["notes".to_string()].into_iter().collect(),
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(rows[0].suppressed, None, "a zero count is not shown");
+        let line = human_line(&rows[0], &Palette::off(), 1000, false);
+        assert!(!line.contains("coalesced"), "got: {line}");
+    }
+
+    #[test]
+    fn a_global_hook_failure_renders_as_a_bracketed_hooks_row() {
+        // A daemon-global hook failure carries an empty watch; it stands alone as
+        // a `[hooks]` row (never an orphaned watch) and folds into the exit code.
+        let report = HealthReport::Running {
+            problems: vec![hook_failing("", 500)],
+            suppressions: vec![],
+            written_at: 1000,
+        };
+        let rows = join_rows(
+            &report,
+            &[resolved("notes", false)],
+            &["notes".to_string()].into_iter().collect(),
+            &HashMap::new(),
+            true,
+        );
+        let global = rows
+            .iter()
+            .find(|r| r.name == "[hooks]")
+            .expect("a [hooks] row");
+        assert_eq!(global.state, "attention");
+        assert_eq!(global.kind.as_deref(), Some("hook-failing"));
+        assert!(
+            global
+                .summary
+                .as_deref()
+                .unwrap()
+                .contains("daemon-global hook"),
+            "got: {:?}",
+            global.summary
+        );
+        assert!(global.is_problem());
     }
 }

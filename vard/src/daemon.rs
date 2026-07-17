@@ -89,7 +89,7 @@ use vard_core::{
 
 use crate::config::{Config, ConfigError, LogLevel};
 use crate::health;
-use crate::hooks::{self, HooksConfig, HooksRunnerHandle};
+use crate::hooks::{self, HooksConfig, HooksRunnerHandle, RunnerSnapshot};
 use crate::instance::{InstanceLock, LockError, LockRole};
 use crate::journal::{self, Journal, JournalOpGate, RecoveryReport, SweepOpts};
 use crate::paths::{self, HomeNotFound};
@@ -1087,7 +1087,7 @@ async fn try_rebuild(
             // — so a stale problem cannot linger, and a still-blocked watch the
             // new engine re-probed at startup is reflected at once (no rebuild
             // amnesia).
-            write_health(&handle, &skipped, paths);
+            write_health(&handle, &skipped, hooks.as_ref(), paths);
             RebuildOutcome {
                 handle,
                 events,
@@ -1220,7 +1220,7 @@ async fn supervise(
     // Write a fresh health document on startup, regenerated from the engine's
     // truth (the initial state probe has already flagged any blocked repo), so
     // it supersedes the crash-leftover file that was cleared before build.
-    write_health(&handle, &skipped, &paths);
+    write_health(&handle, &skipped, hooks.as_ref(), &paths);
 
     loop {
         // Coalesce a burst of health-relevant events into a single write per loop
@@ -1233,8 +1233,9 @@ async fn supervise(
                 Action::Reload
             }
             _ = heartbeat.tick() => {
-                // Refresh written_at (and self-heal any missed transition).
-                write_health(&handle, &skipped, &paths);
+                // Refresh written_at (and self-heal any missed transition, plus
+                // reconcile the hooks runner's suppression/failure projection).
+                write_health(&handle, &skipped, hooks.as_ref(), &paths);
                 Action::Continue
             }
             _ = poll.tick() => {
@@ -1276,7 +1277,7 @@ async fn supervise(
         // A watch transition changed the projected health picture: regenerate.
         // (Rebuild/reload paths write their own health from the new engine.)
         if health_dirty {
-            write_health(&handle, &skipped, &paths);
+            write_health(&handle, &skipped, hooks.as_ref(), &paths);
         }
 
         match action {
@@ -1518,14 +1519,74 @@ fn log_event(event: &Event) {
 /// re-probed is present from the first write, and a skipped watch is never
 /// silently absent (which would read as `ok`).
 ///
+/// The current engine generation's hooks runner (VRD-21), when hooks are armed,
+/// is projected into the same document: its persistently-failing hooks become
+/// `hook-failing` problems and its per-watch suppression counters become
+/// telemetry. The projection is read from the runner's in-memory snapshot on
+/// every write, so a recovered hook or a reset counter simply drops out — no
+/// accumulator lives in the file.
+///
 /// A write failure is warned, never fatal: a health-file hiccup must not crash
 /// the daemon or interrupt snapshotting, and `vard notify` degrades to the
 /// daemon-not-running / starting / stale path on its own.
-fn write_health(handle: &EngineHandle, skipped: &[health::HealthProblem], paths: &DaemonPaths) {
-    let doc = health::doc_from_states(&handle.watch_states(), skipped, health::now_secs());
+fn write_health(
+    handle: &EngineHandle,
+    skipped: &[health::HealthProblem],
+    hooks: Option<&HooksRunnerHandle>,
+    paths: &DaemonPaths,
+) {
+    let now = health::now_secs();
+    let (hook_problems, suppressions) = hooks
+        .map(|h| project_hook_health(&h.snapshot(), now))
+        .unwrap_or_default();
+    let doc = health::doc_with_hooks(
+        &handle.watch_states(),
+        skipped,
+        hook_problems,
+        suppressions,
+        now,
+    );
     if let Err(err) = health::write(&paths.health_file, &doc) {
         warn!(error = %err, "could not write health file");
     }
+}
+
+/// Projects a hooks-runner [`RunnerSnapshot`] into the health vocabulary: each
+/// persistently-failing hook (already at or beyond the failure threshold, and
+/// pre-sorted by the snapshot) becomes a `hook-failing` [`health::HealthProblem`]
+/// stamped at `now`, and each nonzero per-watch suppression counter becomes a
+/// [`health::HookSuppression`]. Suppression counters are sorted by watch name so
+/// the projection is deterministic (the runner keeps them in a `HashMap`); a
+/// zero counter is dropped rather than written.
+fn project_hook_health(
+    snapshot: &RunnerSnapshot,
+    now: u64,
+) -> (Vec<health::HealthProblem>, Vec<health::HookSuppression>) {
+    let problems = snapshot
+        .failing
+        .iter()
+        .map(|f| {
+            health::hook_failing_problem(
+                f.watch.as_deref(),
+                &f.event,
+                &f.command,
+                f.consecutive,
+                &f.last_error,
+                now,
+            )
+        })
+        .collect();
+    let mut suppressions: Vec<health::HookSuppression> = snapshot
+        .suppressed_by_watch
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(watch, count)| health::HookSuppression {
+            watch: watch.clone(),
+            count: *count,
+        })
+        .collect();
+    suppressions.sort_by(|a, b| a.watch.cmp(&b.watch));
+    (problems, suppressions)
 }
 
 /// Drains the request directory into the engine (see [`drain_request_dir`] for
@@ -2988,6 +3049,53 @@ mod tests {
             .expect("daemon must exit promptly on shutdown")
             .expect("daemon task must not panic");
         assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+    }
+
+    #[test]
+    fn project_hook_health_maps_failures_and_sorts_suppression() {
+        use crate::hooks::FailingHook;
+        let mut suppressed = std::collections::HashMap::new();
+        suppressed.insert("zebra".to_string(), 3u64);
+        suppressed.insert("apple".to_string(), 7u64);
+        suppressed.insert("silent".to_string(), 0u64); // a zero count is dropped
+        let snapshot = RunnerSnapshot {
+            suppressed_by_watch: suppressed,
+            failing: vec![
+                FailingHook {
+                    watch: Some("notes".to_string()),
+                    event: "snapshot.completed".to_string(),
+                    command: "apply".to_string(),
+                    consecutive: 4,
+                    last_error: "exited with status 1".to_string(),
+                },
+                FailingHook {
+                    watch: None,
+                    event: "daemon.started".to_string(),
+                    command: "up".to_string(),
+                    consecutive: 3,
+                    last_error: "timed out".to_string(),
+                },
+            ],
+        };
+        let (problems, suppressions) = project_hook_health(&snapshot, 500);
+
+        // Every failing hook becomes a hook-failing / attention problem at `now`.
+        assert_eq!(problems.len(), 2);
+        assert!(
+            problems
+                .iter()
+                .all(|p| p.kind == "hook-failing" && p.state == "attention" && p.since == 500)
+        );
+        // The watch-scoped hook keeps its watch; the global one carries the empty
+        // marker.
+        assert!(problems.iter().any(|p| p.watch == "notes"));
+        assert!(problems.iter().any(|p| p.watch.is_empty()));
+
+        // Suppression: the zero count is dropped and the rest are sorted by watch
+        // (the runner keeps them in a nondeterministic HashMap).
+        let names: Vec<_> = suppressions.iter().map(|s| s.watch.clone()).collect();
+        assert_eq!(names, vec!["apple", "zebra"]);
+        assert_eq!(suppressions[0].count, 7);
     }
 
     /// Polls until `marker` exists (a hook side effect) or a generous budget

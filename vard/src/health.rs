@@ -34,14 +34,19 @@
 //! | `Conflicted`                     | `conflicted`       | `conflicted`       |
 //! | `SyncError`                      | `sync-error`       | `sync-error`       |
 //! | *(pre-engine: repo failed to open)* | `attention`      | `unopenable`       |
+//! | *(runner: hook failing ×3)*         | `attention`      | `hook-failing`     |
 //!
-//! The last row is not derived from an engine [`WatchState`] at all: a watch
-//! whose repository cannot be opened is skipped *before* it ever reaches the
-//! engine (VRD-41 per-watch isolation in `daemon.rs`), so there is no
+//! The last two rows are not derived from an engine [`WatchState`] at all. A
+//! watch whose repository cannot be opened is skipped *before* it ever reaches
+//! the engine (VRD-41 per-watch isolation in `daemon.rs`), so there is no
 //! [`WatchStatus`] to classify. The daemon — the sole owner of that skip
 //! decision — synthesizes the problem itself via [`unopenable_problem`] and
 //! hands it to [`doc_from_states`] alongside the engine's own projection, so a
-//! skipped watch is never silently reported as `ok`.
+//! skipped watch is never silently reported as `ok`. A `hook-failing` problem is
+//! likewise daemon-synthesized (VRD-21): the hooks runner is a bus subscriber
+//! the engine knows nothing about, so the daemon projects its
+//! [`snapshot`](crate::hooks::HooksRunnerHandle::snapshot) into
+//! [`hook_failing_problem`]s and folds them in via [`doc_with_hooks`].
 //!
 //! Two vocabulary decisions are deliberate:
 //!
@@ -64,7 +69,7 @@
 //! file):
 //!
 //! ```toml
-//! version = 1
+//! version = 2
 //! written_at = 1752000000     # unix seconds of this write, for staleness
 //!
 //! [[problem]]
@@ -73,12 +78,25 @@
 //! kind = "unsafe-pause"       # the stable machine classifier
 //! summary = "repository is in an unsafe state ..."
 //! since = 1751990000          # unix seconds the state was entered
+//!
+//! [[problem]]
+//! watch = "notes"
+//! state = "attention"
+//! kind = "hook-failing"       # a hook has failed 3+ times running (VRD-21)
+//! summary = "hook for snapshot.completed has failed 3 times ..."
+//! since = 1752000000
+//!
+//! [[suppression]]
+//! watch = "notes"             # pure telemetry, never a problem (VRD-21)
+//! count = 12                  # hook events coalesced (delayed, never dropped)
 //! ```
 //!
-//! Only *problem* watches contribute an entry; a healthy watch adds nothing, so
-//! a healthy daemon writes a document with an empty `problem` list. The
-//! `version` field lets the shape evolve — a notify built against a newer schema
-//! can refuse an unknown version rather than misread it.
+//! Only *problem* watches contribute a `[[problem]]` entry; a healthy watch adds
+//! nothing, so a healthy daemon writes a document with an empty `problem` list. A
+//! `[[suppression]]` entry is telemetry, not a problem: it records how many hook
+//! events a watch coalesced and never makes the watch unhealthy or makes notify
+//! speak. The `version` field lets the shape evolve — a notify built against a
+//! newer schema can refuse an unknown version rather than misread it.
 //!
 //! Timestamps are epoch seconds so notify renders *elapsed* time ("for 2h"),
 //! never a wall-clock instant that would lie across timezones. `since` comes
@@ -95,8 +113,10 @@ use vard_core::{TroubleKind, WatchState, WatchStatus};
 use crate::instance::{self, DaemonProbe};
 
 /// The current health-document schema version. Bump on any breaking shape
-/// change so a reader can reject what it cannot parse.
-pub(crate) const VERSION: u32 = 1;
+/// change so a reader can reject what it cannot parse. Bumped to `2` for the
+/// hooks-runner projection (VRD-21): the `hook-failing` problem kind and the
+/// per-watch `[[suppression]]` telemetry table.
+pub(crate) const VERSION: u32 = 2;
 
 /// How often the daemon rewrites the health file even when nothing changed, to
 /// refresh `written_at`. `vard notify` uses a multiple of this
@@ -121,6 +141,13 @@ pub(crate) struct HealthDoc {
     /// `[[problem]]`.
     #[serde(default, rename = "problem")]
     pub problems: Vec<HealthProblem>,
+    /// Per-watch hook suppression telemetry (VRD-21): how many hook events each
+    /// watch has coalesced. Pure telemetry, never a problem — an entry here
+    /// never makes a watch unhealthy or makes `vard notify` speak. Empty when no
+    /// watch has coalesced a hook. Renamed to `suppression` so the array reads
+    /// as `[[suppression]]`.
+    #[serde(default, rename = "suppression")]
+    pub suppressions: Vec<HookSuppression>,
 }
 
 /// One troubled watch's entry.
@@ -142,6 +169,21 @@ pub(crate) struct HealthProblem {
     /// Unix seconds at which the watch entered this state, so a reader can
     /// render elapsed time.
     pub since: u64,
+}
+
+/// One watch's hook suppression total (VRD-21): the number of hook events the
+/// runner has coalesced (delayed, never dropped) for it. Telemetry only — it is
+/// carried in its own `[[suppression]]` table, never in `[[problem]]`, so it can
+/// never fold into an attention state. Counts reset on daemon restart (the
+/// runner's in-memory tally is projected wholesale, never accumulated in the
+/// file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HookSuppression {
+    /// The watch's stable name.
+    pub watch: String,
+    /// The coalesced-event total for this watch (always nonzero — a zero count
+    /// is omitted from the projection entirely).
+    pub count: u64,
 }
 
 /// The closed set of problem conditions the health vocabulary reports. Derived
@@ -168,6 +210,13 @@ enum ProblemKind {
     /// ever reached the engine (VRD-41). Never produced by [`classify`] — the
     /// daemon synthesizes it directly via [`unopenable_problem`].
     Unopenable,
+    /// A hook has failed on a key `FAILURE_THRESHOLD` consecutive times (VRD-21):
+    /// non-zero exit or timeout, either counts. Never produced by [`classify`]
+    /// (the engine does not know hooks exist) — the daemon synthesizes it from
+    /// the runner's snapshot via [`hook_failing_problem`]. Self-clearing: the
+    /// key's next success drops it from the runner's state, and the next
+    /// projection omits it.
+    HookFailing,
 }
 
 impl ProblemKind {
@@ -180,6 +229,7 @@ impl ProblemKind {
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
             ProblemKind::Unopenable => "attention",
+            ProblemKind::HookFailing => "attention",
         }
     }
 
@@ -193,6 +243,7 @@ impl ProblemKind {
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
             ProblemKind::Unopenable => "unopenable",
+            ProblemKind::HookFailing => "hook-failing",
         }
     }
 
@@ -227,6 +278,12 @@ impl ProblemKind {
                 }
                 None => "repository cannot be opened; fix it — a reload picks it up".to_string(),
             },
+            // The full detail (event, command, count, last error) is composed by
+            // `hook_failing_problem` and handed in as `reason`; the fallback is
+            // only for a defensively-empty detail.
+            ProblemKind::HookFailing => reason
+                .map(str::to_string)
+                .unwrap_or_else(|| "a hook is failing repeatedly".to_string()),
         }
     }
 }
@@ -278,6 +335,57 @@ pub(crate) fn unopenable_problem(watch: &str, error: &str, since: u64) -> Health
     }
 }
 
+/// Builds a health problem for a hook that has failed on its key
+/// `FAILURE_THRESHOLD` consecutive times (VRD-21), synthesized from the runner's
+/// snapshot exactly as [`unopenable_problem`] is synthesized from the daemon's
+/// own skip decision — the engine never sees hooks. `watch` is the hook's watch,
+/// or `None` for a daemon-global (`[hooks]`) hook: a global hook has no watch, so
+/// its problem carries an **empty** `watch` field, the honest marker `status`
+/// and `notify` render as a daemon-scoped hook line (a real watch name is never
+/// empty). The command is truncated if long so one pathological one-liner cannot
+/// bloat the health file or a prompt. `since` is the projection moment — a hook
+/// failure has no engine-style `entered_at`, so elapsed is not meaningful for it;
+/// the consecutive count in the summary is the signal.
+pub(crate) fn hook_failing_problem(
+    watch: Option<&str>,
+    event: &str,
+    command: &str,
+    consecutive: u64,
+    last_error: &str,
+    since: u64,
+) -> HealthProblem {
+    let command = truncate_command(command);
+    let last = last_error.trim();
+    let detail = if last.is_empty() {
+        format!("hook for {event} has failed {consecutive} times; command: {command}")
+    } else {
+        format!(
+            "hook for {event} has failed {consecutive} times (last error: {last}); \
+             command: {command}"
+        )
+    };
+    HealthProblem {
+        watch: watch.unwrap_or("").to_string(),
+        state: ProblemKind::HookFailing.state_token().to_string(),
+        kind: ProblemKind::HookFailing.kind_token().to_string(),
+        summary: ProblemKind::HookFailing.summary(Some(&detail)),
+        since,
+    }
+}
+
+/// Truncates a hook command for a health-file summary, on a char boundary so a
+/// multibyte command never splits mid-codepoint, appending an ellipsis when cut.
+fn truncate_command(command: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut chars = command.chars();
+    let head: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Regenerates the whole health document from a point-in-time projection of the
 /// engine's per-watch truth plus the current engine generation's `skipped`
 /// watches (those whose repository could not be opened and so never reached
@@ -296,7 +404,31 @@ pub(crate) fn doc_from_states(
         version: VERSION,
         written_at: now,
         problems,
+        suppressions: Vec::new(),
     }
+}
+
+/// Regenerates the whole health document from the engine's per-watch truth and
+/// the `skipped` set (via [`doc_from_states`]), then folds in the hooks runner's
+/// projection (VRD-21): `hook_problems` (each a `hook-failing` [`HealthProblem`],
+/// appended after the engine and skipped problems) and per-watch `suppressions`
+/// telemetry. Both come from the daemon's projection of
+/// [`HooksRunnerHandle::snapshot`](crate::hooks::HooksRunnerHandle::snapshot),
+/// keeping this module decoupled from the runner's own types. Like every other
+/// path this is a pure wholesale projection — no accumulation, so a hook that
+/// recovered or a suppression counter that reset simply does not appear in the
+/// next document.
+pub(crate) fn doc_with_hooks(
+    states: &[WatchStatus],
+    skipped: &[HealthProblem],
+    hook_problems: Vec<HealthProblem>,
+    suppressions: Vec<HookSuppression>,
+    now: u64,
+) -> HealthDoc {
+    let mut doc = doc_from_states(states, skipped, now);
+    doc.problems.extend(hook_problems);
+    doc.suppressions = suppressions;
+    doc
 }
 
 /// What `vard notify` learned about the daemon and its health, resolved by
@@ -309,6 +441,11 @@ pub(crate) enum HealthReport {
     Running {
         /// The current per-watch problems.
         problems: Vec<HealthProblem>,
+        /// Per-watch hook suppression telemetry (VRD-21). Read by `vard status`
+        /// (rendered alongside a watch's state); deliberately ignored by `vard
+        /// notify`, which reports only `problems` and so stays silent when a
+        /// watch has only coalesced hooks.
+        suppressions: Vec<HookSuppression>,
         /// When the daemon last wrote the document (for staleness).
         written_at: u64,
     },
@@ -343,6 +480,7 @@ pub(crate) fn collect(lock_file: &Path, health_file: &Path) -> Result<HealthRepo
         DaemonProbe::Running => match read(health_file) {
             Ok(Some(doc)) if doc.version == VERSION => Ok(HealthReport::Running {
                 problems: doc.problems,
+                suppressions: doc.suppressions,
                 written_at: doc.written_at,
             }),
             Ok(Some(doc)) => Err(format!(
@@ -658,5 +796,125 @@ mod tests {
         let path = dir.path().join("health");
         std::fs::write(&path, "x").unwrap();
         assert!(file_mtime_secs(&path).is_some());
+    }
+
+    #[test]
+    fn hook_failing_problem_for_a_watch_carries_the_detail_and_attention_state() {
+        let p = hook_failing_problem(
+            Some("notes"),
+            "snapshot.completed",
+            "dotfiles-apply",
+            3,
+            "exited with status 1",
+            2000,
+        );
+        assert_eq!(p.watch, "notes");
+        assert_eq!(p.state, "attention");
+        assert_eq!(p.kind, "hook-failing");
+        assert!(
+            p.summary.contains("snapshot.completed"),
+            "got: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("3 times"),
+            "count is surfaced: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("exited with status 1"),
+            "last error is surfaced: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("dotfiles-apply"),
+            "command is surfaced: {}",
+            p.summary
+        );
+        assert_eq!(p.since, 2000);
+    }
+
+    #[test]
+    fn a_global_hook_failure_uses_an_empty_watch_as_the_daemon_marker() {
+        // A real watch name is never empty, so an empty `watch` is the honest
+        // marker for a daemon-global `[hooks]` hook (no watch to attach to).
+        let p = hook_failing_problem(None, "daemon.started", "notify-up", 5, "timed out", 10);
+        assert_eq!(p.watch, "", "a global hook carries no watch name");
+        assert_eq!(p.kind, "hook-failing");
+        assert!(p.summary.contains("daemon.started"), "got: {}", p.summary);
+    }
+
+    #[test]
+    fn a_long_hook_command_is_truncated_on_a_char_boundary() {
+        let long = "é".repeat(200);
+        let p = hook_failing_problem(Some("w"), "sync.pulled", &long, 3, "boom", 0);
+        assert!(
+            p.summary.contains('…'),
+            "a long command is truncated: {}",
+            p.summary
+        );
+        // No panic on a multibyte boundary is the real assertion; the ellipsis
+        // proves the cut happened.
+    }
+
+    #[test]
+    fn doc_with_hooks_appends_hook_problems_after_engine_problems_and_carries_suppression() {
+        let states = vec![status("vault", WatchState::Attention, None, "trouble")];
+        let hook_problems = vec![hook_failing_problem(
+            Some("notes"),
+            "snapshot.completed",
+            "apply",
+            3,
+            "exit 1",
+            2000,
+        )];
+        let suppressions = vec![HookSuppression {
+            watch: "notes".to_string(),
+            count: 12,
+        }];
+        let doc = doc_with_hooks(&states, &[], hook_problems, suppressions, 2000);
+        assert_eq!(doc.version, VERSION);
+        let names: Vec<_> = doc.problems.iter().map(|p| p.watch.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["vault", "notes"],
+            "engine problems come first, hook problems follow"
+        );
+        assert_eq!(doc.problems[1].kind, "hook-failing");
+        assert_eq!(doc.suppressions.len(), 1);
+        assert_eq!(doc.suppressions[0].count, 12);
+    }
+
+    #[test]
+    fn a_document_with_suppression_round_trips_through_toml() {
+        let doc = doc_with_hooks(
+            &[status("v", WatchState::Ok, None, "")],
+            &[],
+            vec![hook_failing_problem(
+                Some("v"),
+                "sync.pulled",
+                "cmd",
+                4,
+                "boom",
+                5,
+            )],
+            vec![HookSuppression {
+                watch: "v".to_string(),
+                count: 3,
+            }],
+            5,
+        );
+        let text = toml::to_string(&doc).unwrap();
+        let back: HealthDoc = toml::from_str(&text).unwrap();
+        assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn suppression_defaults_to_empty_when_absent_from_the_file() {
+        // A v2 doc with no [[suppression]] table parses with an empty vec, so a
+        // healthy daemon's document need not carry the section at all.
+        let doc: HealthDoc = toml::from_str("version = 2\nwritten_at = 1\n").unwrap();
+        assert!(doc.suppressions.is_empty());
+        assert!(doc.problems.is_empty());
     }
 }
