@@ -589,18 +589,14 @@ pub(crate) struct ResolvedWatch {
     /// Whether the watch is paused.
     pub paused: bool,
     /// This watch's hook commands (VRD-21), keyed by dotted event name (e.g.
-    /// `"sync.pulled"`), resolved from `[watch.hooks]`. Running these is a
-    /// later task's concern; this only carries the typed, validated map.
-    // Not yet consumed outside tests — the hook runner is a later checkpoint.
-    #[allow(dead_code)]
+    /// `"sync.pulled"`), resolved from `[watch.hooks]`. The daemon feeds these
+    /// into the hooks runner ([`crate::hooks`]) when it builds each engine.
     pub hooks: HookMap,
     /// This watch's effective hook command timeout (VRD-21): watch override
     /// > `[defaults]` > [`DEFAULT_HOOK_TIMEOUT`].
-    #[allow(dead_code)]
     pub hook_timeout: Duration,
     /// This watch's effective hook rate limit (VRD-21): watch override >
     /// `[defaults]` > [`DEFAULT_HOOK_RATE_LIMIT`].
-    #[allow(dead_code)]
     pub hook_rate_limit: Duration,
 }
 
@@ -1842,6 +1838,21 @@ update_available = "echo nope"
                 version: "1.0.0".to_string(),
             },
         ];
+
+        // The config-key derivation must round-trip: `underscored_to_dotted` (the
+        // real routing path, which restores only the FIRST underscore) must invert
+        // `name().replace('.', "_")` exactly. A future event name with more than one
+        // dot would break this instead of silently misrouting — the underscored key
+        // would map back to the wrong dotted name and never match a live event.
+        for e in &events {
+            let underscored = e.name().replace('.', "_");
+            assert_eq!(
+                underscored_to_dotted(&underscored),
+                e.name(),
+                "the underscored config key for {} must round-trip back to its dotted name",
+                e.name()
+            );
+        }
 
         let catalog_keys: HashSet<String> =
             events.iter().map(|e| e.name().replace('.', "_")).collect();
