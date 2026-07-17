@@ -13,12 +13,40 @@
 //! keys and sections are rejected with an error naming the offender, so a typo
 //! (`[default]`, `qiesce`) cannot silently change behavior. The known-future
 //! surface from spec §12 is explicitly tolerated as opaque values until its
-//! owning tasks land typed models: top-level `[ai]` and `[update]`;
-//! `secret_scan`/`hook_timeout`/`hook_rate_limit` in `[defaults]`; and
-//! `secret_scan`/`hooks` in `[[watch]]`. Top-level `[daemon]` is typed
-//! (VRD-14; see [`DaemonConfig`]) since it is binary-level per ADR 0003. The
-//! top-level `version` key remains the migration lever for real schema
-//! breaks.
+//! owning tasks land typed models: top-level `[ai]` and `[update]`, and
+//! `secret_scan` in `[defaults]`/`[[watch]]`. Top-level `[daemon]` is typed
+//! (VRD-14; see [`DaemonConfig`]) since it is binary-level per ADR 0003. Hooks
+//! (VRD-21) are typed too: top-level `[hooks]`, per-watch `[watch.hooks]`, and
+//! `hook_timeout`/`hook_rate_limit` in `[defaults]`/`[[watch]]` — see the
+//! hook configuration docs below. The top-level `version` key remains the
+//! migration lever for real schema breaks.
+//!
+//! # Hook configuration (VRD-21)
+//!
+//! Hooks map bus events (`vard_core::Event`) to shell command strings. Two
+//! scopes exist, each with its own allowlist of valid event keys, because
+//! only some events carry a watch:
+//!
+//! - Top-level `[hooks]`: daemon-level events with no watch in their payload
+//!   ([`DAEMON_HOOK_EVENTS`]).
+//! - Per-watch `[watch.hooks]`: events whose payload carries a watch
+//!   ([`WATCH_HOOK_EVENTS`]).
+//!
+//! Config keys are the event's dotted catalog name ([`vard_core::Event::name`])
+//! with its first `.` replaced by `_` (`sync.pulled` -> `sync_pulled`). An
+//! unknown key, or a key valid only in the other scope, is a resolution error
+//! naming the key and the section (see [`ConfigError::UnknownHookEvent`] and
+//! [`ConfigError::HookWrongScope`]). This split is pinned to
+//! `vard_core::Event::name()` by a test, so a new core event forces a
+//! conscious choice of which list it joins.
+//!
+//! `hook_timeout` (default 60s) and `hook_rate_limit` (default 5m) resolve
+//! watch override > `[defaults]` > the binary-side constants
+//! [`DEFAULT_HOOK_TIMEOUT`]/[`DEFAULT_HOOK_RATE_LIMIT`], the same
+//! defaults-inheritance shape as `interval`/`quiesce`/`sync_interval`.
+//!
+//! This module only resolves hooks into typed values on [`ResolvedWatch`] and
+//! [`Config::resolve_global_hooks`]; running them is a later task's concern.
 //!
 //! Durations are humantime strings (`"15m"`), deserialized through
 //! [`vard_core::parse_duration`] so the file layer and the SDK share one parser.
@@ -45,6 +73,105 @@ const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
 /// Default `[daemon].log_retention_days`, absent an explicit value.
 const DEFAULT_LOG_RETENTION_DAYS: u32 = 14;
 
+/// Default `hook_timeout`, absent an explicit value in `[defaults]` or a
+/// watch override (VRD-21). Binary-level like [`DEFAULT_LOG_LEVEL`]: hooks
+/// run in the daemon, not the engine, so there is no `vard-core` counterpart.
+pub(crate) const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default `hook_rate_limit`, absent an explicit value in `[defaults]` or a
+/// watch override (VRD-21).
+pub(crate) const DEFAULT_HOOK_RATE_LIMIT: Duration = Duration::from_secs(5 * 60);
+
+/// Config keys valid under a watch's `[watch.hooks]` (VRD-21): every event
+/// whose payload carries a watch — every [`vard_core::Event`] variant except
+/// the three daemon-level ones in [`DAEMON_HOOK_EVENTS`]. Each key is the
+/// event's dotted catalog name ([`vard_core::Event::name`]) with its first
+/// `.` replaced by `_`.
+///
+/// Pinned to `vard_core::Event::name()` by
+/// `hook_event_lists_match_the_core_event_catalog` in the tests below: a new
+/// core event forces a conscious decision about which list it joins.
+pub(crate) const WATCH_HOOK_EVENTS: &[&str] = &[
+    "snapshot_started",
+    "snapshot_completed",
+    "snapshot_failed",
+    "snapshot_skipped",
+    "sync_pushed",
+    "sync_pulled",
+    "sync_conflict",
+    "sync_resolved",
+    "sync_failed",
+    "sync_skipped",
+    "restore_completed",
+    "watch_state_changed",
+];
+
+/// Config keys valid under the top-level `[hooks]` section (VRD-21):
+/// daemon-level events whose payload carries no watch.
+pub(crate) const DAEMON_HOOK_EVENTS: &[&str] =
+    &["daemon_started", "daemon_stopped", "update_available"];
+
+/// A resolved hook map: event key (dotted catalog name, e.g. `sync.pulled`)
+/// to the shell command string to run.
+pub(crate) type HookMap = HashMap<String, String>;
+
+/// Where a hook config key was found, for error attribution and messages.
+#[derive(Debug, Clone)]
+pub(crate) enum HookScope {
+    /// The top-level `[hooks]` section.
+    Global,
+    /// A specific watch's `[watch.hooks]` section, named by the watch.
+    Watch(String),
+}
+
+impl fmt::Display for HookScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HookScope::Global => f.write_str("[hooks]"),
+            HookScope::Watch(name) => write!(f, "watch {name:?}'s [watch.hooks]"),
+        }
+    }
+}
+
+/// Converts an underscored hook config key to its dotted event catalog name
+/// (`sync_pulled` -> `sync.pulled`), replacing only the first `_` — the
+/// convention every entry in [`WATCH_HOOK_EVENTS`]/[`DAEMON_HOOK_EVENTS`]
+/// follows, matching `vard_core::Event::name()` (e.g.
+/// `watch_state_changed` -> `watch.state_changed`).
+fn underscored_to_dotted(key: &str) -> String {
+    key.replacen('_', ".", 1)
+}
+
+/// Validates a raw hook map's keys against `allowed` (the keys valid in this
+/// scope) and `other` (the keys valid only in the sibling scope, so a
+/// misplaced key gets a targeted error), then converts the surviving keys to
+/// their dotted event names. `scope` names where `raw` came from, for error
+/// attribution.
+fn resolve_hook_map(
+    raw: &HashMap<String, String>,
+    allowed: &[&str],
+    other: &[&str],
+    scope: &HookScope,
+) -> Result<HookMap, ConfigError> {
+    let mut resolved = HashMap::with_capacity(raw.len());
+    for (key, command) in raw {
+        if allowed.contains(&key.as_str()) {
+            resolved.insert(underscored_to_dotted(key), command.clone());
+        } else if other.contains(&key.as_str()) {
+            return Err(ConfigError::HookWrongScope {
+                scope: scope.clone(),
+                key: key.clone(),
+            });
+        } else {
+            return Err(ConfigError::UnknownHookEvent {
+                scope: scope.clone(),
+                key: key.clone(),
+            });
+        }
+    }
+    Ok(resolved)
+}
+
 /// A parsed `config.toml`. Unknown keys are rejected; the known-future
 /// sections are carried opaquely (see the [module docs](self)).
 #[derive(Debug, Deserialize)]
@@ -67,6 +194,12 @@ pub(crate) struct Config {
     update: Option<toml::Value>,
     #[serde(default)]
     pub defaults: Defaults,
+    /// The top-level `[hooks]` section (VRD-21): global hook commands for
+    /// daemon-level events, keyed by underscored config key (raw, unvalidated
+    /// — see [`Config::resolve_global_hooks`]). Watch-scoped events belong
+    /// instead under a watch's own `[watch.hooks]` ([`WatchConfig::hooks`]).
+    #[serde(default)]
+    pub hooks: HashMap<String, String>,
     /// Watches, one per `[[watch]]` table.
     #[serde(default, rename = "watch")]
     pub watches: Vec<WatchConfig>,
@@ -114,7 +247,9 @@ pub(crate) enum LogLevel {
 
 /// The `[defaults]` section: values inherited by any watch that does not set
 /// the corresponding field. Every field is optional; an absent field falls
-/// through to the core `DEFAULT_*` constant during resolution.
+/// through to the core `DEFAULT_*` constant during resolution (or, for
+/// `hook_timeout`/`hook_rate_limit`, the binary-side [`DEFAULT_HOOK_TIMEOUT`]/
+/// [`DEFAULT_HOOK_RATE_LIMIT`]).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Defaults {
@@ -129,19 +264,25 @@ pub(crate) struct Defaults {
     /// Tolerated opaquely for the known-future spec §12 surface.
     #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
-    /// Tolerated opaquely for the known-future spec §12 surface.
-    #[allow(dead_code)]
-    hook_timeout: Option<toml::Value>,
-    /// Tolerated opaquely for the known-future spec §12 surface.
-    #[allow(dead_code)]
-    hook_rate_limit: Option<toml::Value>,
+    /// Default hook command timeout (VRD-21), overridable per watch. Falls
+    /// back to [`DEFAULT_HOOK_TIMEOUT`] when unset here and on the watch.
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub hook_timeout: Option<Duration>,
+    /// Default hook rate limit (VRD-21), overridable per watch. Falls back to
+    /// [`DEFAULT_HOOK_RATE_LIMIT`] when unset here and on the watch.
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub hook_rate_limit: Option<Duration>,
 }
 
 /// One `[[watch]]` table. `name` and `path` are required. Of the optional
-/// fields, exactly five inherit from `[defaults]` before falling back to the
-/// core constants: `trigger`, `interval`, `quiesce`, `sync`, and
-/// `sync_interval`. `branch`, `remote`, `exclude`, and `poll_interval` have no
-/// `[defaults]` home and fall back to the core defaults directly.
+/// fields, five inherit from `[defaults]` before falling back to the core
+/// constants: `trigger`, `interval`, `quiesce`, `sync`, and `sync_interval`.
+/// `hook_timeout` and `hook_rate_limit` (VRD-21) also inherit from
+/// `[defaults]`, but fall back to the binary-side [`DEFAULT_HOOK_TIMEOUT`]/
+/// [`DEFAULT_HOOK_RATE_LIMIT`] rather than a core constant. `branch`,
+/// `remote`, `exclude`, and `poll_interval` have no `[defaults]` home and fall
+/// back to the core defaults directly. `hooks` (VRD-21) likewise has no
+/// `[defaults]` home — hook commands are per-watch by nature.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WatchConfig {
@@ -174,9 +315,18 @@ pub(crate) struct WatchConfig {
     /// Tolerated opaquely for the known-future spec §12 surface.
     #[allow(dead_code)]
     secret_scan: Option<toml::Value>,
-    /// Tolerated opaquely; a later task adds typed `[watch.hooks]`.
-    #[allow(dead_code)]
-    hooks: Option<toml::Value>,
+    /// This watch's `[watch.hooks]` table (VRD-21): raw, unvalidated
+    /// underscored event keys mapped to shell commands. Validated and
+    /// converted to dotted event names during [`Config::resolve_all`]; see
+    /// [`ResolvedWatch::hooks`].
+    #[serde(default)]
+    pub hooks: HashMap<String, String>,
+    /// Per-watch override of `[defaults].hook_timeout` (VRD-21).
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub hook_timeout: Option<Duration>,
+    /// Per-watch override of `[defaults].hook_rate_limit` (VRD-21).
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub hook_rate_limit: Option<Duration>,
 }
 
 impl Config {
@@ -273,12 +423,37 @@ impl Config {
         self.resolve_all_with_home(home.as_deref())
     }
 
+    /// Resolves and validates the top-level `[hooks]` section (VRD-21):
+    /// daemon-level hook commands, keyed by dotted event name (e.g.
+    /// `"daemon.started"`). Rejects unknown keys and per-watch event names,
+    /// which belong instead under a watch's own `[watch.hooks]`.
+    ///
+    /// Also invoked from [`resolve_all_with_home`](Self::resolve_all_with_home),
+    /// so [`resolve`](Self::resolve)/[`resolve_all`](Self::resolve_all) fail
+    /// loud on a bad `[hooks]` section too; call this directly to read the
+    /// resolved global hook map itself.
+    pub fn resolve_global_hooks(&self) -> Result<HookMap, ConfigError> {
+        resolve_hook_map(
+            &self.hooks,
+            DAEMON_HOOK_EVENTS,
+            WATCH_HOOK_EVENTS,
+            &HookScope::Global,
+        )
+    }
+
     /// [`resolve_all`](Self::resolve_all) with an explicit home directory, so
     /// tests need not mutate the process environment.
     fn resolve_all_with_home(
         &self,
         home: Option<&Path>,
     ) -> Result<Vec<ResolvedWatch>, ConfigError> {
+        // Validate [hooks] up front, same reasoning as [defaults].trigger
+        // below: a bad global hook key belongs to [hooks], not to whichever
+        // watch happens to resolve first. The map itself is re-derived by
+        // callers via `resolve_global_hooks`; this call exists so resolution
+        // fails loud even when nobody has asked for the global map yet.
+        self.resolve_global_hooks()?;
+
         // Parse [defaults].trigger once, up front: an error there belongs to
         // [defaults], not to whichever watch happens to inherit it first.
         let default_trigger = self
@@ -360,9 +535,31 @@ impl Config {
                 name: watch.name.clone(),
                 source: e,
             })?;
+
+            // hooks: this watch's [watch.hooks], validated against the
+            // watch-carrying event allowlist and converted to dotted keys.
+            let hooks = resolve_hook_map(
+                &watch.hooks,
+                WATCH_HOOK_EVENTS,
+                DAEMON_HOOK_EVENTS,
+                &HookScope::Watch(watch.name.clone()),
+            )?;
+            // hook_timeout / hook_rate_limit: watch > defaults > binary constant.
+            let hook_timeout = watch
+                .hook_timeout
+                .or(self.defaults.hook_timeout)
+                .unwrap_or(DEFAULT_HOOK_TIMEOUT);
+            let hook_rate_limit = watch
+                .hook_rate_limit
+                .or(self.defaults.hook_rate_limit)
+                .unwrap_or(DEFAULT_HOOK_RATE_LIMIT);
+
             resolved.push(ResolvedWatch {
                 spec,
                 paused: watch.paused,
+                hooks,
+                hook_timeout,
+                hook_rate_limit,
             });
         }
 
@@ -391,6 +588,20 @@ pub(crate) struct ResolvedWatch {
     pub spec: WatchSpec,
     /// Whether the watch is paused.
     pub paused: bool,
+    /// This watch's hook commands (VRD-21), keyed by dotted event name (e.g.
+    /// `"sync.pulled"`), resolved from `[watch.hooks]`. Running these is a
+    /// later task's concern; this only carries the typed, validated map.
+    // Not yet consumed outside tests — the hook runner is a later checkpoint.
+    #[allow(dead_code)]
+    pub hooks: HookMap,
+    /// This watch's effective hook command timeout (VRD-21): watch override
+    /// > `[defaults]` > [`DEFAULT_HOOK_TIMEOUT`].
+    #[allow(dead_code)]
+    pub hook_timeout: Duration,
+    /// This watch's effective hook rate limit (VRD-21): watch override >
+    /// `[defaults]` > [`DEFAULT_HOOK_RATE_LIMIT`].
+    #[allow(dead_code)]
+    pub hook_rate_limit: Duration,
 }
 
 /// Expands a leading `~/` (or a bare `~`) against `home`. Any other path —
@@ -485,6 +696,24 @@ pub(crate) enum ConfigError {
         /// The core error explaining the failure.
         source: vard_core::ConfigError,
     },
+    /// A `[hooks]` or `[watch.hooks]` table used a key that names no known
+    /// event in either hook scope (VRD-21).
+    UnknownHookEvent {
+        /// Where the key was found.
+        scope: HookScope,
+        /// The unrecognized key.
+        key: String,
+    },
+    /// A `[hooks]` or `[watch.hooks]` table used a key that names a real
+    /// event, but one valid only in the other hook scope (VRD-21) — a
+    /// watch-carrying event under top-level `[hooks]`, or a daemon-level
+    /// event under a watch's `[watch.hooks]`.
+    HookWrongScope {
+        /// Where the key was found.
+        scope: HookScope,
+        /// The misplaced key.
+        key: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -522,6 +751,19 @@ impl fmt::Display for ConfigError {
             ConfigError::Watch { name, source } => {
                 write!(f, "watch {name:?}: {source}")
             }
+            ConfigError::UnknownHookEvent { scope, key } => {
+                write!(f, "{scope}: unknown hook event {key:?}")
+            }
+            ConfigError::HookWrongScope { scope, key } => match scope {
+                HookScope::Global => write!(
+                    f,
+                    "{scope}: {key:?} is a per-watch event; move it under that watch's [watch.hooks], not top-level [hooks]"
+                ),
+                HookScope::Watch(_) => write!(
+                    f,
+                    "{scope}: {key:?} is a daemon-level event; move it to the top-level [hooks] section"
+                ),
+            },
         }
     }
 }
@@ -545,10 +787,11 @@ mod tests {
         DEFAULT_TRIGGER,
     };
 
-    /// The spec §12 example config, including the future `[ai]`, `[update]`,
-    /// `[daemon]`, and per-watch `[watch.hooks]` sections that this build
-    /// carries opaquely — their presence proves known-future tolerance. Paths
-    /// use `~` like the real spec example.
+    /// The spec §12 example config, including the future `[ai]` and
+    /// `[update]` sections that this build still carries opaquely — their
+    /// presence proves known-future tolerance — plus the now-typed `[hooks]`
+    /// and per-watch `[watch.hooks]` sections (VRD-21). Paths use `~` like
+    /// the real spec example.
     const SPEC_EXAMPLE: &str = r#"
 version = 1
 
@@ -562,6 +805,9 @@ interval = "15m"
 quiesce = "10s"
 sync = true
 sync_interval = "20m"
+
+[hooks]
+daemon_started = "notify-send vard started"
 
 [[watch]]
 name = "notes"
@@ -580,7 +826,7 @@ remote = "backup"
 exclude = ["target", "*.log"]
 
 [watch.hooks]
-post_snapshot = "notify-send snapshot taken"
+snapshot_completed = "notify-send snapshot taken"
 
 [ai]
 enabled = true
@@ -597,12 +843,25 @@ channel = "stable"
         assert_eq!(config.daemon.log_level, LogLevel::Debug);
         assert_eq!(config.daemon.log_retention_days, 30);
         assert_eq!(config.watches.len(), 2);
-        // Resolution succeeds despite [ai], [update], [watch.hooks].
-        let specs = config
-            .resolve_with_home(Some(Path::new("/home/u")))
+        // Resolution succeeds despite the still-opaque [ai] and [update].
+        let all = config
+            .resolve_all_with_home(Some(Path::new("/home/u")))
             .unwrap();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].path(), Path::new("/home/u/notes"));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].spec.path(), Path::new("/home/u/notes"));
+        // Global [hooks] resolves to the dotted event name.
+        let global_hooks = config.resolve_global_hooks().unwrap();
+        assert_eq!(
+            global_hooks.get("daemon.started"),
+            Some(&"notify-send vard started".to_string())
+        );
+        // The second watch's [watch.hooks] resolves the same way.
+        assert_eq!(
+            all[1].hooks.get("snapshot.completed"),
+            Some(&"notify-send snapshot taken".to_string())
+        );
+        // The first watch declared no hooks.
+        assert!(all[0].hooks.is_empty());
     }
 
     #[test]
@@ -1295,5 +1554,314 @@ interval = "soon"
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
+    }
+
+    // --- hooks (VRD-21) -----------------------------------------------------
+
+    #[test]
+    fn hook_timeout_and_rate_limit_default_when_unset() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "bare"
+path = "/data/bare"
+"#,
+        )
+        .unwrap();
+        let all = config.resolve_all().unwrap();
+        assert_eq!(all[0].hook_timeout, DEFAULT_HOOK_TIMEOUT);
+        assert_eq!(all[0].hook_rate_limit, DEFAULT_HOOK_RATE_LIMIT);
+        assert!(all[0].hooks.is_empty());
+    }
+
+    #[test]
+    fn hook_timeout_and_rate_limit_inherit_from_defaults_section() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+hook_timeout = "30s"
+hook_rate_limit = "2m"
+
+[[watch]]
+name = "plain"
+path = "/data/plain"
+"#,
+        )
+        .unwrap();
+        let all = config.resolve_all().unwrap();
+        assert_eq!(all[0].hook_timeout, Duration::from_secs(30));
+        assert_eq!(all[0].hook_rate_limit, Duration::from_secs(2 * 60));
+    }
+
+    #[test]
+    fn watch_hook_timeout_and_rate_limit_override_defaults() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+hook_timeout = "30s"
+hook_rate_limit = "2m"
+
+[[watch]]
+name = "custom"
+path = "/data/custom"
+hook_timeout = "5s"
+hook_rate_limit = "1m"
+"#,
+        )
+        .unwrap();
+        let all = config.resolve_all().unwrap();
+        assert_eq!(all[0].hook_timeout, Duration::from_secs(5));
+        assert_eq!(all[0].hook_rate_limit, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn watch_hooks_resolve_to_dotted_event_names() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "notes"
+path = "/data/notes"
+
+[watch.hooks]
+sync_pulled = "echo pulled"
+snapshot_completed = "echo snapshotted"
+"#,
+        )
+        .unwrap();
+        let all = config.resolve_all().unwrap();
+        assert_eq!(
+            all[0].hooks.get("sync.pulled"),
+            Some(&"echo pulled".to_string())
+        );
+        assert_eq!(
+            all[0].hooks.get("snapshot.completed"),
+            Some(&"echo snapshotted".to_string())
+        );
+    }
+
+    #[test]
+    fn global_hooks_resolve_to_dotted_event_names() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[hooks]
+daemon_started = "echo started"
+daemon_stopped = "echo stopped"
+update_available = "echo update"
+"#,
+        )
+        .unwrap();
+        let hooks = config.resolve_global_hooks().unwrap();
+        assert_eq!(
+            hooks.get("daemon.started"),
+            Some(&"echo started".to_string())
+        );
+        assert_eq!(
+            hooks.get("daemon.stopped"),
+            Some(&"echo stopped".to_string())
+        );
+        assert_eq!(
+            hooks.get("update.available"),
+            Some(&"echo update".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_key_in_watch_hooks_is_rejected() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "w"
+path = "/data/w"
+
+[watch.hooks]
+post_snapshot = "echo nope"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_all().unwrap_err();
+        match &err {
+            ConfigError::UnknownHookEvent { key, .. } => assert_eq!(key, "post_snapshot"),
+            other => panic!("expected UnknownHookEvent, got {other:?}"),
+        }
+        assert!(err.to_string().contains("post_snapshot"), "got: {err}");
+        assert!(err.to_string().contains("\"w\""), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_key_in_global_hooks_is_rejected() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[hooks]
+bogus_event = "echo nope"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_global_hooks().unwrap_err();
+        match &err {
+            ConfigError::UnknownHookEvent { key, .. } => assert_eq!(key, "bogus_event"),
+            other => panic!("expected UnknownHookEvent, got {other:?}"),
+        }
+        assert!(err.to_string().contains("bogus_event"), "got: {err}");
+
+        // resolve()/resolve_all() must fail loud on it too, not just the
+        // direct resolve_global_hooks() call.
+        assert!(config.resolve_all().is_err());
+    }
+
+    #[test]
+    fn watch_carrying_event_under_global_hooks_is_wrong_scope() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[hooks]
+sync_pulled = "echo nope"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_global_hooks().unwrap_err();
+        match &err {
+            ConfigError::HookWrongScope { key, .. } => assert_eq!(key, "sync_pulled"),
+            other => panic!("expected HookWrongScope, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("sync_pulled"), "got: {msg}");
+        assert!(msg.contains("watch.hooks"), "got: {msg}");
+    }
+
+    #[test]
+    fn daemon_scoped_event_under_watch_hooks_is_wrong_scope() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "w"
+path = "/data/w"
+
+[watch.hooks]
+update_available = "echo nope"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_all().unwrap_err();
+        match &err {
+            ConfigError::HookWrongScope { key, .. } => assert_eq!(key, "update_available"),
+            other => panic!("expected HookWrongScope, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("update_available"), "got: {msg}");
+        assert!(msg.contains("[hooks]"), "got: {msg}");
+    }
+
+    #[test]
+    fn hook_event_lists_match_the_core_event_catalog() {
+        // One dummy instance per `vard_core::Event` variant, mapping its
+        // dotted `name()` to the underscored config-key spelling. Every
+        // variant must land in exactly one of WATCH_HOOK_EVENTS /
+        // DAEMON_HOOK_EVENTS, and the two lists together must have no more
+        // and no fewer entries than the catalog: a new core event forces a
+        // conscious choice of which list it joins.
+        use vard_core::{Event, Resolver, SkipReason, Trigger, WatchState};
+
+        let events = [
+            Event::SnapshotStarted {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+            },
+            Event::SnapshotCompleted {
+                watch: "w".to_string(),
+                snapshot: "r".to_string(),
+                files_changed: 0,
+                trigger: Trigger::Manual,
+            },
+            Event::SnapshotFailed {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+                error: "e".to_string(),
+            },
+            Event::SnapshotSkipped {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+                reason: SkipReason::Clean,
+            },
+            Event::SyncPushed {
+                watch: "w".to_string(),
+                new_ref: "r".to_string(),
+                commits: 0,
+            },
+            Event::SyncPulled {
+                watch: "w".to_string(),
+                prev_ref: "a".to_string(),
+                new_ref: "b".to_string(),
+            },
+            Event::SyncConflict {
+                watch: "w".to_string(),
+            },
+            Event::SyncResolved {
+                watch: "w".to_string(),
+                resolver: Resolver::Human,
+            },
+            Event::SyncFailed {
+                watch: "w".to_string(),
+                error: "e".to_string(),
+            },
+            Event::SyncSkipped {
+                watch: "w".to_string(),
+                reason: "r".to_string(),
+            },
+            Event::RestoreCompleted {
+                watch: "w".to_string(),
+                restored_to: "a".to_string(),
+                prev_ref: "b".to_string(),
+            },
+            Event::WatchStateChanged {
+                watch: "w".to_string(),
+                from: WatchState::Ok,
+                to: WatchState::Paused,
+                reason: None,
+                trouble: None,
+            },
+            Event::DaemonStarted,
+            Event::DaemonStopped,
+            Event::UpdateAvailable {
+                version: "1.0.0".to_string(),
+            },
+        ];
+
+        let catalog_keys: HashSet<String> =
+            events.iter().map(|e| e.name().replace('.', "_")).collect();
+        let config_keys: HashSet<String> = WATCH_HOOK_EVENTS
+            .iter()
+            .chain(DAEMON_HOOK_EVENTS.iter())
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            catalog_keys, config_keys,
+            "WATCH_HOOK_EVENTS + DAEMON_HOOK_EVENTS must exactly match vard_core::Event's catalog"
+        );
+
+        // And no event appears in both lists.
+        let watch_set: HashSet<&&str> = WATCH_HOOK_EVENTS.iter().collect();
+        let daemon_set: HashSet<&&str> = DAEMON_HOOK_EVENTS.iter().collect();
+        assert!(
+            watch_set.is_disjoint(&daemon_set),
+            "an event must belong to exactly one hook scope"
+        );
     }
 }

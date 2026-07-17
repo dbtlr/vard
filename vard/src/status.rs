@@ -545,7 +545,13 @@ mod tests {
         let spec = vard_core::WatchSpec::builder(name, std::path::Path::new("/tmp/x"))
             .build()
             .unwrap();
-        ResolvedWatch { spec, paused }
+        ResolvedWatch {
+            spec,
+            paused,
+            hooks: HashMap::new(),
+            hook_timeout: crate::config::DEFAULT_HOOK_TIMEOUT,
+            hook_rate_limit: crate::config::DEFAULT_HOOK_RATE_LIMIT,
+        }
     }
 
     fn map_of(problems: &[HealthProblem]) -> HashMap<String, &HealthProblem> {

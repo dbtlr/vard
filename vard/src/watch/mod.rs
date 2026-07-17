@@ -1342,12 +1342,18 @@ mod tests {
                     .build()
                     .unwrap(),
                 paused: false,
+                hooks: std::collections::HashMap::new(),
+                hook_timeout: crate::config::DEFAULT_HOOK_TIMEOUT,
+                hook_rate_limit: crate::config::DEFAULT_HOOK_RATE_LIMIT,
             },
             ResolvedWatch {
                 spec: vard_core::WatchSpec::builder("second", &link)
                     .build()
                     .unwrap(),
                 paused: false,
+                hooks: std::collections::HashMap::new(),
+                hook_timeout: crate::config::DEFAULT_HOOK_TIMEOUT,
+                hook_rate_limit: crate::config::DEFAULT_HOOK_RATE_LIMIT,
             },
         ];
         let aliases =
