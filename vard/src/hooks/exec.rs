@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
@@ -22,6 +23,21 @@ const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// before it is SIGKILLed.
 #[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-stream cap on retained hook output. Each reader still drains its pipe to
+/// EOF — a chatty hook must never block on a full pipe — but only the trailing
+/// `OUTPUT_TAIL_CAP` bytes are kept for the log; earlier bytes are dropped and
+/// the capture is marked truncated so the log cannot imply the full output was
+/// seen.
+const OUTPUT_TAIL_CAP: usize = 8 * 1024;
+
+/// After the shell leader is gone, how long the pipe readers are given to reach
+/// EOF before (on unix) the process group is SIGKILLed to release a backgrounded
+/// descendant that inherited the pipes. Applied once before the group kill and
+/// once after, so `exec_hook`'s wall clock is bounded by roughly the hook timeout
+/// plus two of these graces even when a `some-daemon &`-style child outlives its
+/// parent.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// One hook cleared to run: the shell command, its working directory, the
 /// wall-clock timeout, and the `VARD_*` environment (minus `VARD_SUPPRESSED`,
@@ -100,20 +116,21 @@ pub(super) fn exec_hook(
     };
 
     // Drain both pipes on background threads so a chatty hook that fills a pipe
-    // buffer cannot deadlock against our completion poll.
+    // buffer cannot deadlock against our completion poll. Each thread keeps only a
+    // bounded tail (see [`drain_tail`]) and reports its result over a channel, so
+    // the collection below can be time-bounded rather than joining a thread that a
+    // pipe-holding descendant could wedge indefinitely.
     let mut child_stdout = child.stdout.take().expect("stdout piped");
     let mut child_stderr = child.stderr.take().expect("stderr piped");
-    let stdout_reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = child_stdout.read_to_end(&mut buf);
-        buf
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let (buf, truncated) = drain_tail(&mut child_stdout);
+        let _ = tx_out.send(StreamMsg::Stdout(buf, truncated));
     });
-    let stderr_reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = child_stderr.read_to_end(&mut buf);
-        buf
+    std::thread::spawn(move || {
+        let (buf, truncated) = drain_tail(&mut child_stderr);
+        let _ = tx.send(StreamMsg::Stderr(buf, truncated));
     });
 
     let mut timed_out = false;
@@ -139,10 +156,19 @@ pub(super) fn exec_hook(
         }
     };
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout);
-    let stderr = String::from_utf8_lossy(&stderr);
+    // Collect both streams, bounded so a backgrounded descendant that inherited
+    // the pipes cannot wedge this thread past the timeout (and escalating to a
+    // group SIGKILL when it does — which also covers a descendant that survived
+    // the timeout SIGTERM).
+    let captured = collect_output(&child, &rx);
+    let stdout = render_stream(
+        &captured.stdout,
+        captured.stdout_truncated || captured.detached,
+    );
+    let stderr = render_stream(
+        &captured.stderr,
+        captured.stderr_truncated || captured.detached,
+    );
 
     if timed_out {
         let secs = inv.timeout.as_secs_f64();
@@ -150,8 +176,8 @@ pub(super) fn exec_hook(
             event,
             scope,
             timeout_secs = secs,
-            stdout = %stdout.trim(),
-            stderr = %stderr.trim(),
+            stdout = %stdout,
+            stderr = %stderr,
             "hook timed out; killed its process group"
         );
         return HookOutcome::Failure(format!("timed out after {secs:.0}s"));
@@ -162,8 +188,8 @@ pub(super) fn exec_hook(
             debug!(
                 event,
                 scope,
-                stdout = %stdout.trim(),
-                stderr = %stderr.trim(),
+                stdout = %stdout,
+                stderr = %stderr,
                 "hook succeeded"
             );
             HookOutcome::Success
@@ -174,8 +200,8 @@ pub(super) fn exec_hook(
                 event,
                 scope,
                 code,
-                stdout = %stdout.trim(),
-                stderr = %stderr.trim(),
+                stdout = %stdout,
+                stderr = %stderr,
                 "hook exited non-zero"
             );
             HookOutcome::Failure(match code {
@@ -227,6 +253,128 @@ fn exited_within(child: &mut std::process::Child, grace: Duration) -> bool {
             }
             Err(_) => return false,
         }
+    }
+}
+
+/// One reader thread's result: the captured tail of a stream and whether earlier
+/// output was dropped to stay under [`OUTPUT_TAIL_CAP`].
+enum StreamMsg {
+    Stdout(Vec<u8>, bool),
+    Stderr(Vec<u8>, bool),
+}
+
+/// Reads `reader` to EOF, retaining only the trailing [`OUTPUT_TAIL_CAP`] bytes.
+/// Returns the retained tail and whether anything earlier was discarded. The
+/// pipe is always drained fully so a chatty hook can never block on a full pipe
+/// buffer; only what is *kept* is bounded.
+fn drain_tail(reader: &mut impl std::io::Read) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > OUTPUT_TAIL_CAP {
+                    let excess = buf.len() - OUTPUT_TAIL_CAP;
+                    buf.drain(..excess);
+                    truncated = true;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (buf, truncated)
+}
+
+/// The captured output of one hook run: the bounded tail of each stream, whether
+/// each was truncated to its cap, and whether the readers had to be detached
+/// (a descendant held the pipes past the drain bound, so what we have is partial).
+#[derive(Default)]
+struct Captured {
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr: Vec<u8>,
+    stderr_truncated: bool,
+    detached: bool,
+}
+
+/// Collects both reader threads' output within a bounded wall clock. The readers
+/// normally reach EOF the instant the leader's pipes close; when a backgrounded
+/// descendant inherited them and holds them open, this SIGKILLs the whole process
+/// group (releasing the pipes — and covering a descendant that survived the
+/// timeout SIGTERM) and drains what then closes. If the pipes *still* have not
+/// closed within the second grace, the readers are detached (they exit when the
+/// fds finally close) and the capture is flagged so nothing implies we saw it all.
+fn collect_output(child: &std::process::Child, rx: &Receiver<StreamMsg>) -> Captured {
+    let mut cap = Captured::default();
+    let mut remaining = 2u8;
+
+    // Phase 1: wait a bounded grace for the ordinary EOF-on-leader-exit case.
+    remaining -= recv_until(rx, &mut cap, remaining, READER_DRAIN_GRACE);
+    if remaining == 0 {
+        return cap;
+    }
+
+    // Phase 2: a descendant is holding the pipes. On unix, kill the whole group
+    // to release them; then drain what closes within a second bounded grace.
+    #[cfg(unix)]
+    signal_group(child, rustix::process::Signal::KILL);
+    #[cfg(not(unix))]
+    let _ = child;
+    remaining -= recv_until(rx, &mut cap, remaining, READER_DRAIN_GRACE);
+    if remaining > 0 {
+        // The pipes never closed within the bound: stop waiting. The reader
+        // threads die when the fds finally close; mark the capture partial.
+        cap.detached = true;
+    }
+    cap
+}
+
+/// Receives up to `want` [`StreamMsg`]s into `cap`, blocking no longer than
+/// `grace` in total. Returns how many were received (fewer than `want` when the
+/// grace elapsed with readers still pending, or the channel disconnected).
+fn recv_until(rx: &Receiver<StreamMsg>, cap: &mut Captured, want: u8, grace: Duration) -> u8 {
+    let deadline = Instant::now() + grace;
+    let mut got = 0;
+    while got < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(StreamMsg::Stdout(buf, truncated)) => {
+                cap.stdout = buf;
+                cap.stdout_truncated = truncated;
+                got += 1;
+            }
+            Ok(StreamMsg::Stderr(buf, truncated)) => {
+                cap.stderr = buf;
+                cap.stderr_truncated = truncated;
+                got += 1;
+            }
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    got
+}
+
+/// Renders a captured stream for the log: lossy UTF-8, trimmed, with an explicit
+/// marker appended when the capture was truncated (either to its byte cap or by a
+/// detached reader) so the log never implies it holds the hook's full output.
+fn render_stream(bytes: &[u8], truncated: bool) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if truncated {
+        if text.is_empty() {
+            "[output truncated]".to_string()
+        } else {
+            format!("{text} [output truncated]")
+        }
+    } else {
+        text.to_string()
     }
 }
 
@@ -361,6 +509,108 @@ mod tests {
         assert!(
             !marker.exists(),
             "the backgrounded grandchild must have been killed with the group"
+        );
+    }
+
+    #[test]
+    fn drain_tail_keeps_only_the_bounded_tail_and_flags_truncation() {
+        // More than the cap: the reader still consumes it all, but keeps only the
+        // trailing OUTPUT_TAIL_CAP bytes and flags truncation.
+        let total = OUTPUT_TAIL_CAP + 5_000;
+        let mut data = vec![b'a'; total - 3];
+        data.extend_from_slice(b"END");
+        let (buf, truncated) = drain_tail(&mut std::io::Cursor::new(data));
+        assert!(truncated, "output past the cap must be flagged truncated");
+        assert_eq!(buf.len(), OUTPUT_TAIL_CAP, "only the cap's worth is kept");
+        assert!(buf.ends_with(b"END"), "the *tail* is what survives");
+
+        // At or under the cap: kept whole, not flagged.
+        let (buf, truncated) = drain_tail(&mut std::io::Cursor::new(vec![b'x'; OUTPUT_TAIL_CAP]));
+        assert!(!truncated);
+        assert_eq!(buf.len(), OUTPUT_TAIL_CAP);
+    }
+
+    #[test]
+    fn render_stream_marks_truncated_output() {
+        assert_eq!(render_stream(b"  hello\n", false), "hello");
+        assert_eq!(render_stream(b"hello", true), "hello [output truncated]");
+        assert_eq!(render_stream(b"", true), "[output truncated]");
+    }
+
+    #[test]
+    fn a_chatty_hook_is_drained_and_still_succeeds() {
+        // Far more than the cap on stdout: the drain must consume it without
+        // deadlocking and the hook exits zero.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = OUTPUT_TAIL_CAP * 8;
+        let command = format!("head -c {bytes} /dev/zero; exit 0");
+        let start = Instant::now();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+                vec![],
+            ),
+            0,
+        );
+        assert!(
+            matches!(outcome, HookOutcome::Success),
+            "a chatty-but-zero-exit hook is a success"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "draining must not block on the full pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backgrounded_pipe_holder_returns_within_the_timeout_bound() {
+        // The classic wedge: the shell backgrounds a child that inherits the
+        // stdout/stderr pipes and then the leader exits at once. `reader.join()`
+        // on such a child would block for the child's whole lifetime. The bounded
+        // collection must instead give up on the readers, SIGKILL the group, and
+        // return — well inside the (long) timeout — with the pipe-holder killed.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        // A backgrounded subshell holds the pipes for 30s then would write a
+        // marker; the leader exits 0 immediately.
+        let command = format!("(sleep 30 && touch {m}) & exit 0", m = marker.display());
+        let start = Instant::now();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                // A long timeout: the bound under test is the reader-drain grace,
+                // not the timeout — the leader never times out.
+                Duration::from_secs(30),
+                vec![],
+            ),
+            0,
+        );
+        let elapsed = start.elapsed();
+        // The leader exited 0, so the run is a success even though a descendant
+        // had to be killed to release the pipes.
+        assert!(
+            matches!(outcome, HookOutcome::Success),
+            "leader exited zero"
+        );
+        // Bounded by roughly two drain graces (~4s), nowhere near the 30s hold.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must return on the drain bound, took {elapsed:?}"
+        );
+        // The group SIGKILL released the pipes by killing the subshell, so its
+        // delayed marker never lands.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "the pipe-holding descendant must have been killed with the group"
         );
     }
 }
