@@ -185,6 +185,26 @@ impl<K: Eq + Hash + Clone, P> Limiter<K, P> {
         self.keys.retain(|k, _| keep(k));
     }
 
+    /// Collapses every `Running` key to `Cooldown`, anchored at its recorded
+    /// run-start (the pending slot and suppressed count are preserved).
+    ///
+    /// Used when handing this limiter's state to a re-armed runner. The successor
+    /// starts with an empty `JoinSet`, so it can never receive the `on_finished`
+    /// for a run that was in flight at handoff — a carried `Running` key would
+    /// then coalesce future events forever without ever firing. Treating the run
+    /// as finished-at-handoff is honest: the in-flight process runs to completion
+    /// on the old blocking pool (its outcome is merely unreportable), and the
+    /// cooldown anchored at the real run-start preserves both debounce (the window
+    /// still measures from when the run began) and delivery (a pending slot fires
+    /// at the window edge via [`poll`](Self::poll)).
+    pub(super) fn collapse_running_to_cooldown(&mut self) {
+        for st in self.keys.values_mut() {
+            if st.phase == Phase::Running {
+                st.phase = Phase::Cooldown;
+            }
+        }
+    }
+
     /// Fires every key whose cooldown window has opened by `now`: a key with a
     /// pending event re-runs (carrying its suppressed count), an empty one drops
     /// back to idle. Returns the payloads to execute, keyed.
@@ -397,6 +417,41 @@ mod tests {
                 "no fire may be issued while the key is still running"
             );
         }
+    }
+
+    #[test]
+    fn collapsing_a_running_key_with_a_pending_fires_it_at_the_window_edge() {
+        // A run in flight (Running) with a coalesced pending event: collapsing to
+        // cooldown (the re-arm handoff) must not lose the pending — it fires at the
+        // window anchored at the original run-start, never wedging.
+        let mut lim: Limiter<&str, &str> = Limiter::new();
+        let t0 = Instant::now();
+        expect_fire(lim.on_event("k", RATE, "a", t0));
+        assert!(lim.on_event("k", RATE, "b", t0 + ms(10)).is_none());
+        // Handoff while the run is still in flight: no on_finished will ever come.
+        lim.collapse_running_to_cooldown();
+        // The key is now cooling with its pending intact; the window still anchors
+        // at the original run-start, so it opens at t0 + RATE.
+        assert_eq!(lim.next_deadline(), Some(t0 + RATE));
+        assert!(lim.poll(t0 + RATE - ms(1)).is_empty());
+        let fired = lim.poll(t0 + RATE);
+        assert_eq!(fired.len(), 1, "the carried pending fires, not a wedge");
+        assert_eq!(fired[0].1.payload, "b");
+        assert_eq!(fired[0].1.suppressed, 1);
+    }
+
+    #[test]
+    fn collapsing_a_running_key_with_no_pending_returns_to_idle_at_the_window() {
+        let mut lim: Limiter<&str, &str> = Limiter::new();
+        let t0 = Instant::now();
+        expect_fire(lim.on_event("k", RATE, "a", t0));
+        lim.collapse_running_to_cooldown();
+        // Empty cooldown: at the window it drops to idle, then the next event runs.
+        assert!(lim.poll(t0 + RATE).is_empty());
+        assert_eq!(lim.next_deadline(), None);
+        let (payload, suppressed) = expect_fire(lim.on_event("k", RATE, "c", t0 + RATE + ms(1)));
+        assert_eq!(payload, "c");
+        assert_eq!(suppressed, 0);
     }
 
     fn ms(n: u64) -> Duration {

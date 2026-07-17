@@ -1201,6 +1201,12 @@ enum Action {
     Shutdown,
 }
 
+/// How long true shutdown waits for the hooks runner to observe the final
+/// `daemon.stopped` and dispatch its hook before the runner is dropped/aborted.
+/// The runner loop ends cleanly when the engine bus closes, so this bound is only
+/// spent when the runner is mid-hook; delivery is best-effort regardless.
+const HOOK_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
 /// The supervisor loop: selects over the event bus, the shutdown/reload signals,
 /// the poll timer, and the source-died backoff timer, applying each turn's
 /// [`Action`] outside the select so the engine can be swapped without borrow
@@ -1363,6 +1369,16 @@ async fn supervise(
 
     info!("shutting down");
     handle.shutdown().await;
+    // `shutdown` emits the final `DaemonStopped` and drops the engine bus, so the
+    // runner's own subscription now sees that event followed by a clean close.
+    // Give the runner a bounded moment to observe it and dispatch its
+    // `daemon.stopped` hook before we drop (and thereby abort) it — otherwise the
+    // handoff-free drop races the runner and the documented shutdown hook may
+    // never fire. Best-effort by nature: a mid-hook runner is not waited on past
+    // the budget, and a SIGKILL/crash still loses `daemon.stopped`.
+    if let Some(runner) = hooks.take() {
+        runner.drain(HOOK_SHUTDOWN_DRAIN).await;
+    }
     // The shutdown join finishes any in-flight pass — closing (or, on a crash,
     // leaving dangling for recovery) each op-lock journal bracket — so this drain
     // only needs to log the trailing events (including the final DaemonStopped).
@@ -1551,7 +1567,7 @@ fn write_health(
 ) {
     let now = health::now_secs();
     let (hook_problems, suppressions) = hooks
-        .map(|h| project_hook_health(&h.snapshot(), now))
+        .map(|h| project_hook_health(&h.snapshot()))
         .unwrap_or_default();
     let doc = health::doc_with_hooks(
         &handle.watch_states(),
@@ -1568,13 +1584,14 @@ fn write_health(
 /// Projects a hooks-runner [`RunnerSnapshot`] into the health vocabulary: each
 /// persistently-failing hook (already at or beyond the failure threshold, and
 /// pre-sorted by the snapshot) becomes a `hook-failing` [`health::HealthProblem`]
-/// stamped at `now`, and each nonzero per-watch suppression counter becomes a
-/// [`health::HookSuppression`]. Suppression counters are sorted by watch name so
-/// the projection is deterministic (the runner keeps them in a `HashMap`); a
-/// zero counter is dropped rather than written.
+/// stamped at the moment its streak first crossed the threshold (the runner's
+/// stable `since`, so the problem's age does not reset on every heartbeat or
+/// unrelated health write), and each nonzero per-watch suppression counter
+/// becomes a [`health::HookSuppression`]. Suppression counters are sorted by
+/// watch name so the projection is deterministic (the runner keeps them in a
+/// `HashMap`); a zero counter is dropped rather than written.
 fn project_hook_health(
     snapshot: &RunnerSnapshot,
-    now: u64,
 ) -> (Vec<health::HealthProblem>, Vec<health::HookSuppression>) {
     let problems = snapshot
         .failing
@@ -1586,7 +1603,7 @@ fn project_hook_health(
                 &f.command,
                 f.consecutive,
                 &f.last_error,
-                now,
+                health::systemtime_secs(f.since),
             )
         })
         .collect();
@@ -3068,10 +3085,15 @@ mod tests {
     #[test]
     fn project_hook_health_maps_failures_and_sorts_suppression() {
         use crate::hooks::FailingHook;
+        use std::time::{Duration, UNIX_EPOCH};
         let mut suppressed = std::collections::HashMap::new();
         suppressed.insert("zebra".to_string(), 3u64);
         suppressed.insert("apple".to_string(), 7u64);
         suppressed.insert("silent".to_string(), 0u64); // a zero count is dropped
+        // Each failing hook carries its own stable `since` (the moment its streak
+        // crossed the threshold); the projection stamps that, never `now`.
+        let notes_since = UNIX_EPOCH + Duration::from_secs(500);
+        let daemon_since = UNIX_EPOCH + Duration::from_secs(1234);
         let snapshot = RunnerSnapshot {
             suppressed_by_watch: suppressed,
             failing: vec![
@@ -3081,6 +3103,7 @@ mod tests {
                     command: "apply".to_string(),
                     consecutive: 4,
                     last_error: "exited with status 1".to_string(),
+                    since: notes_since,
                 },
                 FailingHook {
                     watch: None,
@@ -3088,22 +3111,32 @@ mod tests {
                     command: "up".to_string(),
                     consecutive: 3,
                     last_error: "timed out".to_string(),
+                    since: daemon_since,
                 },
             ],
         };
-        let (problems, suppressions) = project_hook_health(&snapshot, 500);
+        let (problems, suppressions) = project_hook_health(&snapshot);
 
-        // Every failing hook becomes a hook-failing / attention problem at `now`.
+        // Every failing hook becomes a hook-failing / attention problem stamped at
+        // its own stable `since`, not the write moment.
         assert_eq!(problems.len(), 2);
         assert!(
             problems
                 .iter()
-                .all(|p| p.kind == "hook-failing" && p.state == "attention" && p.since == 500)
+                .all(|p| p.kind == "hook-failing" && p.state == "attention")
         );
-        // The watch-scoped hook keeps its watch; the global one carries the empty
-        // marker.
-        assert!(problems.iter().any(|p| p.watch == "notes"));
-        assert!(problems.iter().any(|p| p.watch.is_empty()));
+        // The watch-scoped hook keeps its watch and its own since; the global one
+        // carries the empty marker and its own since.
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.watch == "notes" && p.since == 500)
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.watch.is_empty() && p.since == 1234)
+        );
 
         // Suppression: the zero count is dropped and the rest are sorted by watch
         // (the runner keeps them in a nondeterministic HashMap).

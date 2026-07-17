@@ -343,9 +343,10 @@ pub(crate) fn unopenable_problem(watch: &str, error: &str, since: u64) -> Health
 /// its problem carries an **empty** `watch` field, the honest marker `status`
 /// and `notify` render as a daemon-scoped hook line (a real watch name is never
 /// empty). The command is truncated if long so one pathological one-liner cannot
-/// bloat the health file or a prompt. `since` is the projection moment — a hook
-/// failure has no engine-style `entered_at`, so elapsed is not meaningful for it;
-/// the consecutive count in the summary is the signal.
+/// bloat the health file or a prompt. `since` is the moment the streak first
+/// crossed the failure threshold (the runner's stable timestamp), so the
+/// problem's age stays honest across heartbeats and reloads rather than resetting
+/// on every write; the consecutive count in the summary is the primary signal.
 pub(crate) fn hook_failing_problem(
     watch: Option<&str>,
     event: &str,
@@ -574,7 +575,7 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 /// A [`SystemTime`] as whole unix seconds (0 if before the epoch).
-fn systemtime_secs(t: SystemTime) -> u64 {
+pub(crate) fn systemtime_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)

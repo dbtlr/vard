@@ -27,6 +27,13 @@
 //!   daemon exiting.
 //! - A key's consecutive-failure streak keeps counting across reloads, so a
 //!   BackoffRebuild loop cannot silently reset a failing hook below its threshold.
+//!   Its `since` (the moment the streak crossed the reporting threshold) rides
+//!   along too, so the projected health problem's age is stable across reloads.
+//! - A run that was *in flight* at the re-arm cannot be handed to the successor
+//!   (whose `JoinSet` has no task for it), so the carried key collapses from
+//!   `Running` to `Cooldown` anchored at its real run-start. The old blocking
+//!   pool still reaps that child; its outcome is merely unreportable. Debounce and
+//!   the trailing pending slot are both preserved, so the key never wedges.
 //! - `daemon.started`, which every new engine generation re-emits, hits a limiter
 //!   that remembers the previous fire: a reload storm debounces to at most one hook
 //!   run per cooldown window. This is deliberate — there is no first-generation-only
@@ -34,7 +41,11 @@
 //!   each config reload/engine rebuild, rate-limited by the loop guard;
 //!   `daemon.stopped` fires only at true shutdown, since a reload aborts the old
 //!   runner before the old engine drains its `daemon.stopped`. That asymmetry is an
-//!   accepted trade.
+//!   accepted trade. At true shutdown the daemon gives the runner a short bounded
+//!   drain ([`HooksRunnerHandle::drain`]) to observe `daemon.stopped` and dispatch
+//!   its hook before it is dropped; delivery is nonetheless **best-effort** — a
+//!   mid-hook runner is not waited on past the drain budget, and a SIGKILL or crash
+//!   still loses `daemon.stopped`.
 //! - A command changed in the config is a *different* key, so the old pending slot
 //!   for the previous command is pruned rather than fired — the honest behavior.
 //! - The [`limiter`] holds the pure `idle -> running -> cooldown` decision core;
@@ -72,7 +83,7 @@ mod limiter;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::task::{Id, JoinSet};
 use tracing::{trace, warn};
@@ -233,6 +244,11 @@ pub(crate) struct FailingHook {
     pub consecutive: u64,
     /// The most recent failure's reason.
     pub last_error: String,
+    /// When this key's streak first reached [`FAILURE_THRESHOLD`] — the stable
+    /// moment the health projection stamps as the problem's `since`, so its age
+    /// does not reset on every heartbeat or unrelated health write. Carried
+    /// across a re-arm with the rest of the failure state.
+    pub since: SystemTime,
 }
 
 /// The runner's mutable state, shared between the runner task (writer) and
@@ -261,11 +277,16 @@ impl Default for RunnerState {
     }
 }
 
-/// One key's consecutive-failure tally and last error.
+/// One key's consecutive-failure tally, last error, and the moment the streak
+/// first crossed [`FAILURE_THRESHOLD`].
 #[derive(Clone)]
 struct Failure {
     consecutive: u64,
     last_error: String,
+    /// `Some` once `consecutive` first reaches [`FAILURE_THRESHOLD`]; the stable
+    /// `since` for the health projection. `None` while the streak is still below
+    /// the threshold (not yet a reported problem).
+    since: Option<SystemTime>,
 }
 
 /// A runner's state captured for handoff to its re-armed successor: the limiter's
@@ -296,8 +317,27 @@ impl HooksRunnerHandle {
     /// already tolerates.
     pub(crate) fn carryover(&self) -> Carryover {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Carryover {
-            state: state.clone(),
+        let mut state = state.clone();
+        // The successor's JoinSet has no task for a run that is in flight right
+        // now, so it could never call `on_finished` on a carried `Running` key —
+        // that key would coalesce forever without firing. Collapse any in-flight
+        // run to cooldown (anchored at its real run-start): the old blocking pool
+        // still reaps the child, and the pending slot fires at the window edge.
+        state.limiter.collapse_running_to_cooldown();
+        Carryover { state }
+    }
+
+    /// Best-effort drain at true shutdown: waits up to `budget` for the runner
+    /// task to end on its own — the engine bus closing (see
+    /// [`EngineHandle::shutdown`](vard_core::EngineHandle)) ends the loop cleanly,
+    /// so a `daemon.stopped` hook it already dispatched gets a chance to start —
+    /// then aborts whatever is left. Consumes the handle; `Drop` aborts the task
+    /// on the way out (a no-op once it has ended). Delivery is best-effort: a mid-
+    /// hook runner is not waited on beyond `budget`, and a SIGKILL/crash still
+    /// loses `daemon.stopped`.
+    pub(crate) async fn drain(mut self, budget: Duration) {
+        if tokio::time::timeout(budget, &mut self.task).await.is_err() {
+            warn!("hooks runner: shutdown drain timed out; aborting the runner");
         }
     }
 
@@ -317,6 +357,9 @@ impl HooksRunnerHandle {
                 command: key.command.clone(),
                 consecutive: f.consecutive,
                 last_error: f.last_error.clone(),
+                // Set the moment the streak crossed the threshold, which every
+                // `failing` entry has by definition; fall back defensively.
+                since: f.since.unwrap_or_else(SystemTime::now),
             })
             .collect();
         failing.sort_by(|a, b| {
@@ -504,9 +547,16 @@ fn record_outcome(state: &mut RunnerState, key: &HookKey, outcome: &HookOutcome)
             let failure = state.failures.entry(key.clone()).or_insert(Failure {
                 consecutive: 0,
                 last_error: String::new(),
+                since: None,
             });
             failure.consecutive += 1;
             failure.last_error = error.clone();
+            // Stamp `since` the instant the streak first reaches the reporting
+            // threshold, and never again — so the projected problem's age stays
+            // honest across heartbeats and reloads.
+            if failure.since.is_none() && failure.consecutive >= FAILURE_THRESHOLD {
+                failure.since = Some(SystemTime::now());
+            }
         }
     }
 }
@@ -1051,6 +1101,104 @@ mod tests {
         // runs (immediately if it caught the tail idle, or as the trailing run).
         wait_for(&marker).await;
         drop(runner);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn carryover_of_a_running_key_with_a_pending_fires_it_and_does_not_wedge() {
+        // A reload that lands while a hook is mid-run must not wedge the key. The
+        // hook touches a per-`VARD_SUPPRESSED` marker immediately, then holds the
+        // run open (sleep) so the key is still `Running` at carryover: marker.0 is
+        // the first run, marker.1 is the coalesced trailing run the successor must
+        // fire once the cooldown window opens.
+        let dir = tempfile::tempdir().unwrap();
+        let command = format!(
+            "touch {d}/marker.$VARD_SUPPRESSED; sleep 2",
+            d = dir.path().display()
+        );
+        let build = || {
+            let mut hooks = HookMap::new();
+            hooks.insert("snapshot.completed".to_string(), command.clone());
+            HooksConfig::build(
+                HookMap::new(),
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+                vec![WatchHooks {
+                    name: "notes".to_string(),
+                    path: dir.path().to_path_buf(),
+                    hooks,
+                    timeout: Duration::from_secs(5),
+                    rate_limit: Duration::from_millis(50),
+                }],
+            )
+            .unwrap()
+        };
+
+        let bus = EventBus::default();
+        let runner = spawn(bus.subscribe(), build(), None);
+        let emit = || {
+            bus.emit(Event::SnapshotCompleted {
+                watch: "notes".to_string(),
+                snapshot: "r".to_string(),
+                files_changed: 0,
+                trigger: Trigger::Event,
+            });
+        };
+
+        // First event fires immediately: the run touches marker.0 then sleeps, so
+        // the key sits in `Running`.
+        emit();
+        wait_for(&dir.path().join("marker.0")).await;
+        // A second event lands mid-run and coalesces into the pending slot.
+        emit();
+        let coalesced = loop_until(&runner, |snap| {
+            snap.suppressed_by_watch.get("notes").copied().unwrap_or(0) >= 1
+        })
+        .await;
+        assert!(
+            coalesced,
+            "the second event must coalesce while the run is in flight"
+        );
+
+        // Hand the state to a successor and abort the old runner. Its in-flight
+        // sleep keeps running on the blocking pool (and never re-fires the pending,
+        // since its `on_finished` is unreachable), so marker.1 can only come from
+        // the successor.
+        let carry = runner.carryover();
+        drop(runner);
+        let runner2 = spawn(bus.subscribe(), build(), Some(carry));
+
+        // The successor fires the carried pending at the cooldown edge — the bug
+        // wedged the key in `Running` forever, so marker.1 would never appear.
+        wait_for(&dir.path().join("marker.1")).await;
+        drop(runner2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_runner_drains_promptly_when_the_bus_closes_at_shutdown() {
+        // At true shutdown the engine emits daemon.stopped and drops the bus. The
+        // runner loop must end on that clean close so `drain` returns well inside
+        // its budget rather than spending the whole timeout and aborting.
+        let mut global = HookMap::new();
+        global.insert("daemon.started".to_string(), "true".to_string());
+        let config = HooksConfig::build(
+            global,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        let bus = EventBus::default();
+        let runner = spawn(bus.subscribe(), config, None);
+        // Close the bus, as `EngineHandle::shutdown` does after the final event.
+        drop(bus);
+        let start = Instant::now();
+        runner.drain(Duration::from_secs(2)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "the runner must end cleanly on bus close, took {:?}",
+            start.elapsed()
+        );
     }
 
     /// Polls the runner's snapshot until `pred` holds or a short budget elapses.
