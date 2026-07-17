@@ -574,15 +574,17 @@ async fn run_daemon(
     reconcile_journals(&paths, &defined);
     recover_stale_locks(&paths, defined.iter().map(|w| &w.spec));
 
-    let (handle, events, watches) = build_started_engine_from_specs(&paths.journal_dir, specs)
-        .await
-        .map_err(StartupError::Engine)?;
+    let (handle, events, watches, skipped) =
+        build_started_engine_from_specs(&paths.journal_dir, specs)
+            .await
+            .map_err(StartupError::Engine)?;
 
     supervise(
         paths,
         handle,
         events,
         watches,
+        skipped,
         shutdown,
         reload,
         poll_interval,
@@ -729,35 +731,90 @@ impl journal::SyncSettler for GitSyncSettler {
 }
 
 /// Builds a git-backed engine from resolved specs, subscribes, and starts it.
-/// Returns the handle, a fresh event subscriber, and the ordered watch
-/// identities (name for request fan-out, path for the op gate).
+/// Returns the handle, a fresh event subscriber, the ordered watch identities
+/// (name for request fan-out, path for the op gate), and this generation's
+/// skipped-watch health problems.
 ///
 /// Each watch is armed with its per-watch [`JournalOpGate`] (op lock + journal
 /// under `journal_dir`), so the engine's worker brackets every commit under the
 /// op lock — this is where the daemon injects the structural one-writer-per-watch
 /// invariant (VRD-37); the journal is no longer an event-bus subscriber.
+///
+/// Per-watch open isolation (VRD-41): every surviving spec's repository is
+/// opened HERE, one at a time, before any watch reaches [`Engine::builder`] — a
+/// spec whose repository cannot be opened (missing, corrupt, mid-rebase) is
+/// `error!`-logged and dropped from this engine generation, never taking the
+/// rest down with it. Only the openable specs feed `watches`, so a skipped
+/// watch is not part of the supervised identity set either (request fan-out
+/// then honestly warns "unknown watch" for it, same as any other unknown name).
+/// A skipped watch is not merely a log line, though: this function is the
+/// single source of truth for the skip decision, so it also synthesizes a
+/// [`health::HealthProblem`] for it right here (`state = "attention"`,
+/// `kind = "unopenable"` — see [`health::unopenable_problem`]) and returns the
+/// whole set for the caller to fold into every health-document write. Nothing
+/// downstream re-probes the repository to learn this. The already-open
+/// backends are injected via `watch_with_backend_and_gate`, so `build` cannot
+/// re-open (and re-fail) what this function already vetted — the same pattern
+/// `cmd/sync.rs` uses for the CLI sync path. A reload re-resolves every spec
+/// from scratch, so a repository fixed on disk is picked back up on the next
+/// poll. If every spec fails to open, the engine simply supervises zero
+/// watches; [`Engine::start`] is fine with that (no workers armed,
+/// `DaemonStarted` still emitted) — the same idle shape the daemon already runs
+/// for an all-paused config.
 async fn build_started_engine_from_specs(
     journal_dir: &Path,
     specs: Vec<WatchSpec>,
-) -> Result<(EngineHandle, EventReceiver, WatchSet), EngineError> {
+) -> Result<
+    (
+        EngineHandle,
+        EventReceiver,
+        WatchSet,
+        Vec<health::HealthProblem>,
+    ),
+    EngineError,
+> {
     let specs = dedup_aliased_specs(specs);
+    // One instant for the whole build: every watch skipped in this generation
+    // entered its `unopenable` problem "now", at the engine-build moment.
+    let build_moment = health::now_secs();
+    let mut opened = Vec::with_capacity(specs.len());
+    let mut skipped = Vec::new();
+    for spec in specs {
+        match vard_core::open_git_backend(&spec) {
+            Ok(backend) => opened.push((spec, backend)),
+            Err(e) => {
+                error!(
+                    skipped = spec.name(),
+                    repo = %spec.path().display(),
+                    error = %e,
+                    "watch's repository cannot be opened; skipping it for this engine \
+                     (fix the repository and it is picked up on the next reload)"
+                );
+                skipped.push(health::unopenable_problem(
+                    spec.name(),
+                    &e.to_string(),
+                    build_moment,
+                ));
+            }
+        }
+    }
     let watches = WatchSet::new(
-        specs
+        opened
             .iter()
-            .map(|spec| WatchIdentity::new(spec.name().to_string(), spec.path().to_path_buf()))
+            .map(|(spec, _)| WatchIdentity::new(spec.name().to_string(), spec.path().to_path_buf()))
             .collect(),
     );
     let mut builder = Engine::builder();
-    // Specs and `watches` are in the same (deduped) order, so zip pairs each spec
-    // with its identity to build the injected gate.
-    for (spec, identity) in specs.into_iter().zip(watches.iter()) {
+    // `opened` and `watches` are in the same (surviving) order, so zip pairs each
+    // spec with its identity to build the injected gate.
+    for ((spec, backend), identity) in opened.into_iter().zip(watches.iter()) {
         let gate: vard_core::SharedGate = Arc::new(identity.op_gate(journal_dir));
-        builder = builder.watch_with_gate(spec, gate);
+        builder = builder.watch_with_backend_and_gate(spec, Arc::new(backend), gate);
     }
     let engine = builder.build()?;
     let events = engine.subscribe();
     let handle = engine.start().await?;
-    Ok((handle, events, watches))
+    Ok((handle, events, watches, skipped))
 }
 
 /// Drops any active watch whose journal key collides with an earlier one's —
@@ -810,7 +867,12 @@ fn dedup_aliased_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
 async fn build_started_engine(
     paths: &DaemonPaths,
     known: &[WatchIdentity],
-) -> Option<(EngineHandle, EventReceiver, WatchSet)> {
+) -> Option<(
+    EngineHandle,
+    EventReceiver,
+    WatchSet,
+    Vec<health::HealthProblem>,
+)> {
     let config = match Config::load(&paths.config_file) {
         Ok(config) => config,
         Err(err) => {
@@ -882,6 +944,10 @@ struct RebuildOutcome {
     handle: EngineHandle,
     events: EventReceiver,
     watches: WatchSet,
+    /// The current engine generation's skipped-watch health problems (VRD-41):
+    /// the fresh set on a successful rebuild, or the old generation's set
+    /// unchanged when the rebuild kept the old engine.
+    skipped: Vec<health::HealthProblem>,
     /// Whether a fresh engine actually replaced the old one.
     rebuilt: bool,
     /// Whether the new engine reported failure (a dead signal source or a
@@ -911,9 +977,10 @@ async fn try_rebuild(
     old_handle: EngineHandle,
     mut old_events: EventReceiver,
     old_watches: WatchSet,
+    old_skipped: Vec<health::HealthProblem>,
 ) -> RebuildOutcome {
     match build_started_engine(paths, &old_watches).await {
-        Some((handle, mut events, watches)) => {
+        Some((handle, mut events, watches, skipped)) => {
             let mut failure_seen = false;
             {
                 let mut shutdown = std::pin::pin!(old_handle.shutdown());
@@ -961,11 +1028,12 @@ async fn try_rebuild(
             // — so a stale problem cannot linger, and a still-blocked watch the
             // new engine re-probed at startup is reflected at once (no rebuild
             // amnesia).
-            write_health(&handle, paths);
+            write_health(&handle, &skipped, paths);
             RebuildOutcome {
                 handle,
                 events,
                 watches,
+                skipped,
                 rebuilt: true,
                 failure_seen,
             }
@@ -974,6 +1042,7 @@ async fn try_rebuild(
             handle: old_handle,
             events: old_events,
             watches: old_watches,
+            skipped: old_skipped,
             rebuilt: false,
             failure_seen: false,
         },
@@ -997,6 +1066,15 @@ async fn try_rebuild(
 /// took no in-flight operation, so recovery finds its journal clean and does
 /// nothing, while its journal file is retained (a paused watch still owns it and
 /// the orphan sweep never touches a configured key).
+///
+/// A watch that turned temporarily *unopenable* (VRD-41 per-watch isolation —
+/// still configured and active, but this generation's `build_started_engine`
+/// skipped it) rides this same path: it was in `before`'s supervised set but is
+/// absent from `after`, so it reads as "removed" even though it is not. That is
+/// safe for the same reason as a pause: the settler-less recovery here is
+/// idempotent and touches only a provably-ours, provably-stale lock, so the
+/// watch re-arms cleanly (no lock left wedged) the moment its repository is
+/// repaired and a later reload reopens it.
 fn drain_removed_watches(paths: &DaemonPaths, before: &[WatchIdentity], after: &[WatchIdentity]) {
     let surviving = WatchIdentity::key_set(after);
     for removed in before
@@ -1058,6 +1136,7 @@ async fn supervise(
     mut handle: EngineHandle,
     mut events: EventReceiver,
     mut watches: WatchSet,
+    mut skipped: Vec<health::HealthProblem>,
     shutdown: Arc<Notify>,
     reload: Arc<Notify>,
     poll_interval: Duration,
@@ -1079,7 +1158,7 @@ async fn supervise(
     // Write a fresh health document on startup, regenerated from the engine's
     // truth (the initial state probe has already flagged any blocked repo), so
     // it supersedes the crash-leftover file that was cleared before build.
-    write_health(&handle, &paths);
+    write_health(&handle, &skipped, &paths);
 
     loop {
         // Coalesce a burst of health-relevant events into a single write per loop
@@ -1093,7 +1172,7 @@ async fn supervise(
             }
             _ = heartbeat.tick() => {
                 // Refresh written_at (and self-heal any missed transition).
-                write_health(&handle, &paths);
+                write_health(&handle, &skipped, &paths);
                 Action::Continue
             }
             _ = poll.tick() => {
@@ -1135,17 +1214,18 @@ async fn supervise(
         // A watch transition changed the projected health picture: regenerate.
         // (Rebuild/reload paths write their own health from the new engine.)
         if health_dirty {
-            write_health(&handle, &paths);
+            write_health(&handle, &skipped, &paths);
         }
 
         match action {
             Action::Continue => {}
             Action::Shutdown => break,
             Action::Reload => {
-                let outcome = try_rebuild(&paths, handle, events, watches).await;
+                let outcome = try_rebuild(&paths, handle, events, watches, skipped).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watches = outcome.watches;
+                skipped = outcome.skipped;
                 if outcome.rebuilt {
                     // A full rebuild supersedes any pending source-died retry.
                     rebuild_at = None;
@@ -1179,10 +1259,11 @@ async fn supervise(
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
-                let outcome = try_rebuild(&paths, handle, events, watches).await;
+                let outcome = try_rebuild(&paths, handle, events, watches, skipped).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watches = outcome.watches;
+                skipped = outcome.skipped;
                 if !outcome.rebuilt {
                     // The rebuild failed; keep retrying on a growing backoff so a
                     // persistently broken engine is not hammered.
@@ -1364,17 +1445,20 @@ fn log_event(event: &Event) {
 }
 
 /// Regenerates the health file from the engine's current per-watch truth
-/// ([`EngineHandle::watch_states`]) and writes it atomically. The document is a
-/// pure projection — never patched incrementally — so every write reflects
-/// exactly what the engine reports right now: a recovered watch drops out, a
-/// renamed watch's stale entry cannot linger, and a still-blocked watch a
-/// restart re-probed is present from the first write.
+/// ([`EngineHandle::watch_states`]) plus the current engine generation's
+/// `skipped` watches (VRD-41 — those whose repository could not be opened and
+/// so never reached the engine at all) and writes it atomically. The document
+/// is a pure projection — never patched incrementally — so every write
+/// reflects exactly what is true right now: a recovered watch drops out, a
+/// renamed watch's stale entry cannot linger, a still-blocked watch a restart
+/// re-probed is present from the first write, and a skipped watch is never
+/// silently absent (which would read as `ok`).
 ///
 /// A write failure is warned, never fatal: a health-file hiccup must not crash
 /// the daemon or interrupt snapshotting, and `vard notify` degrades to the
 /// daemon-not-running / starting / stale path on its own.
-fn write_health(handle: &EngineHandle, paths: &DaemonPaths) {
-    let doc = health::doc_from_states(&handle.watch_states(), health::now_secs());
+fn write_health(handle: &EngineHandle, skipped: &[health::HealthProblem], paths: &DaemonPaths) {
+    let doc = health::doc_from_states(&handle.watch_states(), skipped, health::now_secs());
     if let Err(err) = health::write(&paths.health_file, &doc) {
         warn!(error = %err, "could not write health file");
     }
@@ -2625,6 +2709,93 @@ mod tests {
         let kept = dedup_aliased_specs(vec![second, first]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].name(), "second");
+    }
+
+    // --- per-watch open isolation (VRD-41) ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unopenable_repo_is_skipped_while_its_healthy_sibling_still_starts() {
+        // One spec points at a plain directory (never `git init`-ed, so
+        // `open_git_backend` fails with `NotARepo`); the other is a real repo.
+        // Before VRD-41, `Engine::build` opened every watch itself and one bad
+        // repository failed the whole build — snapshot protection for the
+        // healthy watch too. Now the bad watch is vetted and dropped HERE, so
+        // the engine still builds and starts, supervising only the survivor.
+        let root = tempfile::tempdir().unwrap();
+        let broken = root.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        let healthy = root.path().join("healthy");
+        init_repo(&healthy);
+
+        let journal_dir = root.path().join("journal");
+        let specs = vec![
+            WatchSpec::builder("broken", &broken).build().unwrap(),
+            WatchSpec::builder("healthy", &healthy).build().unwrap(),
+        ];
+
+        let (handle, _events, watches, skipped) =
+            build_started_engine_from_specs(&journal_dir, specs)
+                .await
+                .expect("one unopenable repo must not fail the whole engine build");
+
+        assert_eq!(
+            watches.len(),
+            1,
+            "only the healthy watch survives into the supervised identity set"
+        );
+        assert_eq!(watches[0].name, "healthy");
+
+        // The skipped watch is not just logged and dropped — it comes back as a
+        // health problem, so `vard status`/`notify` inherit honesty rather than
+        // reading a missing watch as a false "ok" (the honesty gap this closes).
+        assert_eq!(
+            skipped.len(),
+            1,
+            "exactly one health problem for the one skipped watch"
+        );
+        assert_eq!(skipped[0].watch, "broken");
+        assert_eq!(skipped[0].state, "attention");
+        assert_eq!(skipped[0].kind, "unopenable");
+        assert!(
+            !skipped[0].summary.is_empty(),
+            "the summary carries the open error, not left blank"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_repo_unopenable_still_builds_and_starts_a_zero_watch_engine() {
+        // The whole-engine-failure regression this ticket closes: a single spec
+        // whose repository cannot be opened must no longer bubble up as
+        // `Err(EngineError::Backend { .. })` from `Engine::build`. It is skipped
+        // and logged, and the engine proceeds supervising nothing — the same
+        // idle shape an all-paused config already produces (`Engine::start`
+        // arms no workers and still emits `DaemonStarted` for zero watches).
+        let root = tempfile::tempdir().unwrap();
+        let broken = root.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+
+        let journal_dir = root.path().join("journal");
+        let specs = vec![WatchSpec::builder("broken", &broken).build().unwrap()];
+
+        let (handle, _events, watches, skipped) =
+            build_started_engine_from_specs(&journal_dir, specs)
+                .await
+                .expect("an engine with zero survivors must still build and start, not fail whole");
+
+        assert!(
+            watches.is_empty(),
+            "the sole watch failed to open and is not supervised"
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the sole skipped watch still surfaces as a health problem"
+        );
+        assert_eq!(skipped[0].watch, "broken");
+
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

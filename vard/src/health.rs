@@ -33,6 +33,15 @@
 //! | `Attention` (other)              | `attention`        | `attention`        |
 //! | `Conflicted`                     | `conflicted`       | `conflicted`       |
 //! | `SyncError`                      | `sync-error`       | `sync-error`       |
+//! | *(pre-engine: repo failed to open)* | `attention`      | `unopenable`       |
+//!
+//! The last row is not derived from an engine [`WatchState`] at all: a watch
+//! whose repository cannot be opened is skipped *before* it ever reaches the
+//! engine (VRD-41 per-watch isolation in `daemon.rs`), so there is no
+//! [`WatchStatus`] to classify. The daemon — the sole owner of that skip
+//! decision — synthesizes the problem itself via [`unopenable_problem`] and
+//! hands it to [`doc_from_states`] alongside the engine's own projection, so a
+//! skipped watch is never silently reported as `ok`.
 //!
 //! Two vocabulary decisions are deliberate:
 //!
@@ -155,6 +164,10 @@ enum ProblemKind {
     Conflicted,
     /// A sync operation is failing.
     SyncError,
+    /// A watch's repository could not be opened, so it was skipped before it
+    /// ever reached the engine (VRD-41). Never produced by [`classify`] — the
+    /// daemon synthesizes it directly via [`unopenable_problem`].
+    Unopenable,
 }
 
 impl ProblemKind {
@@ -166,6 +179,7 @@ impl ProblemKind {
             ProblemKind::SourceDied | ProblemKind::Attention => "attention",
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
+            ProblemKind::Unopenable => "attention",
         }
     }
 
@@ -178,6 +192,7 @@ impl ProblemKind {
             ProblemKind::Attention => "attention",
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
+            ProblemKind::Unopenable => "unopenable",
         }
     }
 
@@ -206,6 +221,12 @@ impl ProblemKind {
             ProblemKind::SyncError => reason
                 .map(str::to_string)
                 .unwrap_or_else(|| "a sync operation is failing".to_string()),
+            ProblemKind::Unopenable => match reason {
+                Some(err) => {
+                    format!("repository cannot be opened: {err}; fix it — a reload picks it up")
+                }
+                None => "repository cannot be opened; fix it — a reload picks it up".to_string(),
+            },
         }
     }
 }
@@ -242,14 +263,39 @@ fn problem_from_status(status: &WatchStatus) -> Option<HealthProblem> {
     })
 }
 
+/// Builds a health problem for a watch skipped at engine-build time because its
+/// repository could not be opened (VRD-41 per-watch isolation). The daemon
+/// owns the skip decision and calls this right where it makes it — nothing
+/// here re-probes the repository; it only applies the health vocabulary
+/// (`state = "attention"`, `kind = "unopenable"`) to the daemon's own facts.
+pub(crate) fn unopenable_problem(watch: &str, error: &str, since: u64) -> HealthProblem {
+    HealthProblem {
+        watch: watch.to_string(),
+        state: ProblemKind::Unopenable.state_token().to_string(),
+        kind: ProblemKind::Unopenable.kind_token().to_string(),
+        summary: ProblemKind::Unopenable.summary(Some(error)),
+        since,
+    }
+}
+
 /// Regenerates the whole health document from a point-in-time projection of the
-/// engine's per-watch truth, stamped `written_at = now`. This is the only way
-/// the document is produced — it is never patched incrementally.
-pub(crate) fn doc_from_states(states: &[WatchStatus], now: u64) -> HealthDoc {
+/// engine's per-watch truth plus the current engine generation's `skipped`
+/// watches (those whose repository could not be opened and so never reached
+/// the engine at all — see [`unopenable_problem`]), stamped `written_at = now`.
+/// This is the only way the document is produced — it is never patched
+/// incrementally. Engine-derived problems come first, skipped problems after;
+/// an empty `skipped` slice reproduces the pre-VRD-41-fix behavior exactly.
+pub(crate) fn doc_from_states(
+    states: &[WatchStatus],
+    skipped: &[HealthProblem],
+    now: u64,
+) -> HealthDoc {
+    let mut problems: Vec<HealthProblem> = states.iter().filter_map(problem_from_status).collect();
+    problems.extend(skipped.iter().cloned());
     HealthDoc {
         version: VERSION,
         written_at: now,
-        problems: states.iter().filter_map(problem_from_status).collect(),
+        problems,
     }
 }
 
@@ -419,7 +465,7 @@ mod tests {
     #[test]
     fn healthy_watches_contribute_no_problems() {
         let states = vec![status("vault", WatchState::Ok, None, "")];
-        let doc = doc_from_states(&states, 2000);
+        let doc = doc_from_states(&states, &[], 2000);
         assert_eq!(doc.version, VERSION);
         assert_eq!(doc.written_at, 2000);
         assert!(doc.problems.is_empty());
@@ -433,7 +479,7 @@ mod tests {
             None,
             "a merge is in progress",
         )];
-        let p = &doc_from_states(&states, 2000).problems[0];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
         assert_eq!(p.watch, "vault");
         assert_eq!(
             p.state, "blocked",
@@ -457,7 +503,7 @@ mod tests {
             Some(TroubleKind::SnapshotsFailing),
             "git commit failed (exit 1): boom",
         )];
-        let p = &doc_from_states(&states, 2000).problems[0];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
         assert_eq!(p.state, "snapshots-failing");
         assert_eq!(p.kind, "snapshots-failing");
         assert!(
@@ -475,7 +521,7 @@ mod tests {
             Some(TroubleKind::SourceDied),
             "watch task ended abnormally",
         )];
-        let p = &doc_from_states(&states, 2000).problems[0];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
         assert_eq!(p.state, "attention");
         assert_eq!(p.kind, "source-died");
         assert!(p.summary.contains("rebuilding"), "got: {}", p.summary);
@@ -489,7 +535,7 @@ mod tests {
             Some(TroubleKind::Degraded),
             "inotify queue overflowed",
         )];
-        let p = &doc_from_states(&states, 2000).problems[0];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
         assert_eq!(p.state, "attention");
         assert_eq!(p.kind, "attention");
         assert_eq!(p.summary, "inotify queue overflowed");
@@ -501,13 +547,59 @@ mod tests {
             status("zebra", WatchState::Attention, None, ""),
             status("apple", WatchState::Paused, None, "merge"),
         ];
-        let names: Vec<_> = doc_from_states(&states, 0)
+        let names: Vec<_> = doc_from_states(&states, &[], 0)
             .problems
             .iter()
             .map(|p| p.watch.clone())
             .collect();
         // The projection preserves the engine's configured order (not sorted).
         assert_eq!(names, vec!["zebra", "apple"]);
+    }
+
+    #[test]
+    fn unopenable_problem_uses_the_attention_state_and_unopenable_kind() {
+        let p = unopenable_problem("broken", "not a git repository", 500);
+        assert_eq!(p.watch, "broken");
+        assert_eq!(p.state, "attention");
+        assert_eq!(p.kind, "unopenable");
+        assert!(
+            p.summary.contains("not a git repository"),
+            "the open error is surfaced: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("reload"),
+            "action guidance points at a reload: {}",
+            p.summary
+        );
+        assert_eq!(p.since, 500);
+    }
+
+    #[test]
+    fn doc_from_states_appends_skipped_problems_after_engine_problems() {
+        let states = vec![status("zebra", WatchState::Attention, None, "trouble")];
+        let skipped = vec![unopenable_problem("broken", "no such repo", 10)];
+        let doc = doc_from_states(&states, &skipped, 2000);
+        let names: Vec<_> = doc.problems.iter().map(|p| p.watch.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["zebra", "broken"],
+            "engine problems come first, skipped problems follow"
+        );
+        assert_eq!(doc.problems[1].kind, "unopenable");
+    }
+
+    #[test]
+    fn an_empty_skipped_slice_reproduces_the_pre_vrd41_fix_behavior() {
+        let states = vec![status(
+            "vault",
+            WatchState::Attention,
+            Some(TroubleKind::SnapshotsFailing),
+            "boom",
+        )];
+        let with_empty_skipped = doc_from_states(&states, &[], 2000);
+        assert_eq!(with_empty_skipped.problems.len(), 1);
+        assert_eq!(with_empty_skipped.problems[0].watch, "vault");
     }
 
     #[test]
@@ -518,7 +610,7 @@ mod tests {
             Some(TroubleKind::SnapshotsFailing),
             "x",
         )];
-        let doc = doc_from_states(&states, 200);
+        let doc = doc_from_states(&states, &[], 200);
         let text = toml::to_string(&doc).unwrap();
         let back: HealthDoc = toml::from_str(&text).unwrap();
         assert_eq!(back, doc);
@@ -537,6 +629,7 @@ mod tests {
                 Some(TroubleKind::SourceDied),
                 "backend died",
             )],
+            &[],
             9,
         );
         write(&path, &doc).unwrap();
