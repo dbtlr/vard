@@ -183,32 +183,45 @@ fn join_rows(
     // A running daemon (even under a stale file) is monitoring; a starting or
     // stopped daemon is not, so an unpaused watch is `unknown`, not `ok`.
     let monitoring = matches!(report, HealthReport::Running { .. });
-    let mut rows: Vec<WatchRow> = reported
-        .iter()
-        .map(|rw| {
-            let alias_of = aliases
-                .get(&rw.spec.name().to_lowercase())
-                .map(String::as_str);
-            let mut row = WatchRow::project(rw, &problems, monitoring, alias_of);
-            // Overlay this watch's hook suppression telemetry (VRD-21) when
-            // nonzero — it is not a problem, so it rides alongside whatever state
-            // the watch already has (including `ok`) and never changes it.
-            if let Some(&count) = suppressions.get(&rw.spec.name().to_lowercase())
-                && count > 0
-            {
-                row.suppressed = Some(count);
+    let mut rows: Vec<WatchRow> = Vec::new();
+    for rw in reported {
+        let name_lc = rw.spec.name().to_lowercase();
+        let alias_of = aliases.get(&name_lc).map(String::as_str);
+        let mut row = WatchRow::project(rw, &problems, monitoring, alias_of);
+        // Overlay this watch's hook suppression telemetry (VRD-21) when nonzero —
+        // it is not a problem, so it rides alongside whatever state the watch
+        // already has (including `ok`) and never changes it.
+        if let Some(&count) = suppressions.get(&name_lc)
+            && count > 0
+        {
+            row.suppressed = Some(count);
+        }
+        rows.push(row);
+        // A watch can carry more than one problem (e.g. a sync conflict AND a
+        // failing hook): `project` renders the first (engine-derived) one as the
+        // primary row; the rest follow in the health document's order so neither
+        // is hidden. An aliased watch is unsupervised, so it has no honest health
+        // to expand.
+        if alias_of.is_none()
+            && let Some(extra) = problems.get(&name_lc)
+        {
+            for p in extra.iter().skip(1) {
+                rows.push(WatchRow::from_problem(rw.spec.name().to_string(), p));
             }
-            row
-        })
-        .collect();
+        }
+    }
 
-    if include_orphans && let HealthReport::Running { problems, .. } = report {
+    if let HealthReport::Running { problems, .. } = report {
         for p in problems {
             if p.watch.is_empty() {
                 // An empty watch marks a daemon-global (`[hooks]`) hook failure
-                // (VRD-21): it has no watch row to join, so it stands alone.
+                // (VRD-21). It is daemon-scope, like liveness — not orphan-scope —
+                // so it renders (and folds into the exit code) regardless of any
+                // selector, standing alone since it has no watch row to join.
                 rows.push(WatchRow::global_hook(p));
-            } else if !configured_names.contains(&p.watch.to_lowercase()) {
+            } else if include_orphans && !configured_names.contains(&p.watch.to_lowercase()) {
+                // An orphaned watch problem is only meaningful in the whole-fleet
+                // view; a selector already narrows to one named config watch.
                 rows.push(WatchRow::orphan(p));
             }
         }
@@ -228,17 +241,21 @@ fn alias_map(watches: &[ResolvedWatch]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Indexes the health problems by their watch name, lowercased on both insert
-/// and lookup so the join is case-insensitive — matching the config/select
-/// duplicate-detection identity. Empty unless a daemon is running.
-fn problems_map(report: &HealthReport) -> HashMap<String, &HealthProblem> {
-    match report {
-        HealthReport::Running { problems, .. } => problems
-            .iter()
-            .map(|p| (p.watch.to_lowercase(), p))
-            .collect(),
-        HealthReport::Starting | HealthReport::NotRunning { .. } => HashMap::new(),
+/// Groups the health problems by their watch name, lowercased on both insert and
+/// lookup so the join is case-insensitive — matching the config/select
+/// duplicate-detection identity. A watch can hold more than one problem at once
+/// (e.g. a sync conflict *and* a failing hook); the group preserves the health
+/// document's order (engine-derived problems first, hook-failing after), so the
+/// join can render every one rather than letting a later entry hide an earlier.
+/// Empty unless a daemon is running.
+fn problems_map(report: &HealthReport) -> HashMap<String, Vec<&HealthProblem>> {
+    let mut map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
+    if let HealthReport::Running { problems, .. } = report {
+        for p in problems {
+            map.entry(p.watch.to_lowercase()).or_default().push(p);
+        }
     }
+    map
 }
 
 /// Indexes the per-watch hook suppression telemetry (VRD-21) by lowercased watch
@@ -333,14 +350,14 @@ impl WatchRow {
     /// monitoring, else `unknown` (nothing is watching it).
     fn project(
         rw: &ResolvedWatch,
-        problems: &HashMap<String, &HealthProblem>,
+        problems: &HashMap<String, Vec<&HealthProblem>>,
         monitoring: bool,
         alias_of: Option<&str>,
     ) -> WatchRow {
         let name = rw.spec.name();
         if let Some(winner) = alias_of {
             WatchRow::alias(name.to_string(), winner)
-        } else if let Some(p) = problems.get(&name.to_lowercase()) {
+        } else if let Some(p) = problems.get(&name.to_lowercase()).and_then(|v| v.first()) {
             WatchRow::from_problem(name.to_string(), p)
         } else if rw.paused {
             WatchRow::plain(name.to_string(), "paused")
@@ -615,11 +632,12 @@ mod tests {
         }
     }
 
-    fn map_of(problems: &[HealthProblem]) -> HashMap<String, &HealthProblem> {
-        problems
-            .iter()
-            .map(|p| (p.watch.to_lowercase(), p))
-            .collect()
+    fn map_of(problems: &[HealthProblem]) -> HashMap<String, Vec<&HealthProblem>> {
+        let mut map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
+        for p in problems {
+            map.entry(p.watch.to_lowercase()).or_default().push(p);
+        }
+        map
     }
 
     #[test]
@@ -643,7 +661,7 @@ mod tests {
 
     #[test]
     fn project_shows_paused_when_no_problem() {
-        let map: HashMap<String, &HealthProblem> = HashMap::new();
+        let map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
         let row = WatchRow::project(&resolved("notes", true), &map, true, None);
         assert_eq!(row.state, "paused");
         assert!(!row.is_problem(), "a deliberate pause is not attention");
@@ -651,7 +669,7 @@ mod tests {
 
     #[test]
     fn project_shows_ok_when_healthy_and_monitored() {
-        let map: HashMap<String, &HealthProblem> = HashMap::new();
+        let map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
         let row = WatchRow::project(&resolved("work", false), &map, true, None);
         assert_eq!(row.state, "ok");
         assert!(!row.is_problem());
@@ -660,7 +678,7 @@ mod tests {
     #[test]
     fn project_shows_unknown_when_nothing_is_monitoring() {
         // Daemon not running / starting: an unpaused watch is `unknown`, not `ok`.
-        let map: HashMap<String, &HealthProblem> = HashMap::new();
+        let map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
         let row = WatchRow::project(
             &resolved("work", false),
             &map,
@@ -694,7 +712,7 @@ mod tests {
 
     #[test]
     fn project_marks_an_aliased_watch_as_unsupervised_attention() {
-        let map: HashMap<String, &HealthProblem> = HashMap::new();
+        let map: HashMap<String, Vec<&HealthProblem>> = HashMap::new();
         // An alias beats every other signal — the daemon never supervises it, so a
         // false `ok`/`paused` would hide that it is unwatched.
         let row = WatchRow::project(&resolved("second", true), &map, true, Some("first"));
@@ -985,5 +1003,66 @@ mod tests {
             global.summary
         );
         assert!(global.is_problem());
+    }
+
+    #[test]
+    fn a_global_hook_failure_surfaces_even_under_a_selector() {
+        // A daemon-global hook failure is daemon-scope, like liveness: it must
+        // render and fold into the exit code regardless of a selector (which only
+        // narrows the per-watch part). `include_orphans = false` models a selector.
+        let report = HealthReport::Running {
+            problems: vec![hook_failing("", 500)],
+            suppressions: vec![],
+            written_at: 1000,
+        };
+        let rows = join_rows(
+            &report,
+            &[resolved("notes", false)],
+            &["notes".to_string()].into_iter().collect(),
+            &HashMap::new(),
+            /* include_orphans */ false,
+        );
+        let global = rows
+            .iter()
+            .find(|r| r.name == "[hooks]")
+            .expect("a [hooks] row must survive a selector");
+        assert_eq!(global.kind.as_deref(), Some("hook-failing"));
+        assert!(
+            global.is_problem(),
+            "the global hook problem must fold into the exit code even under a selector"
+        );
+    }
+
+    #[test]
+    fn a_watch_with_engine_and_hook_problems_shows_both_engine_first() {
+        // One watch carrying a sync conflict AND a failing hook must show both,
+        // engine problem first, not let the last-appended one hide the first.
+        let report = HealthReport::Running {
+            problems: vec![
+                problem("notes", "conflicted", 100),
+                hook_failing("notes", 200),
+            ],
+            suppressions: vec![],
+            written_at: 1000,
+        };
+        let rows = join_rows(
+            &report,
+            &[resolved("notes", false)],
+            &["notes".to_string()].into_iter().collect(),
+            &HashMap::new(),
+            true,
+        );
+        let notes: Vec<&WatchRow> = rows.iter().filter(|r| r.name == "notes").collect();
+        assert_eq!(notes.len(), 2, "both problems render, one row each");
+        assert_eq!(
+            notes[0].state, "conflicted",
+            "the engine problem comes first"
+        );
+        assert_eq!(notes[0].kind.as_deref(), Some("conflicted"));
+        assert_eq!(notes[1].kind.as_deref(), Some("hook-failing"));
+        assert!(
+            notes[0].is_problem() && notes[1].is_problem(),
+            "both fold into the exit code"
+        );
     }
 }
