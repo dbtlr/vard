@@ -9,6 +9,7 @@ mod daemon;
 mod flock;
 mod health;
 mod help;
+mod hooks;
 mod instance;
 mod journal;
 mod notify;

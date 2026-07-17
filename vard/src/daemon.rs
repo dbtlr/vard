@@ -89,6 +89,7 @@ use vard_core::{
 
 use crate::config::{Config, ConfigError, LogLevel};
 use crate::health;
+use crate::hooks::{self, HooksConfig, HooksRunnerHandle};
 use crate::instance::{InstanceLock, LockError, LockRole};
 use crate::journal::{self, Journal, JournalOpGate, RecoveryReport, SweepOpts};
 use crate::paths::{self, HomeNotFound};
@@ -574,8 +575,9 @@ async fn run_daemon(
     reconcile_journals(&paths, &defined);
     recover_stale_locks(&paths, defined.iter().map(|w| &w.spec));
 
-    let (handle, events, watches, skipped) =
-        build_started_engine_from_specs(&paths.journal_dir, specs)
+    let hooks_config = build_hooks_config(&config, &defined);
+    let (handle, events, watches, skipped, hooks) =
+        build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config)
             .await
             .map_err(StartupError::Engine)?;
 
@@ -585,6 +587,7 @@ async fn run_daemon(
         events,
         watches,
         skipped,
+        hooks,
         shutdown,
         reload,
         poll_interval,
@@ -764,12 +767,14 @@ impl journal::SyncSettler for GitSyncSettler {
 async fn build_started_engine_from_specs(
     journal_dir: &Path,
     specs: Vec<WatchSpec>,
+    hooks: Option<HooksConfig>,
 ) -> Result<
     (
         EngineHandle,
         EventReceiver,
         WatchSet,
         Vec<health::HealthProblem>,
+        Option<HooksRunnerHandle>,
     ),
     EngineError,
 > {
@@ -813,8 +818,51 @@ async fn build_started_engine_from_specs(
     }
     let engine = builder.build()?;
     let events = engine.subscribe();
+    // The hooks runner takes its OWN subscription, distinct from the supervisor's
+    // `events`, and does so *before* start so it observes `daemon.started`.
+    let hook_events = hooks.as_ref().map(|_| engine.subscribe());
     let handle = engine.start().await?;
-    Ok((handle, events, watches, skipped))
+    let runner = match (hooks, hook_events) {
+        (Some(config), Some(rx)) => Some(hooks::spawn(rx, config)),
+        _ => None,
+    };
+    Ok((handle, events, watches, skipped, runner))
+}
+
+/// Assembles the hooks runner's arming from a loaded [`Config`] and its resolved
+/// watches, or `None` when no hooks are configured anywhere (global or on any
+/// active watch) — in which case the daemon spawns no runner. Only active
+/// (non-paused) watches contribute: a paused watch runs no engine worker and so
+/// emits no events. The global `[hooks]` timeout and rate limit come from
+/// `[defaults]` (there is no daemon-level override), matching how a watch with no
+/// explicit values resolves them.
+fn build_hooks_config(
+    config: &Config,
+    defined: &[crate::config::ResolvedWatch],
+) -> Option<HooksConfig> {
+    // `resolve_global_hooks` was already validated during `resolve_all`; an error
+    // here would have failed startup/reload before this point, so treat a stray
+    // failure as "no global hooks" rather than propagating.
+    let global = config.resolve_global_hooks().unwrap_or_default();
+    let global_timeout = config
+        .defaults
+        .hook_timeout
+        .unwrap_or(crate::config::DEFAULT_HOOK_TIMEOUT);
+    let global_rate_limit = config
+        .defaults
+        .hook_rate_limit
+        .unwrap_or(crate::config::DEFAULT_HOOK_RATE_LIMIT);
+    let watches = defined
+        .iter()
+        .filter(|w| !w.paused)
+        .map(|w| hooks::WatchHooks {
+            name: w.spec.name().to_string(),
+            path: w.spec.path().to_path_buf(),
+            hooks: w.hooks.clone(),
+            timeout: w.hook_timeout,
+            rate_limit: w.hook_rate_limit,
+        });
+    HooksConfig::build(global, global_timeout, global_rate_limit, watches)
 }
 
 /// Drops any active watch whose journal key collides with an earlier one's —
@@ -872,6 +920,7 @@ async fn build_started_engine(
     EventReceiver,
     WatchSet,
     Vec<health::HealthProblem>,
+    Option<HooksRunnerHandle>,
 )> {
     let config = match Config::load(&paths.config_file) {
         Ok(config) => config,
@@ -929,7 +978,8 @@ async fn build_started_engine(
             .filter(|spec| !known_keys.contains(&journal::journal_file_name(spec.path()))),
     );
 
-    match build_started_engine_from_specs(&paths.journal_dir, specs).await {
+    let hooks_config = build_hooks_config(&config, &defined);
+    match build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config).await {
         Ok(started) => Some(started),
         Err(err) => {
             error!(error = %err, "reload: could not start new engine; keeping current engine");
@@ -948,6 +998,10 @@ struct RebuildOutcome {
     /// the fresh set on a successful rebuild, or the old generation's set
     /// unchanged when the rebuild kept the old engine.
     skipped: Vec<health::HealthProblem>,
+    /// The hooks runner armed against the current engine's bus (VRD-21): a fresh
+    /// runner on a successful rebuild, or the old one retained when the rebuild
+    /// kept the old engine. `None` when no hooks are configured.
+    hooks: Option<HooksRunnerHandle>,
     /// Whether a fresh engine actually replaced the old one.
     rebuilt: bool,
     /// Whether the new engine reported failure (a dead signal source or a
@@ -978,9 +1032,14 @@ async fn try_rebuild(
     mut old_events: EventReceiver,
     old_watches: WatchSet,
     old_skipped: Vec<health::HealthProblem>,
+    old_hooks: Option<HooksRunnerHandle>,
 ) -> RebuildOutcome {
     match build_started_engine(paths, &old_watches).await {
-        Some((handle, mut events, watches, skipped)) => {
+        Some((handle, mut events, watches, skipped, hooks)) => {
+            // The new runner is already armed against the new engine's bus; abort
+            // the old one now so it does not react to the old engine's drain
+            // (in particular its `daemon.stopped`, which a reload is not).
+            drop(old_hooks);
             let mut failure_seen = false;
             {
                 let mut shutdown = std::pin::pin!(old_handle.shutdown());
@@ -1034,6 +1093,7 @@ async fn try_rebuild(
                 events,
                 watches,
                 skipped,
+                hooks,
                 rebuilt: true,
                 failure_seen,
             }
@@ -1043,6 +1103,7 @@ async fn try_rebuild(
             events: old_events,
             watches: old_watches,
             skipped: old_skipped,
+            hooks: old_hooks,
             rebuilt: false,
             failure_seen: false,
         },
@@ -1137,6 +1198,7 @@ async fn supervise(
     mut events: EventReceiver,
     mut watches: WatchSet,
     mut skipped: Vec<health::HealthProblem>,
+    mut hooks: Option<HooksRunnerHandle>,
     shutdown: Arc<Notify>,
     reload: Arc<Notify>,
     poll_interval: Duration,
@@ -1221,11 +1283,12 @@ async fn supervise(
             Action::Continue => {}
             Action::Shutdown => break,
             Action::Reload => {
-                let outcome = try_rebuild(&paths, handle, events, watches, skipped).await;
+                let outcome = try_rebuild(&paths, handle, events, watches, skipped, hooks).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watches = outcome.watches;
                 skipped = outcome.skipped;
+                hooks = outcome.hooks;
                 if outcome.rebuilt {
                     // A full rebuild supersedes any pending source-died retry.
                     rebuild_at = None;
@@ -1259,11 +1322,12 @@ async fn supervise(
             }
             Action::BackoffRebuild => {
                 rebuild_at = None;
-                let outcome = try_rebuild(&paths, handle, events, watches, skipped).await;
+                let outcome = try_rebuild(&paths, handle, events, watches, skipped, hooks).await;
                 handle = outcome.handle;
                 events = outcome.events;
                 watches = outcome.watches;
                 skipped = outcome.skipped;
+                hooks = outcome.hooks;
                 if !outcome.rebuilt {
                     // The rebuild failed; keep retrying on a growing backoff so a
                     // persistently broken engine is not hammered.
@@ -2733,8 +2797,8 @@ mod tests {
             WatchSpec::builder("healthy", &healthy).build().unwrap(),
         ];
 
-        let (handle, _events, watches, skipped) =
-            build_started_engine_from_specs(&journal_dir, specs)
+        let (handle, _events, watches, skipped, _hooks) =
+            build_started_engine_from_specs(&journal_dir, specs, None)
                 .await
                 .expect("one unopenable repo must not fail the whole engine build");
 
@@ -2779,8 +2843,8 @@ mod tests {
         let journal_dir = root.path().join("journal");
         let specs = vec![WatchSpec::builder("broken", &broken).build().unwrap()];
 
-        let (handle, _events, watches, skipped) =
-            build_started_engine_from_specs(&journal_dir, specs)
+        let (handle, _events, watches, skipped, _hooks) =
+            build_started_engine_from_specs(&journal_dir, specs, None)
                 .await
                 .expect("an engine with zero survivors must still build and start, not fail whole");
 
@@ -2852,6 +2916,90 @@ mod tests {
             result.is_ok(),
             "clean idle shutdown returns Ok, got {result:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_hook_fires_on_snapshot_and_re_arms_across_a_reload() {
+        // A watch-scoped `snapshot_completed` hook runs its shell command when the
+        // watch commits, and after a config reload the runner is re-armed against
+        // the new engine's bus with the reload's new command. Markers live outside
+        // the watched repo so firing a hook cannot itself trigger a snapshot.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        init_repo(&repo);
+        let before = root.path().join("before-marker");
+        let after = root.path().join("after-marker");
+
+        let state = root.path().join("state");
+        let config_file = root.path().join("config.toml");
+        let config_text = |marker: &Path| {
+            format!(
+                "version = 1\n\n\
+                 [[watch]]\nname = \"w\"\npath = {repo:?}\ntrigger = \"events\"\nquiesce = \"300ms\"\n\n\
+                 [watch.hooks]\nsnapshot_completed = {cmd:?}\n",
+                cmd = format!("touch {}", marker.display()),
+            )
+        };
+        std::fs::write(&config_file, config_text(&before)).unwrap();
+
+        let paths = DaemonPaths {
+            config_file: config_file.clone(),
+            lock_file: state.join("vard.lock"),
+            request_dir: state.join("requests"),
+            journal_dir: state.join("journal"),
+            reconcile_dir: state.join("reconcile"),
+            health_file: state.join("health"),
+        };
+        std::fs::create_dir_all(&paths.request_dir).unwrap();
+
+        let shutdown = Arc::new(Notify::new());
+        let reload = Arc::new(Notify::new());
+        let config = Config::load(&paths.config_file).unwrap();
+        let daemon = tokio::spawn(run_daemon(
+            paths.clone(),
+            config,
+            Arc::clone(&shutdown),
+            Arc::clone(&reload),
+            Duration::from_millis(100),
+        ));
+
+        // A write commits a snapshot, which fires the pre-reload hook.
+        let note = repo.join("note.md");
+        std::fs::write(&note, b"one").unwrap();
+        wait_for_commits(&repo, 2, Some(&note)).await;
+        wait_for_marker(&before).await;
+
+        // Rewrite the config with a new hook command; the content-fingerprint
+        // poll detects it and reloads, re-arming the runner on the new engine.
+        // Let the debounce settle and the engine rebuild land before triggering
+        // the next snapshot, so it is unambiguously the reloaded hook that fires.
+        std::fs::write(&config_file, config_text(&after)).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // A fresh write after the reload commits again and must fire the *new*
+        // hook. Re-touch to clear any watcher-arm race across the rebuild.
+        std::fs::write(&note, b"two").unwrap();
+        wait_for_commits(&repo, 3, Some(&note)).await;
+        wait_for_marker(&after).await;
+
+        shutdown.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("daemon must exit promptly on shutdown")
+            .expect("daemon task must not panic");
+        assert!(result.is_ok(), "clean shutdown returns Ok, got {result:?}");
+    }
+
+    /// Polls until `marker` exists (a hook side effect) or a generous budget
+    /// elapses. Real time; the hook itself is a sub-millisecond `touch`.
+    async fn wait_for_marker(marker: &Path) {
+        for _ in 0..200 {
+            if marker.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("hook marker {} never appeared", marker.display());
     }
 
     #[tokio::test(flavor = "multi_thread")]
