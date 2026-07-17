@@ -30,7 +30,7 @@ Human line form by default, **regardless of destination** — unlike the list su
 ⚠ vard: daemon not running — start it with `vard run`
 ```
 
-Each line is a watch that is blocked (unsafe-repo), snapshots-failing, conflicted, sync-erroring, or attention-needing, with how long it has been in that state. A watch you deliberately paused is **not** reported (that is not a problem); [`status`](status.md) lists paused watches. If the daemon is not running that is itself one reported line (it replaces any stale per-watch entries), and while it is starting or stopping `notify` says so rather than reporting a false all-clear — so a prompt hook can tell "all quiet" from "nothing is watching your files".
+Each line is a watch that is blocked (unsafe-repo), snapshots-failing, conflicted, sync-erroring, or attention-needing, with how long it has been in that state. A watch whose [hook](run.md#hooks) has failed 3 consecutive times is reported here too (kind `hook-failing`), clearing on the hook's next success; a failing global `[hooks]` hook is reported as a daemon hook. A watch you deliberately paused is **not** reported (that is not a problem); [`status`](status.md) lists paused watches. Hook **suppression** — coalesced hook events — is telemetry, not a problem: `notify` stays silent about it (a watch that has only coalesced hooks is healthy), so it never adds prompt noise; [`status`](status.md) is where the coalesced count is shown. If the daemon is not running that is itself one reported line (it replaces any stale per-watch entries), and while it is starting or stopping `notify` says so rather than reporting a false all-clear — so a prompt hook can tell "all quiet" from "nothing is watching your files".
 
 ```bash
 vard notify --format json

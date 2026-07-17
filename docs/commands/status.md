@@ -58,15 +58,19 @@ A watch whose path canonicalizes onto an earlier watch's — two config entries 
 
 A watch whose repository **cannot be opened** (a corrupt or deleted `.git`, a directory that was never initialized) is likewise never shown as `ok`: the daemon skips it at engine build rather than letting one broken repository stop every healthy watch, and reports it as `attention` with kind `unopenable` and a summary naming the open error. It is not being snapshotted while flagged. Repair the repository, then reload the daemon (`SIGHUP`, or any config-file change) — the next engine build re-opens every watch from scratch and picks it back up.
 
+A watch with a [hook](run.md#hooks) that has failed on **3 consecutive** runs (a non-zero exit or a timeout) is reported as `attention` with kind `hook-failing`, and the summary names the event, the command, the failure count, and the last error. Like `snapshots-failing`, it **clears itself** the moment that hook next succeeds — there is nothing to acknowledge. A failing **global** `[hooks]` hook has no watch to attach to, so it is reported on its own row labeled `[hooks]`.
+
+A watch that has **coalesced** hook events (the [loop guard](run.md#the-loop-guard) delayed some same-key hook runs) shows a trailing `(N hook events coalesced)` on its line. This is pure telemetry: it never changes the watch's state (a healthy watch stays `ok`), never counts toward the exit code, and is omitted entirely when the count is zero.
+
 ```bash
 vard status --format json
 ```
 
 ```json
-[{"name":null,"state":"not-running","kind":null,"summary":"not running — start it with `vard run`","since":null,"elapsed_seconds":null,"daemon":true}]
+[{"name":null,"state":"not-running","kind":null,"summary":"not running — start it with `vard run`","since":null,"elapsed_seconds":null,"suppressed":null,"daemon":true}]
 ```
 
-In JSON, the daemon row carries a null watch `name` and a `daemon: true` flag; each configured watch is its own object.
+In JSON, the daemon row carries a null watch `name` and a `daemon: true` flag; each configured watch is its own object. A watch's coalesced-hook count is the `suppressed` field (null when zero).
 
 ## Exit codes
 
