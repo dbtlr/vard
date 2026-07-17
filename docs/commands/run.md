@@ -83,6 +83,8 @@ Event keys are the event's name with its first `.` written as `_` (so `snapshot.
 
 **Daemon events** (under `[hooks]`): `daemon_started`, `daemon_stopped`, `update_available`.
 
+`daemon_started` fires when the daemon first starts **and again on every config reload or engine rebuild** (each rebuilds the engine, which re-emits it); it is rate-limited by the loop guard below, so a storm of reloads collapses to at most one hook run per cooldown window. `daemon_stopped` fires only on a real shutdown — a reload deliberately does not emit it for the engine it replaces.
+
 `hook_timeout` and `hook_rate_limit` live in `[defaults]` and each watch may override them in its own `[[watch]]` table; absent everywhere they default to `60s` and `5m`. (Global `[hooks]` use the `[defaults]` values.)
 
 ### Execution semantics
@@ -122,6 +124,8 @@ A hook can dirty the tree, which snapshots, which fires the hook again. To keep 
 - When the window opens, the pending event runs **once**, with `VARD_SUPPRESSED` set to how many arrivals it stands in for.
 
 So a hook is only ever **delayed**, never skipped: the last event always runs. A single event that arrives during the cooldown is delivered when the window opens with `VARD_SUPPRESSED=1`; an immediate run always sees `VARD_SUPPRESSED=0`. An idempotent apply script (stow, rsync) produces no change on its second pass, so the loop dies in one iteration; a genuinely non-idempotent hook cycles at most once per cooldown window, bounded and visible.
+
+The loop-guard state — each key's cooldown window, its pending trailing slot, and its consecutive-failure streak — **survives a config reload or engine rebuild**: a coalesced event still waiting to run fires when its window opens even if a reload lands in between, and a failing hook keeps its failure count rather than resetting each reload. The one boundary is process shutdown: stopping the daemon drops any not-yet-fired pending event (a hook is delayed across reloads, never across a restart). A hook whose command is changed in the config is a new key, so a pending run queued for the old command is dropped rather than run under the new one.
 
 The per-watch count of coalesced events is shown by [`status`](status.md) as telemetry; it never marks a watch unhealthy and [`notify`](notify.md) stays silent about it.
 
