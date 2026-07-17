@@ -76,7 +76,7 @@ Adding also seeds the repository's private `.git/info/exclude` (never your track
 | `--sync` | Turn syncing on for the new watch and run a first sync to confirm — the same opt-in flow as [`vard watch sync`](#sync). Writes `sync = true`. Conflicts with `--no-sync`. |
 | `--init` | If the directory is not a git repository, `git init` it without prompting (the non-interactive escape hatch). |
 
-Syncing is **off by default**: a newly added watch is local-only until you turn it on. Pass `--sync` to opt in at add time (it writes `sync = true` and runs a confirmation cycle), or turn it on later with [`vard watch sync <name>`](#sync). The `--remote` and `--branch` flags are **optional** — they default to `origin` and the repository's current branch — so what a sync actually needs is that the selected remote **exists in the repository** (`git remote add origin <url>`), not that you pass the flags. See [`sync`](sync.md).
+Syncing is **off by default**: a newly added watch is local-only until you turn it on. Pass `--sync` to opt in at add time (it writes `sync = true` and runs a confirmation cycle), or turn it on later with [`vard watch sync <name>`](#sync). The `--remote` and `--branch` flags are **optional** — they default to `origin` and the repository's current branch — so what a sync actually needs is that the selected remote **exists in the repository** (`git remote add origin <url>`), not that you pass the flags. See [`sync`](sync.md). Adding with `--sync` before that remote exists still writes `sync = true` and exits `1` from the confirmation cycle — see [`sync`](#sync) below for what that exit means to a script.
 
 When an `add` leaves syncing **off** — neither `--sync` nor a `defaults.sync = true` — the records-form output ends with a single hint line:
 
@@ -214,6 +214,8 @@ Opting in never creates a remote; vard does not touch remotes. A watch whose rep
 ```
 
 Add the remote (`git remote add origin <url>`), then re-run `vard watch sync notes` to sync.
+
+The exit `1` here is a refusal reported honestly, **not** a rollback: `sync = true` has already landed in the config, and a running [daemon](run.md) logs the remote-less watch as a skip and **picks up a remote added later on its next sync, live** — no restart, no re-enable (see [`sync`](sync.md)). For a provisioning script that registers watches **before** their remotes exist, that makes exit `1` the expected "enabled, pending a remote" outcome, distinct from `2` (a real fault). How the refusal is reported depends on the mode: with **no daemon** the confirmation cycle runs and the machine forms carry it as a row (`status: "disabled"`, the `detail` naming the missing remote); with a **daemon running** the up-front check refuses before any cycle, as a message on stderr only — `add --sync`'s JSON then carries an empty `sync` array — so the exit code is the signal to script against.
 
 `--off` turns syncing off instead: it writes an explicit `sync = false` — a pin that also overrides a `defaults.sync = true` — and runs **no** cycle, reporting plainly like pause/resume:
 
