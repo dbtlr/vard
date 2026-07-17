@@ -27,7 +27,7 @@ On startup the daemon:
 1. **Acquires the single-instance lock** for its state directory, so only one vard owns a directory tree at a time. A second daemon contending for the same state directory exits with status `2`.
 2. **Loads the config file** into watch specs.
 3. **Recovers stale version-control locks** left behind by a previous crash.
-4. **Watches every configured directory** and snapshots changes into version control.
+4. **Watches every configured directory** and snapshots changes into version control. A directory whose repository cannot be opened is skipped with an error log rather than stopping the daemon — it is reported as `attention` (kind `unopenable`) by [`status`](status.md) and [`notify`](notify.md), and re-attempted on every reload, so repairing the repository plus a reload brings it back.
 
 While running it:
 

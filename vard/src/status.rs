@@ -608,6 +608,24 @@ mod tests {
     }
 
     #[test]
+    fn project_renders_an_unopenable_skip_as_a_problem_not_ok() {
+        // VRD-41 honesty gap: a watch the daemon skipped because its repository
+        // could not be opened produces no engine state, so without a health
+        // problem entry it would fall through to `ok` — a false "protected".
+        let p = problem("broken", "attention", 100);
+        let p = HealthProblem {
+            kind: "unopenable".to_string(),
+            ..p
+        };
+        let map = map_of(std::slice::from_ref(&p));
+        let row = WatchRow::project(&resolved("broken", false), &map, true, None);
+        assert_eq!(row.state, "attention");
+        assert_eq!(row.kind.as_deref(), Some("unopenable"));
+        assert_ne!(row.state, "ok", "a skipped watch must never render as ok");
+        assert!(row.is_problem());
+    }
+
+    #[test]
     fn project_marks_an_aliased_watch_as_unsupervised_attention() {
         let map: HashMap<String, &HealthProblem> = HashMap::new();
         // An alias beats every other signal — the daemon never supervises it, so a
