@@ -1,17 +1,17 @@
 ---
 title: run
-description: Run the vard daemon in the foreground, watching and snapshotting every configured directory.
+description: Run the vard daemon in the foreground, watching and snapshotting every active configured directory.
 ---
 
 # vard run
 
-Run the vard daemon in the foreground until stopped. This is the process that does the actual watching: where [`snapshot`](snapshot.md) takes one snapshot on demand, `run` watches every configured directory continuously and snapshots changes into version control on its own. It stays attached to the terminal and logs each event to stderr, so you run it under a process supervisor (systemd, launchd, a tmux pane) rather than as a one-shot command.
+Run the vard daemon in the foreground until stopped. This is the process that does the actual watching: where [`snapshot`](snapshot.md) takes one snapshot on demand, `run` watches every active configured directory continuously and snapshots changes into version control on its own. It stays attached to the terminal and logs each event to stderr, so you run it under a process supervisor (systemd, launchd, a tmux pane) rather than as a one-shot command.
 
 ## Examples
 
 ```bash
 vard run
-# watch every configured directory and snapshot until Ctrl-C
+# watch every active configured directory and snapshot until Ctrl-C
 
 vard run &
 # background it in a shell; logs still go to stderr
@@ -27,7 +27,7 @@ On startup the daemon:
 1. **Acquires the single-instance lock** for its state directory, so only one vard owns a directory tree at a time. A second daemon contending for the same state directory exits with status `2`.
 2. **Loads the config file** into watch specs.
 3. **Recovers stale version-control locks** left behind by a previous crash.
-4. **Watches every configured directory** and snapshots changes into version control. A directory whose repository cannot be opened is skipped with an error log rather than stopping the daemon — it is reported as `attention` (kind `unopenable`) by [`status`](status.md) and [`notify`](notify.md), and re-attempted on every reload, so repairing the repository plus a reload brings it back.
+4. **Watches every active configured directory** and snapshots changes into version control. A directory whose repository cannot be opened is skipped with an error log rather than stopping the daemon — it is reported as `attention` (kind `unopenable`) by [`status`](status.md) and [`notify`](notify.md), and re-attempted on every reload, so repairing the repository plus a reload brings it back.
 
 While running it:
 
