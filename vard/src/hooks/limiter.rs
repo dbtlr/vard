@@ -38,6 +38,7 @@ enum Phase {
 }
 
 /// One key's coalescing state.
+#[derive(Clone)]
 struct KeyState<P> {
     phase: Phase,
     /// The cooldown length for this key (its scope's `hook_rate_limit`).
@@ -60,6 +61,7 @@ impl<P> KeyState<P> {
 }
 
 /// The coalescing limiter over an opaque key `K` and payload `P`.
+#[derive(Clone)]
 pub(super) struct Limiter<K, P> {
     keys: HashMap<K, KeyState<P>>,
 }
@@ -174,6 +176,13 @@ impl<K: Eq + Hash + Clone, P> Limiter<K, P> {
             .filter(|st| st.phase == Phase::Cooldown)
             .map(KeyState::deadline)
             .min()
+    }
+
+    /// Drops every key the predicate rejects — used on a re-arm to prune keys
+    /// (`(scope, event, command)`) the new config no longer arms, so a stale
+    /// pending slot for a removed or command-changed hook cannot fire.
+    pub(super) fn retain(&mut self, keep: impl Fn(&K) -> bool) {
+        self.keys.retain(|k, _| keep(k));
     }
 
     /// Fires every key whose cooldown window has opened by `now`: a key with a

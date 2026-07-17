@@ -577,7 +577,7 @@ async fn run_daemon(
 
     let hooks_config = build_hooks_config(&config, &defined);
     let (handle, events, watches, skipped, hooks) =
-        build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config)
+        build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config, None)
             .await
             .map_err(StartupError::Engine)?;
 
@@ -768,6 +768,7 @@ async fn build_started_engine_from_specs(
     journal_dir: &Path,
     specs: Vec<WatchSpec>,
     hooks: Option<HooksConfig>,
+    hooks_carry: Option<hooks::Carryover>,
 ) -> Result<
     (
         EngineHandle,
@@ -823,7 +824,7 @@ async fn build_started_engine_from_specs(
     let hook_events = hooks.as_ref().map(|_| engine.subscribe());
     let handle = engine.start().await?;
     let runner = match (hooks, hook_events) {
-        (Some(config), Some(rx)) => Some(hooks::spawn(rx, config)),
+        (Some(config), Some(rx)) => Some(hooks::spawn(rx, config, hooks_carry)),
         _ => None,
     };
     Ok((handle, events, watches, skipped, runner))
@@ -915,6 +916,7 @@ fn dedup_aliased_specs(specs: Vec<WatchSpec>) -> Vec<WatchSpec> {
 async fn build_started_engine(
     paths: &DaemonPaths,
     known: &[WatchIdentity],
+    hooks_carry: Option<hooks::Carryover>,
 ) -> Option<(
     EngineHandle,
     EventReceiver,
@@ -979,7 +981,9 @@ async fn build_started_engine(
     );
 
     let hooks_config = build_hooks_config(&config, &defined);
-    match build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config).await {
+    match build_started_engine_from_specs(&paths.journal_dir, specs, hooks_config, hooks_carry)
+        .await
+    {
         Ok(started) => Some(started),
         Err(err) => {
             error!(error = %err, "reload: could not start new engine; keeping current engine");
@@ -1034,11 +1038,21 @@ async fn try_rebuild(
     old_skipped: Vec<health::HealthProblem>,
     old_hooks: Option<HooksRunnerHandle>,
 ) -> RebuildOutcome {
-    match build_started_engine(paths, &old_watches).await {
+    // Capture the old runner's coalescing + failure + suppression state so the new
+    // runner resumes it: a pending trailing event, a failure streak, and the
+    // debounced `daemon.started` all survive the swap (VRD-21). Cloned, not drained
+    // — on a failed rebuild `old_hooks` is returned unchanged as the live runner,
+    // so it must keep its own state intact.
+    let hooks_carry = old_hooks.as_ref().map(HooksRunnerHandle::carryover);
+    match build_started_engine(paths, &old_watches, hooks_carry).await {
         Some((handle, mut events, watches, skipped, hooks)) => {
-            // The new runner is already armed against the new engine's bus; abort
-            // the old one now so it does not react to the old engine's drain
-            // (in particular its `daemon.stopped`, which a reload is not).
+            // The new runner is already armed against the new engine's bus (resuming
+            // the carried state); abort the old one now so it does not react to the
+            // old engine's drain. In particular the old engine's `daemon.stopped` is
+            // deliberately suppressed on a reload: only a true shutdown fires
+            // `daemon.stopped`, while `daemon.started` is re-emitted by every new
+            // generation and rate-limited by the carried loop guard. That asymmetry
+            // (started re-fires, bounded; stopped does not) is an accepted trade.
             drop(old_hooks);
             let mut failure_seen = false;
             {
@@ -2859,7 +2873,7 @@ mod tests {
         ];
 
         let (handle, _events, watches, skipped, _hooks) =
-            build_started_engine_from_specs(&journal_dir, specs, None)
+            build_started_engine_from_specs(&journal_dir, specs, None, None)
                 .await
                 .expect("one unopenable repo must not fail the whole engine build");
 
@@ -2905,7 +2919,7 @@ mod tests {
         let specs = vec![WatchSpec::builder("broken", &broken).build().unwrap()];
 
         let (handle, _events, watches, skipped, _hooks) =
-            build_started_engine_from_specs(&journal_dir, specs, None)
+            build_started_engine_from_specs(&journal_dir, specs, None, None)
                 .await
                 .expect("an engine with zero survivors must still build and start, not fail whole");
 

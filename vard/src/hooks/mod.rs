@@ -12,7 +12,31 @@
 //! - [`spawn`] subscribes the runner to the engine bus (its **own** subscription,
 //!   never shared with the health-writer loop) and starts its task, returning a
 //!   [`HooksRunnerHandle`]. Dropping the handle aborts the task — this is how the
-//!   daemon re-arms cleanly on an engine rebuild or config reload.
+//!   daemon re-arms cleanly on an engine rebuild or config reload. The re-armed
+//!   runner is not born empty: [`HooksRunnerHandle::carryover`] hands the old
+//!   runner's [`Carryover`] (limiter per-key phase, pending trailing slots,
+//!   failure streaks, and suppression totals) into the new [`spawn`], keyed by
+//!   the reload-stable `(scope, event, command)` and pruned to the new config.
+//!
+//! # State across a re-arm
+//!
+//! Because the state survives a reload/rebuild:
+//! - A coalesced trailing event that had not yet fired stays pending and fires
+//!   when its window opens — "delayed, never dropped" holds across reloads too.
+//!   Process shutdown is the honest boundary: a pending slot does not survive the
+//!   daemon exiting.
+//! - A key's consecutive-failure streak keeps counting across reloads, so a
+//!   BackoffRebuild loop cannot silently reset a failing hook below its threshold.
+//! - `daemon.started`, which every new engine generation re-emits, hits a limiter
+//!   that remembers the previous fire: a reload storm debounces to at most one hook
+//!   run per cooldown window. This is deliberate — there is no first-generation-only
+//!   lifecycle delivery. `daemon.started` therefore fires at startup and again on
+//!   each config reload/engine rebuild, rate-limited by the loop guard;
+//!   `daemon.stopped` fires only at true shutdown, since a reload aborts the old
+//!   runner before the old engine drains its `daemon.stopped`. That asymmetry is an
+//!   accepted trade.
+//! - A command changed in the config is a *different* key, so the old pending slot
+//!   for the previous command is pruned rather than fired — the honest behavior.
 //! - The [`limiter`] holds the pure `idle -> running -> cooldown` decision core;
 //!   [`exec`] runs the process with the SIGTERM/SIGKILL process-group discipline.
 //!
@@ -45,13 +69,13 @@
 mod exec;
 mod limiter;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::task::JoinSet;
-use tracing::warn;
+use tokio::task::{Id, JoinSet};
+use tracing::{trace, warn};
 use vard_core::{Event, EventReceiver, RecvError};
 
 use crate::config::HookMap;
@@ -163,6 +187,25 @@ impl HooksConfig {
             watches: map,
         })
     }
+
+    /// Every hook key this config arms: the identities carried state must be
+    /// pruned to on a re-arm, so a pending slot or failure streak for a hook the
+    /// new config no longer defines is dropped rather than resurrected.
+    fn hook_keys(&self) -> impl Iterator<Item = HookKey> + '_ {
+        let global = self.global.hooks.iter().map(|(event, command)| HookKey {
+            scope: Scope::Global,
+            event: event.clone(),
+            command: command.clone(),
+        });
+        let watches = self.watches.iter().flat_map(|(name, scope)| {
+            scope.hooks.iter().map(move |(event, command)| HookKey {
+                scope: Scope::Watch(name.clone()),
+                event: event.clone(),
+                command: command.clone(),
+            })
+        });
+        global.chain(watches)
+    }
 }
 
 /// A cheap, point-in-time read of the runner's accumulated state — the pure
@@ -193,21 +236,44 @@ pub(crate) struct FailingHook {
 }
 
 /// The runner's mutable state, shared between the runner task (writer) and
-/// [`HooksRunnerHandle::snapshot`] (reader).
-#[derive(Default)]
-struct SharedState {
+/// [`HooksRunnerHandle::snapshot`] (reader), and carried across a re-arm (see
+/// [`Carryover`]). Holds the coalescing [`Limiter`] itself so a reload preserves
+/// each key's phase and pending trailing slot, not just the observability tallies.
+#[derive(Clone)]
+struct RunnerState {
     /// Coalesced-event totals per watch name.
     suppressed_by_watch: HashMap<String, u64>,
-    /// Coalesced-event total for daemon-global hooks.
-    global_suppressed: u64,
     /// Per-key failure tracking; a key is absent once it succeeds.
     failures: HashMap<HookKey, Failure>,
+    /// The per-key `idle -> running -> cooldown` decision core. Lives here so it
+    /// survives a re-arm; only the runner task mutates it (plus the drain that
+    /// builds a [`Carryover`]).
+    limiter: Limiter<HookKey, HookInvocation>,
+}
+
+impl Default for RunnerState {
+    fn default() -> Self {
+        RunnerState {
+            suppressed_by_watch: HashMap::new(),
+            failures: HashMap::new(),
+            limiter: Limiter::new(),
+        }
+    }
 }
 
 /// One key's consecutive-failure tally and last error.
+#[derive(Clone)]
 struct Failure {
     consecutive: u64,
     last_error: String,
+}
+
+/// A runner's state captured for handoff to its re-armed successor: the limiter's
+/// per-key phase and pending slots, the failure streaks, and the suppression
+/// totals. Cloned from the old runner (which keeps running until its handle is
+/// dropped) and pruned to the new config in [`spawn`].
+pub(crate) struct Carryover {
+    state: RunnerState,
 }
 
 /// A handle to a running hooks runner. Dropping it aborts the runner task
@@ -216,11 +282,25 @@ struct Failure {
 pub(crate) struct HooksRunnerHandle {
     // Read by `snapshot`, which the daemon calls to build the health projection;
     // the runner task writes it throughout.
-    state: Arc<Mutex<SharedState>>,
+    state: Arc<Mutex<RunnerState>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl HooksRunnerHandle {
+    /// Captures this runner's state for handoff to a re-armed runner. Cloned, not
+    /// drained: the old runner keeps serving its bus until the daemon drops its
+    /// handle, and on a *failed* rebuild it is kept as the live runner — draining
+    /// would leave it (or a bad-config fallback) amnesiac. On a successful rebuild
+    /// the old runner is aborted right after, so the clone cannot double-fire a
+    /// pending slot except within the brief both-armed rebuild window the daemon
+    /// already tolerates.
+    pub(crate) fn carryover(&self) -> Carryover {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Carryover {
+            state: state.clone(),
+        }
+    }
+
     /// A cheap, pure read of the runner's state for the health projection.
     pub(crate) fn snapshot(&self) -> RunnerSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -257,31 +337,79 @@ impl Drop for HooksRunnerHandle {
 
 /// Subscribes the runner to `events` (its own bus subscription, taken *before*
 /// the engine starts so `daemon.started` is seen) and starts its task with
-/// `config`. The returned handle's drop aborts the task.
-pub(crate) fn spawn(events: EventReceiver, config: HooksConfig) -> HooksRunnerHandle {
-    let state = Arc::new(Mutex::new(SharedState::default()));
+/// `config`. `carry`, when present, is the previous generation's [`Carryover`]:
+/// its state resumes here, pruned to the keys and watches `config` still arms so a
+/// removed or command-changed hook cannot fire a stale pending slot. The returned
+/// handle's drop aborts the task.
+pub(crate) fn spawn(
+    events: EventReceiver,
+    config: HooksConfig,
+    carry: Option<Carryover>,
+) -> HooksRunnerHandle {
+    let mut state = carry.map(|c| c.state).unwrap_or_default();
+    prune_to_config(&mut state, &config);
+    let state = Arc::new(Mutex::new(state));
     let task = tokio::spawn(run(events, config, Arc::clone(&state)));
     HooksRunnerHandle { state, task }
+}
+
+/// Prunes carried state to what `config` still arms: a failure streak or pending
+/// slot for a `(scope, event, command)` the new config dropped is discarded, and a
+/// suppression total for a watch the new config no longer arms goes with it. A
+/// single retain per collection — the keys are stable across generations, so a
+/// surviving key keeps its state untouched.
+fn prune_to_config(state: &mut RunnerState, config: &HooksConfig) {
+    let valid: HashSet<HookKey> = config.hook_keys().collect();
+    state.failures.retain(|key, _| valid.contains(key));
+    state.limiter.retain(|key| valid.contains(key));
+    let watches: HashSet<&str> = config.watches.keys().map(String::as_str).collect();
+    state
+        .suppressed_by_watch
+        .retain(|watch, _| watches.contains(watch.as_str()));
 }
 
 /// The runner task: coalesce bus events through the limiter, fire cleared hooks
 /// on blocking tasks, and advance the limiter as runs finish and cooldowns
 /// elapse. Ends cleanly when the bus closes.
-async fn run(mut events: EventReceiver, config: HooksConfig, state: Arc<Mutex<SharedState>>) {
-    let mut limiter: Limiter<HookKey, HookInvocation> = Limiter::new();
+async fn run(mut events: EventReceiver, config: HooksConfig, state: Arc<Mutex<RunnerState>>) {
+    // Tracks the key of every in-flight blocking task by its join id, so a task
+    // that panics (a bare `JoinError` carries no payload, hence no key) can still
+    // be attributed, recorded as a failure, and its key re-armed. Populated on
+    // spawn, drained on completion (success, failure, or panic).
+    let mut in_flight: HashMap<Id, HookKey> = HashMap::new();
     let mut joins: JoinSet<(HookKey, HookOutcome)> = JoinSet::new();
     loop {
         // The soonest a pending cooldown is due; `None` when no key is cooling.
-        let deadline = limiter.next_deadline();
-        let sleep = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let sleep = {
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
+            st.limiter
+                .next_deadline()
+                .map(|d| d.saturating_duration_since(Instant::now()))
+        };
         tokio::select! {
             received = events.recv() => match received {
                 Ok(event) => {
                     if let Some((key, rate_limit, invocation)) = route(&config, &event) {
-                        match limiter.on_event(key.clone(), rate_limit, invocation, Instant::now()) {
-                            Some(fire) => spawn_hook(&mut joins, key, fire),
-                            None => record_suppressed(&state, &key),
+                        let fire = {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            match st.limiter.on_event(key.clone(), rate_limit, invocation, Instant::now()) {
+                                Some(fire) => Some(fire),
+                                None => {
+                                    // Coalesced: bump the per-watch total (global
+                                    // suppression is not tracked). Delayed, not lost.
+                                    if let Scope::Watch(name) = &key.scope {
+                                        *st.suppressed_by_watch.entry(name.clone()).or_insert(0) += 1;
+                                    }
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(fire) = fire {
+                            spawn_hook(&mut joins, &mut in_flight, key, fire);
                         }
+                    } else {
+                        // Hot path: the common no-hook event stays near-free at trace.
+                        trace!(event = event.name(), "hooks runner: no configured hook for event");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -291,17 +419,52 @@ async fn run(mut events: EventReceiver, config: HooksConfig, state: Arc<Mutex<Sh
                 }
                 Err(RecvError::Closed) => break,
             },
-            Some(done) = joins.join_next(), if !joins.is_empty() => {
-                if let Ok((key, outcome)) = done {
-                    record_outcome(&state, &key, &outcome);
-                    if let Some(fire) = limiter.on_finished(&key, Instant::now()) {
-                        spawn_hook(&mut joins, key, fire);
+            Some(done) = joins.join_next_with_id(), if !joins.is_empty() => {
+                let fire = match done {
+                    Ok((id, (key, outcome))) => {
+                        in_flight.remove(&id);
+                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        record_outcome(&mut st, &key, &outcome);
+                        st.limiter.on_finished(&key, Instant::now()).map(|f| (key, f))
                     }
+                    Err(join_err) => {
+                        // A hook task panicked (or was cancelled). Recover its key so
+                        // the limiter re-arms — otherwise the key wedges in Running
+                        // forever, silently dropping every future event for it.
+                        match in_flight.remove(&join_err.id()) {
+                            Some(key) => {
+                                warn!(
+                                    event = %key.event,
+                                    scope = key.scope.label(),
+                                    error = %join_err,
+                                    "hooks runner: hook task failed to join; recording a failure and re-arming"
+                                );
+                                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                                record_outcome(
+                                    &mut st,
+                                    &key,
+                                    &HookOutcome::Failure("hook task panicked".to_string()),
+                                );
+                                st.limiter.on_finished(&key, Instant::now()).map(|f| (key, f))
+                            }
+                            None => {
+                                warn!(error = %join_err, "hooks runner: a hook task failed to join with no tracked key");
+                                None
+                            }
+                        }
+                    }
+                };
+                if let Some((key, fire)) = fire {
+                    spawn_hook(&mut joins, &mut in_flight, key, fire);
                 }
             }
             _ = tokio::time::sleep(sleep.unwrap_or_default()), if sleep.is_some() => {
-                for (key, fire) in limiter.poll(Instant::now()) {
-                    spawn_hook(&mut joins, key, fire);
+                let fired = {
+                    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.limiter.poll(Instant::now())
+                };
+                for (key, fire) in fired {
+                    spawn_hook(&mut joins, &mut in_flight, key, fire);
                 }
             }
         }
@@ -309,9 +472,12 @@ async fn run(mut events: EventReceiver, config: HooksConfig, state: Arc<Mutex<Sh
 }
 
 /// Dispatches a cleared hook onto a blocking task, tagged with its key so the
-/// runner can advance the limiter when it completes.
+/// runner can advance the limiter when it completes. The task's join id is
+/// recorded in `in_flight` so a panic (whose `JoinError` carries no payload) is
+/// still attributable to its key.
 fn spawn_hook(
     joins: &mut JoinSet<(HookKey, HookOutcome)>,
+    in_flight: &mut HashMap<Id, HookKey>,
     key: HookKey,
     fire: Fire<HookInvocation>,
 ) {
@@ -319,25 +485,17 @@ fn spawn_hook(
     let suppressed = fire.suppressed;
     let event = key.event.clone();
     let scope = key.scope.label().to_string();
-    joins.spawn_blocking(move || {
+    let task_key = key.clone();
+    let handle = joins.spawn_blocking(move || {
         let outcome = exec_hook(&event, &scope, &invocation, suppressed);
-        (key, outcome)
+        (task_key, outcome)
     });
-}
-
-/// Bumps the coalesced-event total for a key's scope.
-fn record_suppressed(state: &Arc<Mutex<SharedState>>, key: &HookKey) {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    match &key.scope {
-        Scope::Watch(name) => *state.suppressed_by_watch.entry(name.clone()).or_insert(0) += 1,
-        Scope::Global => state.global_suppressed += 1,
-    }
+    in_flight.insert(handle.id(), key);
 }
 
 /// Folds one run's outcome into the key's consecutive-failure tally: a failure
 /// increments and records its reason, a success clears the key.
-fn record_outcome(state: &Arc<Mutex<SharedState>>, key: &HookKey, outcome: &HookOutcome) {
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+fn record_outcome(state: &mut RunnerState, key: &HookKey, outcome: &HookOutcome) {
     match outcome {
         HookOutcome::Success => {
             state.failures.remove(key);
@@ -639,6 +797,110 @@ mod tests {
         assert_eq!(rate, Duration::from_secs(300), "the global rate limit");
     }
 
+    #[test]
+    fn event_watch_partitions_the_whole_event_catalog_by_scope() {
+        // One instance of every event, split the way the config catalog splits
+        // them: every WATCH_HOOK_EVENTS event must carry a watch (so `route` can
+        // reach a `[watch.hooks]` map), and every DAEMON_HOOK_EVENTS event must
+        // not. A new allowlisted event whose `event_watch` arm was forgotten
+        // (defaulting to daemon-level) then fails here instead of misrouting live.
+        use vard_core::{Resolver, SkipReason, WatchState};
+
+        let watch_events = [
+            Event::SnapshotStarted {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+            },
+            Event::SnapshotCompleted {
+                watch: "w".to_string(),
+                snapshot: "r".to_string(),
+                files_changed: 0,
+                trigger: Trigger::Manual,
+            },
+            Event::SnapshotFailed {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+                error: "e".to_string(),
+            },
+            Event::SnapshotSkipped {
+                watch: "w".to_string(),
+                trigger: Trigger::Manual,
+                reason: SkipReason::Clean,
+            },
+            Event::SyncPushed {
+                watch: "w".to_string(),
+                new_ref: "r".to_string(),
+                commits: 0,
+            },
+            Event::SyncPulled {
+                watch: "w".to_string(),
+                prev_ref: "a".to_string(),
+                new_ref: "b".to_string(),
+            },
+            Event::SyncConflict {
+                watch: "w".to_string(),
+            },
+            Event::SyncResolved {
+                watch: "w".to_string(),
+                resolver: Resolver::Human,
+            },
+            Event::SyncFailed {
+                watch: "w".to_string(),
+                error: "e".to_string(),
+            },
+            Event::SyncSkipped {
+                watch: "w".to_string(),
+                reason: "r".to_string(),
+            },
+            Event::RestoreCompleted {
+                watch: "w".to_string(),
+                restored_to: "a".to_string(),
+                prev_ref: "b".to_string(),
+            },
+            Event::WatchStateChanged {
+                watch: "w".to_string(),
+                from: WatchState::Ok,
+                to: WatchState::Paused,
+                reason: None,
+                trouble: None,
+            },
+        ];
+        let daemon_events = [
+            Event::DaemonStarted,
+            Event::DaemonStopped,
+            Event::UpdateAvailable {
+                version: "1.0.0".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            watch_events.len(),
+            crate::config::WATCH_HOOK_EVENTS.len(),
+            "one watch-event instance per WATCH_HOOK_EVENTS entry"
+        );
+        assert_eq!(
+            daemon_events.len(),
+            crate::config::DAEMON_HOOK_EVENTS.len(),
+            "one daemon-event instance per DAEMON_HOOK_EVENTS entry"
+        );
+        for event in &watch_events {
+            assert_eq!(
+                event_watch(event),
+                Some("w"),
+                "{} must route watch-scoped",
+                event.name()
+            );
+        }
+        for event in &daemon_events {
+            assert_eq!(
+                event_watch(event),
+                None,
+                "{} must route daemon-scoped",
+                event.name()
+            );
+        }
+    }
+
     // --- runner wiring -------------------------------------------------------
 
     /// Waits until `path` exists (a hook side effect), or panics. Real time, tiny
@@ -677,7 +939,7 @@ mod tests {
         .unwrap();
 
         let bus = EventBus::default();
-        let runner = spawn(bus.subscribe(), config);
+        let runner = spawn(bus.subscribe(), config, None);
         bus.emit(Event::SnapshotCompleted {
             watch: "notes".to_string(),
             snapshot: "r".to_string(),
@@ -713,7 +975,7 @@ mod tests {
         .unwrap();
 
         let bus = EventBus::default();
-        let runner = spawn(bus.subscribe(), config);
+        let runner = spawn(bus.subscribe(), config, None);
         let emit = || {
             bus.emit(Event::SnapshotCompleted {
                 watch: "notes".to_string(),
@@ -775,7 +1037,7 @@ mod tests {
         .unwrap();
 
         let bus = EventBus::new(2);
-        let runner = spawn(bus.subscribe(), config);
+        let runner = spawn(bus.subscribe(), config, None);
         // Flood well past capacity so the subscriber lags, then let it catch up.
         for i in 0..50 {
             bus.emit(Event::SnapshotCompleted {
