@@ -736,23 +736,54 @@ impl journal::SyncSettler for GitSyncSettler {
 /// under `journal_dir`), so the engine's worker brackets every commit under the
 /// op lock — this is where the daemon injects the structural one-writer-per-watch
 /// invariant (VRD-37); the journal is no longer an event-bus subscriber.
+///
+/// Per-watch open isolation (VRD-41): every surviving spec's repository is
+/// opened HERE, one at a time, before any watch reaches [`Engine::builder`] — a
+/// spec whose repository cannot be opened (missing, corrupt, mid-rebase) is
+/// `error!`-logged and dropped from this engine generation, never taking the
+/// rest down with it. Only the openable specs feed `watches`, so a skipped
+/// watch is not part of the supervised identity set either (request fan-out
+/// then honestly warns "unknown watch" for it, same as any other unknown name).
+/// The already-open backends are injected via `watch_with_backend_and_gate`, so
+/// `build` cannot re-open (and re-fail) what this function already vetted — the
+/// same pattern `cmd/sync.rs` uses for the CLI sync path. A reload re-resolves
+/// every spec from scratch, so a repository fixed on disk is picked back up on
+/// the next poll. If every spec fails to open, the engine simply supervises
+/// zero watches; [`Engine::start`] is fine with that (no workers armed,
+/// `DaemonStarted` still emitted) — the same idle shape the daemon already runs
+/// for an all-paused config.
 async fn build_started_engine_from_specs(
     journal_dir: &Path,
     specs: Vec<WatchSpec>,
 ) -> Result<(EngineHandle, EventReceiver, WatchSet), EngineError> {
     let specs = dedup_aliased_specs(specs);
+    let mut opened = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match vard_core::open_git_backend(&spec) {
+            Ok(backend) => opened.push((spec, backend)),
+            Err(e) => {
+                error!(
+                    skipped = spec.name(),
+                    repo = %spec.path().display(),
+                    error = %e,
+                    "watch's repository cannot be opened; skipping it for this engine \
+                     (fix the repository and it is picked up on the next reload)"
+                );
+            }
+        }
+    }
     let watches = WatchSet::new(
-        specs
+        opened
             .iter()
-            .map(|spec| WatchIdentity::new(spec.name().to_string(), spec.path().to_path_buf()))
+            .map(|(spec, _)| WatchIdentity::new(spec.name().to_string(), spec.path().to_path_buf()))
             .collect(),
     );
     let mut builder = Engine::builder();
-    // Specs and `watches` are in the same (deduped) order, so zip pairs each spec
-    // with its identity to build the injected gate.
-    for (spec, identity) in specs.into_iter().zip(watches.iter()) {
+    // `opened` and `watches` are in the same (surviving) order, so zip pairs each
+    // spec with its identity to build the injected gate.
+    for ((spec, backend), identity) in opened.into_iter().zip(watches.iter()) {
         let gate: vard_core::SharedGate = Arc::new(identity.op_gate(journal_dir));
-        builder = builder.watch_with_gate(spec, gate);
+        builder = builder.watch_with_backend_and_gate(spec, Arc::new(backend), gate);
     }
     let engine = builder.build()?;
     let events = engine.subscribe();
@@ -2625,6 +2656,69 @@ mod tests {
         let kept = dedup_aliased_specs(vec![second, first]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].name(), "second");
+    }
+
+    // --- per-watch open isolation (VRD-41) ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unopenable_repo_is_skipped_while_its_healthy_sibling_still_starts() {
+        // One spec points at a plain directory (never `git init`-ed, so
+        // `open_git_backend` fails with `NotARepo`); the other is a real repo.
+        // Before VRD-41, `Engine::build` opened every watch itself and one bad
+        // repository failed the whole build — snapshot protection for the
+        // healthy watch too. Now the bad watch is vetted and dropped HERE, so
+        // the engine still builds and starts, supervising only the survivor.
+        let root = tempfile::tempdir().unwrap();
+        let broken = root.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        let healthy = root.path().join("healthy");
+        init_repo(&healthy);
+
+        let journal_dir = root.path().join("journal");
+        let specs = vec![
+            WatchSpec::builder("broken", &broken).build().unwrap(),
+            WatchSpec::builder("healthy", &healthy).build().unwrap(),
+        ];
+
+        let (handle, _events, watches) = build_started_engine_from_specs(&journal_dir, specs)
+            .await
+            .expect("one unopenable repo must not fail the whole engine build");
+
+        assert_eq!(
+            watches.len(),
+            1,
+            "only the healthy watch survives into the supervised identity set"
+        );
+        assert_eq!(watches[0].name, "healthy");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_repo_unopenable_still_builds_and_starts_a_zero_watch_engine() {
+        // The whole-engine-failure regression this ticket closes: a single spec
+        // whose repository cannot be opened must no longer bubble up as
+        // `Err(EngineError::Backend { .. })` from `Engine::build`. It is skipped
+        // and logged, and the engine proceeds supervising nothing — the same
+        // idle shape an all-paused config already produces (`Engine::start`
+        // arms no workers and still emits `DaemonStarted` for zero watches).
+        let root = tempfile::tempdir().unwrap();
+        let broken = root.path().join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+
+        let journal_dir = root.path().join("journal");
+        let specs = vec![WatchSpec::builder("broken", &broken).build().unwrap()];
+
+        let (handle, _events, watches) = build_started_engine_from_specs(&journal_dir, specs)
+            .await
+            .expect("an engine with zero survivors must still build and start, not fail whole");
+
+        assert!(
+            watches.is_empty(),
+            "the sole watch failed to open and is not supervised"
+        );
+
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
