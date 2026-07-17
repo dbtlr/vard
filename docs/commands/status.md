@@ -28,7 +28,7 @@ vard status --format json
 
 ## Output
 
-A list surface (records/json/jsonl). The first line reports the daemon; each watch then reports one state.
+A list surface (records/json/jsonl). The first line reports the daemon; each watch then reports its state. A watch holding more than one problem contributes one row per problem, and a failing global `[hooks]` hook — which belongs to no watch — adds its own daemon-scoped `[hooks]` row (see below).
 
 ```text
 ⚠ daemon: not running — start it with `vard run`
@@ -37,7 +37,7 @@ A list surface (records/json/jsonl). The first line reports the daemon; each wat
 
 The **daemon** line is one of: running, not running, starting, stopping, or — when a running daemon's health file has gone stale — stale.
 
-Each **watch** shows one state:
+Each **watch** row shows one state (a watch with several problems contributes one such row per problem):
 
 | State | Meaning |
 |---|---|

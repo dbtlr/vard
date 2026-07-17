@@ -123,7 +123,7 @@ A hook can dirty the tree, which snapshots, which fires the hook again. To keep 
 - While it is running or inside its `hook_rate_limit` cooldown, further same-key events do not spawn new runs — they replace a single pending slot (latest wins) and bump a counter.
 - When the window opens, the pending event runs **once**, with `VARD_SUPPRESSED` set to how many arrivals it stands in for.
 
-So a hook is only ever **delayed**, never skipped: the last event always runs. A single event that arrives during the cooldown is delivered when the window opens with `VARD_SUPPRESSED=1`; an immediate run always sees `VARD_SUPPRESSED=0`. An idempotent apply script (stow, rsync) produces no change on its second pass, so the loop dies in one iteration; a genuinely non-idempotent hook cycles at most once per cooldown window, bounded and visible.
+Events accepted by the loop guard are **delayed**, never skipped: the latest coalesced event always runs. (If the event-bus subscriber falls more than the bus capacity behind before the limiter sees an event — rare, and logged — older events can be dropped at the bus itself, upstream of the loop guard.) A single event that arrives during the cooldown is delivered when the window opens with `VARD_SUPPRESSED=1`; an immediate run always sees `VARD_SUPPRESSED=0`. An idempotent apply script (stow, rsync) produces no change on its second pass, so the loop dies in one iteration; a genuinely non-idempotent hook cycles at most once per cooldown window, bounded and visible.
 
 The loop-guard state — each key's cooldown window, its pending trailing slot, and its consecutive-failure streak — **survives a config reload or engine rebuild**: a coalesced event still waiting to run fires when its window opens even if a reload lands in between, and a failing hook keeps its failure count rather than resetting each reload. The one boundary is process shutdown: stopping the daemon drops any not-yet-fired pending event (a hook is delayed across reloads, never across a restart). A hook whose command is changed in the config is a new key, so a pending run queued for the old command is dropped rather than run under the new one.
 
@@ -131,7 +131,7 @@ The per-watch count of coalesced events is shown by [`status`](status.md) as tel
 
 ### Failing hooks
 
-If a hook fails — a **non-zero exit or a timeout** — on **3 consecutive** runs of the same key, the daemon reports it as a `hook-failing` problem: the hook's watch shows `attention` in [`status`](status.md) and [`notify`](notify.md), with the event, command, failure count, and last error. It **clears itself** the moment that hook next succeeds — there is nothing to acknowledge. A global `[hooks]` hook that fails this way is reported as a daemon-scoped hook rather than against any watch.
+If a hook fails — a **non-zero exit or a timeout** — on **3 consecutive** runs of the same key, the daemon reports it as a `hook-failing` problem: the hook's watch shows `attention` in [`status`](status.md) and [`notify`](notify.md), with the event, command, failure count, and last error. It **clears** on the hook's next success — but that clear reaches `status`/`notify` only at the daemon's next health refresh (a heartbeat or any state-change write), not the instant the hook succeeds; there is nothing to acknowledge. A global `[hooks]` hook that fails this way is reported as a daemon-scoped hook rather than against any watch.
 
 ## Output
 
