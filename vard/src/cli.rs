@@ -423,16 +423,27 @@ The checks in this release, all local (no network):
                 contents are never scanned). A watch with `secret_scan = false`
                 is `skipped`; a repository that cannot be opened `warn`s without
                 blocking the other watches' rows
+  remote-auth   per sync-enabled watch, whether the configured remote is
+                reachable and authenticated — a read-only `git ls-remote`, with
+                `GIT_TERMINAL_PROMPT=0` and a timeout so a dead VPN or a
+                prompt-wanting remote cannot hang doctor. Reachable is `ok`;
+                unreachable or an auth failure is `fail` with git's reason. A
+                watch that does not sync, or has no remote defined, is `skipped`;
+                a repository that cannot be opened `warn`s. This is the one
+                network check — `--offline` skips it, rendering `skipped`
+
+`--offline` skips every network check (today: remote-auth), so doctor runs the \
+local checks only.
 
 Exit codes: 0 when every check is `ok` or `skipped`; 1 when any check `warn`s \
 or `fail`s (attention); 2 when doctor itself could not run (an unresolvable \
 state directory, an invalid config). Output follows the global `--format`: \
-human glyph lines by default, or a stable JSON/JSONL array when piped.
+human glyph lines by default, or a stable JSON/JSONL array when piped (a \
+per-watch row carries its own `watch` field).
 
-A remote-authentication probe (with an `--offline` flag to skip it) is planned \
-for a later release; agent/keychain and service-linger checks are deferred to \
-the service-install command (VRD-24).")]
-    Doctor,
+Agent/keychain and service-linger checks are deferred to the service-install \
+command (VRD-24).")]
+    Doctor(DoctorArgs),
 
     /// Read and edit vard's configuration: get, set, unset, edit, path.
     #[command(disable_help_flag = true)]
@@ -560,6 +571,16 @@ pub struct LogsArgs {
     /// Show the last N lines, spanning rotated logfiles as needed.
     #[arg(short = 'n', long = "lines", value_name = "N", default_value = "50")]
     pub lines: usize,
+}
+
+/// Arguments to `vard doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Skip network checks (today: the remote-auth probe), running the local
+    /// checks only. The skipped checks are reported `skipped` with an
+    /// "offline mode" note.
+    #[arg(long = "offline")]
+    pub offline: bool,
 }
 
 /// The `vard config` subcommands.

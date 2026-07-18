@@ -71,7 +71,7 @@ vard commands share a three-value exit convention:
 |---|---|
 | [`status`](commands/status.md) | Show the daemon's liveness and every watch's current state, read-only. |
 | [`notify`](commands/notify.md) | Print one line per watch that needs attention, for a shell prompt or status bar. |
-| [`doctor`](commands/doctor.md) | Diagnose the local vard environment read-only: git, inotify limits, health-file freshness, request-queue hygiene, and a per-watch secret audit. |
+| [`doctor`](commands/doctor.md) | Diagnose the vard environment read-only: git, inotify limits, health-file freshness, request-queue hygiene, a per-watch secret audit, and a per-watch remote-auth probe (`--offline` skips the network check). |
 
 ## Configuration
 

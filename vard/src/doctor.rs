@@ -21,12 +21,13 @@
 //! an invalid config) is the operational error 2, surfaced through the shared
 //! [`CmdError`] layer. The per-row codes fold with [`CmdError::worse`].
 //!
-//! # Scope (this checkpoint)
+//! # Scope
 //!
-//! Local checks only: git presence/version, inotify limits vs watched-tree size
+//! Local checks: git presence/version, inotify limits vs watched-tree size
 //! (Linux), health-file freshness, request-dir hygiene, and a per-watch secret
-//! audit. The remote-auth probe and an `--offline` flag are a later checkpoint;
-//! agent/keychain and linger checks are deferred to service-install (VRD-24).
+//! audit. One network check: a per-watch **remote-auth** probe (a read-only
+//! `git ls-remote`), which `--offline` renders `skipped`. Agent/keychain and
+//! linger checks are deferred to service-install (VRD-24).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anstyle::Style;
-use vard_core::{SecretMatch, SecretScanner, VcsBackend};
+use vard_core::{SecretMatch, SecretScanner, VcsBackend, VcsError};
 
 use crate::cli::{ColorWhen, OutputFormat};
 use crate::command::{self, CmdError, CmdResult, OutCtx};
@@ -54,7 +55,13 @@ const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] = &[
     check_health,
     check_request_dir,
     check_secret_audit,
+    check_remote_auth,
 ];
+
+/// Wall-clock bound on each per-watch remote-auth probe, so a dead VPN or a
+/// prompt-wanting remote cannot hang doctor. Each watch is probed independently
+/// under this same bound (see [`check_remote_auth`]).
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A single check's status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,19 +109,35 @@ impl Status {
 
 /// One rendered check result.
 struct CheckRow {
-    /// The check's stable name (e.g. `git`, `inotify`). A per-watch check names
-    /// the watch alongside, in `detail`.
+    /// The check's stable name (e.g. `git`, `inotify`).
     name: String,
+    /// The watch this row is about, for a per-watch check (secret-audit,
+    /// remote-auth); `None` for a global row. Carried as its own field so a
+    /// machine consumer reads it directly rather than parsing it out of
+    /// [`detail`](Self::detail) prose.
+    watch: Option<String>,
     /// The check's status.
     status: Status,
-    /// A human-readable one-line explanation with any action guidance.
+    /// A human-readable one-line explanation with any action guidance. A
+    /// per-watch row still names its watch here for the human form.
     detail: String,
 }
 
-/// Builds a [`CheckRow`].
+/// Builds a global [`CheckRow`] (no associated watch).
 fn row(name: &str, status: Status, detail: impl Into<String>) -> CheckRow {
     CheckRow {
         name: name.to_string(),
+        watch: None,
+        status,
+        detail: detail.into(),
+    }
+}
+
+/// Builds a per-watch [`CheckRow`], tagging it with the `watch` it is about.
+fn watch_row(name: &str, watch: &str, status: Status, detail: impl Into<String>) -> CheckRow {
+    CheckRow {
+        name: name.to_string(),
+        watch: Some(watch.to_string()),
         status,
         detail: detail.into(),
     }
@@ -134,13 +157,16 @@ struct Ctx {
     request_dir: PathBuf,
     /// Unix seconds sampled once, so every age the checks report is consistent.
     now: u64,
+    /// Whether network checks are skipped (`--offline`). When set, the
+    /// remote-auth probe emits `skipped` rows instead of contacting any remote.
+    offline: bool,
 }
 
 impl Ctx {
     /// Resolves the XDG paths and the watch list. A missing config is an empty
     /// watch list; a present-but-invalid config is the operational error 2
     /// (doctor cannot enumerate what it would diagnose).
-    fn gather() -> Result<Ctx, CmdError> {
+    fn gather(offline: bool) -> Result<Ctx, CmdError> {
         let lock_file = paths::lock_file().map_err(|e| CmdError::err(e.to_string()))?;
         let health_file = paths::health_file().map_err(|e| CmdError::err(e.to_string()))?;
         let request_dir = paths::request_dir().map_err(|e| CmdError::err(e.to_string()))?;
@@ -159,22 +185,27 @@ impl Ctx {
             health_file,
             request_dir,
             now: health::now_secs(),
+            offline,
         })
     }
 }
 
 /// Entry point for `vard doctor`. Returns the folded attention exit code (0 all
 /// clear, 1 something needs attention), or 2 when doctor could not run at all.
-pub(crate) fn run(color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
-    match run_inner(color, format) {
+pub(crate) fn run(color: ColorWhen, format: Option<OutputFormat>, offline: bool) -> ExitCode {
+    match run_inner(color, format, offline) {
         Ok(code) => ExitCode::from(code),
         Err(err) => command::finish(Err(err)),
     }
 }
 
-fn run_inner(color: ColorWhen, format: Option<OutputFormat>) -> Result<u8, CmdError> {
+fn run_inner(
+    color: ColorWhen,
+    format: Option<OutputFormat>,
+    offline: bool,
+) -> Result<u8, CmdError> {
     let out = OutCtx::resolve(color, format);
-    let ctx = Ctx::gather()?;
+    let ctx = Ctx::gather(offline)?;
     let rows: Vec<CheckRow> = CHECKS.iter().flat_map(|check| check(&ctx)).collect();
     let code = rows
         .iter()
@@ -497,62 +528,87 @@ fn evaluate_health(report: &HealthReport, now: u64) -> CheckRow {
 // --- check 4: request-dir hygiene -----------------------------------------
 
 fn check_request_dir(ctx: &Ctx) -> Vec<CheckRow> {
-    let leftovers = scan_stale_leftovers(&ctx.request_dir, ctx.now);
-    vec![evaluate_request_dir(&leftovers)]
+    let scan = scan_request_dir(&ctx.request_dir, ctx.now);
+    vec![evaluate_request_dir(&scan)]
 }
 
-/// Scans the request dir for crashed-writer leftovers: entries whose name is
-/// **not** a settled request ([`request::is_settled_request_name`]) — a temp or
-/// dotfile from an interrupted atomic write — and whose mtime is older than
-/// [`request::STALE_AFTER`]. A settled `*.toml` is a real queued request the
-/// daemon owns; a *fresh* unsettled file is a writer mid-flight. Neither is
-/// flagged. A missing dir yields nothing. Returns the names, sorted.
-fn scan_stale_leftovers(dir: &Path, now: u64) -> Vec<String> {
+/// The two kinds of stale entry the request-dir check flags, both older than
+/// [`request::STALE_AFTER`] and both flag-only (doctor never deletes).
+#[derive(Default)]
+struct RequestDirScan {
+    /// Unsettled temp/dot names from an interrupted atomic write — a crashed
+    /// writer's leftovers. Sorted.
+    crashed: Vec<String>,
+    /// Settled `*.toml` requests still sitting in the queue past the staleness
+    /// window — requests piling up unconsumed (typically no daemon is running;
+    /// the daemon would discard them as stale anyway). Sorted.
+    stale_settled: Vec<String>,
+}
+
+/// Scans the request dir, sorting stale entries into the two
+/// [`RequestDirScan`] buckets. A settled `*.toml`
+/// ([`request::is_settled_request_name`]) older than [`request::STALE_AFTER`]
+/// is a piling-up unconsumed request; an *unsettled* name that old is a crashed
+/// writer's leftover. A *fresh* entry of either kind is a writer or daemon
+/// mid-flight and is not flagged. A missing dir yields an empty scan.
+fn scan_request_dir(dir: &Path, now: u64) -> RequestDirScan {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return RequestDirScan::default(),
     };
-    let mut leftovers = Vec::new();
+    let mut scan = RequestDirScan::default();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if request::is_settled_request_name(&name) {
-            continue;
-        }
         let age = entry
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| now.saturating_sub(d.as_secs()));
-        if age.is_some_and(|age| age > request::STALE_AFTER.as_secs()) {
-            leftovers.push(name);
+        if age.is_none_or(|age| age <= request::STALE_AFTER.as_secs()) {
+            continue;
+        }
+        if request::is_settled_request_name(&name) {
+            scan.stale_settled.push(name);
+        } else {
+            scan.crashed.push(name);
         }
     }
-    leftovers.sort();
-    leftovers
+    scan.crashed.sort();
+    scan.stale_settled.sort();
+    scan
 }
 
-/// Decides the request-dir check from the stale-leftover names, so it tests with
-/// injected values.
-fn evaluate_request_dir(leftovers: &[String]) -> CheckRow {
-    if leftovers.is_empty() {
-        row(
+/// Decides the request-dir check from a [`RequestDirScan`], so it tests with
+/// injected values. Either bucket alone or both together `warn` (still
+/// flag-only); a clean scan is `ok`. The two conditions carry distinct wording:
+/// crashed-writer leftovers are safe to delete, while piled-up settled requests
+/// point at a daemon that is not consuming them.
+fn evaluate_request_dir(scan: &RequestDirScan) -> CheckRow {
+    if scan.crashed.is_empty() && scan.stale_settled.is_empty() {
+        return row(
             "request-dir",
             Status::Ok,
             "no stale leftovers in the request queue",
-        )
-    } else {
-        row(
-            "request-dir",
-            Status::Warn,
-            format!(
-                "{} stale file(s) in the request queue, left by a crashed writer; safe to \
-                 delete: {}",
-                leftovers.len(),
-                leftovers.join(", ")
-            ),
-        )
+        );
     }
+    let mut parts = Vec::new();
+    if !scan.crashed.is_empty() {
+        parts.push(format!(
+            "{} stale file(s) left by a crashed writer, safe to delete: {}",
+            scan.crashed.len(),
+            scan.crashed.join(", ")
+        ));
+    }
+    if !scan.stale_settled.is_empty() {
+        parts.push(format!(
+            "{} settled request(s) piling up unconsumed past the staleness window — no daemon is \
+             consuming them (a running daemon would discard them as stale): {}",
+            scan.stale_settled.len(),
+            scan.stale_settled.join(", ")
+        ));
+    }
+    row("request-dir", Status::Warn, parts.join("; "))
 }
 
 // --- check 5: per-watch secret audit --------------------------------------
@@ -589,8 +645,9 @@ fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
     // A watch with scanning off is not audited — a deliberate opt-out, not a
     // problem. Reported `skipped`, mirroring the daemon's per-watch policy.
     if !spec.secret_scan() {
-        return row(
+        return watch_row(
             "secret-audit",
+            name,
             Status::Skipped,
             format!("watch {name:?}: secret scanning is disabled (secret_scan = false)"),
         );
@@ -601,7 +658,12 @@ fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
     let scanner = match SecretScanner::compile(spec.secret_scan(), spec.secret_patterns()) {
         Ok(scanner) => scanner,
         Err(e) => {
-            return row("secret-audit", Status::Warn, format!("watch {name:?}: {e}"));
+            return watch_row(
+                "secret-audit",
+                name,
+                Status::Warn,
+                format!("watch {name:?}: {e}"),
+            );
         }
     };
 
@@ -611,8 +673,9 @@ fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
     let backend = match vard_core::open_git_backend(spec) {
         Ok(backend) => backend,
         Err(e) => {
-            return row(
+            return watch_row(
                 "secret-audit",
+                name,
                 Status::Warn,
                 format!(
                     "watch {name:?}: repository could not be opened ({e}); skipped — fix it and \
@@ -625,8 +688,9 @@ fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
     let tracked = match backend.tracked_files() {
         Ok(tracked) => tracked,
         Err(e) => {
-            return row(
+            return watch_row(
                 "secret-audit",
+                name,
                 Status::Warn,
                 format!("watch {name:?}: could not list tracked files ({e})"),
             );
@@ -641,8 +705,9 @@ fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
 /// with the count and up to [`SECRET_EXAMPLE_CAP`] example repo-relative paths.
 fn evaluate_secret_audit(watch: &str, findings: &[SecretMatch]) -> CheckRow {
     if findings.is_empty() {
-        return row(
+        return watch_row(
             "secret-audit",
+            watch,
             Status::Ok,
             format!("watch {watch:?}: no tracked file has a secret-shaped name"),
         );
@@ -658,8 +723,9 @@ fn evaluate_secret_audit(watch: &str, findings: &[SecretMatch]) -> CheckRow {
     } else {
         String::new()
     };
-    row(
+    watch_row(
         "secret-audit",
+        watch,
         Status::Fail,
         format!(
             "watch {watch:?}: {} tracked file(s) have a secret-shaped name, already committed — \
@@ -668,6 +734,161 @@ fn evaluate_secret_audit(watch: &str, findings: &[SecretMatch]) -> CheckRow {
             examples.join(", ")
         ),
     )
+}
+
+// --- check 6: per-watch remote-auth probe ---------------------------------
+
+/// Probes every configured watch's remote for reachability and authentication
+/// (a read-only `git ls-remote`), one row per watch. Watches are probed
+/// independently — one dead remote never blocks another watch's row. A watch
+/// that does not sync, or syncs with no remote defined in its repository, is
+/// `skipped` with the reason; with `--offline` every sync-enabled watch is
+/// `skipped` "offline mode" without touching the network. A reachable,
+/// authenticated remote is `ok`; an unreachable one, an auth failure, or a probe
+/// timeout is `fail`; a repository that cannot be opened is `warn` (consistent
+/// with the secret audit). With no watches configured there is nothing to probe.
+fn check_remote_auth(ctx: &Ctx) -> Vec<CheckRow> {
+    if ctx.watches.is_empty() {
+        return vec![row(
+            "remote-auth",
+            Status::Skipped,
+            "no watches configured to probe",
+        )];
+    }
+    ctx.watches
+        .iter()
+        .map(|rw| probe_watch_remote(rw, ctx.offline))
+        .collect()
+}
+
+/// Probes one watch's remote. Resolves the disposition (skip/warn) that needs no
+/// network first, then runs the bounded [`VcsBackend::probe_remote`] and hands
+/// its result to [`evaluate_remote_auth`].
+fn probe_watch_remote(rw: &ResolvedWatch, offline: bool) -> CheckRow {
+    let spec = &rw.spec;
+    let name = spec.name();
+
+    // A non-syncing watch has no remote to probe — a deliberate config, not a
+    // problem.
+    if !spec.sync() {
+        return watch_row(
+            "remote-auth",
+            name,
+            Status::Skipped,
+            format!("watch {name:?}: sync is disabled (sync = false) — no remote to probe"),
+        );
+    }
+
+    // Offline: skip the network for every sync-enabled watch and say so, without
+    // opening the repository or contacting any remote.
+    if offline {
+        return watch_row(
+            "remote-auth",
+            name,
+            Status::Skipped,
+            format!("watch {name:?}: offline mode — network check skipped"),
+        );
+    }
+
+    // Open the vetted way, matching the secret audit. An unopenable repository is
+    // this watch's own warn — never a crash, never a block on the rest.
+    let backend = match vard_core::open_git_backend(spec) {
+        Ok(backend) => backend,
+        Err(e) => {
+            return watch_row(
+                "remote-auth",
+                name,
+                Status::Warn,
+                format!(
+                    "watch {name:?}: repository could not be opened ({e}); skipped — fix it and \
+                     re-run"
+                ),
+            );
+        }
+    };
+
+    // A sync-enabled watch whose repository does not define the configured remote
+    // is skipped with the reason — the same honest no-op the sync engine treats
+    // it as (a cheap, non-network config lookup, so it runs even though the probe
+    // below is the network step).
+    match backend.has_remote() {
+        Ok(true) => {}
+        Ok(false) => {
+            return watch_row(
+                "remote-auth",
+                name,
+                Status::Skipped,
+                format!(
+                    "watch {name:?}: sync is on but remote {:?} is not defined in the repository",
+                    spec.remote()
+                ),
+            );
+        }
+        Err(e) => {
+            return watch_row(
+                "remote-auth",
+                name,
+                Status::Warn,
+                format!("watch {name:?}: could not read the remote config ({e})"),
+            );
+        }
+    }
+
+    evaluate_remote_auth(
+        name,
+        spec.remote(),
+        backend.probe_remote(REMOTE_PROBE_TIMEOUT),
+    )
+}
+
+/// Decides one watch's remote-auth row from the probe result, so the mapping is
+/// unit-testable without a network. `Ok` is a reachable, authenticated remote; a
+/// timeout or any command failure is a `fail`, the latter summarizing git's
+/// stderr to its first meaningful line rather than dumping the whole thing.
+fn evaluate_remote_auth(watch: &str, remote: &str, probe: Result<(), VcsError>) -> CheckRow {
+    match probe {
+        Ok(()) => watch_row(
+            "remote-auth",
+            watch,
+            Status::Ok,
+            format!("watch {watch:?}: remote {remote:?} is reachable and authenticated"),
+        ),
+        Err(VcsError::Timeout { elapsed, .. }) => watch_row(
+            "remote-auth",
+            watch,
+            Status::Fail,
+            format!(
+                "watch {watch:?}: remote {remote:?} did not answer within {elapsed:.1?} — check \
+                 the network or VPN"
+            ),
+        ),
+        Err(VcsError::CommandFailed { stderr, .. }) => watch_row(
+            "remote-auth",
+            watch,
+            Status::Fail,
+            format!(
+                "watch {watch:?}: remote {remote:?} is unreachable or refused authentication: {}",
+                first_line(&stderr)
+            ),
+        ),
+        Err(e) => watch_row(
+            "remote-auth",
+            watch,
+            Status::Fail,
+            format!("watch {watch:?}: remote {remote:?} probe failed: {e}"),
+        ),
+    }
+}
+
+/// The first non-empty, trimmed line of `text`, so a multi-line git stderr is
+/// summarized to its most meaningful line rather than dumped whole. An all-blank
+/// string yields `"(no details)"`.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no details)")
+        .to_string()
 }
 
 // --- rendering ------------------------------------------------------------
@@ -707,15 +928,24 @@ fn render_human(w: &mut dyn Write, rows: &[CheckRow], palette: &Palette) -> io::
 }
 
 /// The machine records: one per check, a stable `{check, status, detail}` shape.
+/// A per-watch row additionally carries a `watch` field (between `status` and
+/// `detail`); a global row omits it entirely, so a machine consumer reads the
+/// watch name directly instead of parsing it out of `detail`.
 fn records(rows: &[CheckRow]) -> Vec<Record> {
     rows.iter()
-        .map(|r| Record {
-            header: None,
-            fields: vec![
+        .map(|r| {
+            let mut fields = vec![
                 RecordField::str("check", &r.name),
                 RecordField::str("status", r.status.token()),
-                RecordField::str("detail", &r.detail),
-            ],
+            ];
+            if let Some(watch) = &r.watch {
+                fields.push(RecordField::str("watch", watch));
+            }
+            fields.push(RecordField::str("detail", &r.detail));
+            Record {
+                header: None,
+                fields,
+            }
         })
         .collect()
 }
@@ -879,14 +1109,24 @@ mod tests {
 
     // --- request-dir --------------------------------------------------------
 
-    #[test]
-    fn request_dir_clean_is_ok() {
-        assert_eq!(evaluate_request_dir(&[]).status, Status::Ok);
+    fn scan(crashed: &[&str], stale_settled: &[&str]) -> RequestDirScan {
+        RequestDirScan {
+            crashed: crashed.iter().map(|s| s.to_string()).collect(),
+            stale_settled: stale_settled.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
-    fn request_dir_with_leftovers_warns_and_names_them() {
-        let r = evaluate_request_dir(&[".req-123.toml.tmp".to_string()]);
+    fn request_dir_clean_is_ok() {
+        assert_eq!(
+            evaluate_request_dir(&RequestDirScan::default()).status,
+            Status::Ok
+        );
+    }
+
+    #[test]
+    fn request_dir_with_crashed_leftovers_warns_and_names_them() {
+        let r = evaluate_request_dir(&scan(&[".req-123.toml.tmp"], &[]));
         assert_eq!(r.status, Status::Warn);
         assert!(
             r.detail.contains(".req-123.toml.tmp"),
@@ -897,37 +1137,74 @@ mod tests {
     }
 
     #[test]
-    fn scan_flags_stale_unsettled_but_not_settled_or_fresh() {
+    fn request_dir_with_stale_settled_warns_about_piling_up() {
+        let r = evaluate_request_dir(&scan(&[], &["req-1.toml"]));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("req-1.toml"), "names it: {}", r.detail);
+        assert!(
+            r.detail.contains("piling up") && r.detail.contains("no daemon"),
+            "distinct piling-up wording: {}",
+            r.detail
+        );
+        // The stale-settled wording must NOT borrow the crashed-writer phrasing.
+        assert!(
+            !r.detail.contains("crashed writer"),
+            "distinct from the crashed case: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn request_dir_with_both_kinds_warns_and_reports_each() {
+        let r = evaluate_request_dir(&scan(&[".req-1.toml.tmp"], &["req-2.toml"]));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("crashed writer"), "crashed: {}", r.detail);
+        assert!(r.detail.contains("piling up"), "settled: {}", r.detail);
+    }
+
+    #[test]
+    fn scan_sorts_stale_entries_into_the_two_buckets_and_ignores_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_000_000u64;
         let stale = now - request::STALE_AFTER.as_secs() - 60;
         let fresh = now - 5;
 
-        // A settled request (never flagged, however old).
+        // A stale settled request: piling up unconsumed.
         std::fs::write(dir.path().join("req.toml"), "x").unwrap();
-        // A stale unsettled leftover (a crashed writer's temp name): flagged.
+        // A stale unsettled leftover (a crashed writer's temp name).
         let leftover = dir.path().join(".req-1.toml.tmp");
         std::fs::write(&leftover, "x").unwrap();
         // A fresh unsettled file (a writer mid-flight): not flagged.
         let inflight = dir.path().join(".req-2.toml.tmp");
         std::fs::write(&inflight, "x").unwrap();
+        // A fresh settled request (the daemon just has not drained it yet): not
+        // flagged.
+        let queued = dir.path().join("req-fresh.toml");
+        std::fs::write(&queued, "x").unwrap();
 
         set_mtime(&dir.path().join("req.toml"), stale);
         set_mtime(&leftover, stale);
         set_mtime(&inflight, fresh);
+        set_mtime(&queued, fresh);
 
-        let found = scan_stale_leftovers(dir.path(), now);
+        let found = scan_request_dir(dir.path(), now);
         assert_eq!(
-            found,
+            found.crashed,
             vec![".req-1.toml.tmp".to_string()],
-            "only the stale unsettled leftover is flagged"
+            "only the stale unsettled leftover is a crashed-writer entry"
+        );
+        assert_eq!(
+            found.stale_settled,
+            vec!["req.toml".to_string()],
+            "only the stale settled request piles up"
         );
     }
 
     #[test]
     fn scan_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(scan_stale_leftovers(&dir.path().join("nope"), 1_000).is_empty());
+        let found = scan_request_dir(&dir.path().join("nope"), 1_000);
+        assert!(found.crashed.is_empty() && found.stale_settled.is_empty());
     }
 
     /// Sets a file's mtime to `secs` past the epoch, via a `SystemTime` on the
@@ -981,6 +1258,99 @@ mod tests {
         // is precisely what quarantine cannot catch.
         let r = evaluate_secret_audit("w", &[secret_named("id_rsa")]);
         assert!(r.detail.contains("already committed"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn secret_audit_rows_carry_the_watch_field() {
+        assert_eq!(
+            evaluate_secret_audit("notes", &[]).watch.as_deref(),
+            Some("notes")
+        );
+        assert_eq!(
+            evaluate_secret_audit("vault", &[secret_named("id_rsa")])
+                .watch
+                .as_deref(),
+            Some("vault")
+        );
+    }
+
+    // --- remote-auth ---------------------------------------------------------
+
+    #[test]
+    fn remote_auth_reachable_is_ok() {
+        let r = evaluate_remote_auth("notes", "origin", Ok(()));
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.watch.as_deref(), Some("notes"));
+        assert!(
+            r.detail.contains("reachable") && r.detail.contains("origin"),
+            "got: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn remote_auth_command_failure_fails_with_first_stderr_line_only() {
+        let probe = Err(VcsError::CommandFailed {
+            op: "ls-remote".to_string(),
+            status: Some(128),
+            stderr: "fatal: repository 'x' does not exist\nfatal: Could not read from remote\n"
+                .to_string(),
+        });
+        let r = evaluate_remote_auth("vault", "origin", probe);
+        assert_eq!(r.status, Status::Fail);
+        assert!(
+            r.detail.contains("does not exist"),
+            "summarizes the first line: {}",
+            r.detail
+        );
+        // The second stderr line is elided — a summary, not a dump.
+        assert!(
+            !r.detail.contains("Could not read"),
+            "must not dump the whole stderr: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn remote_auth_timeout_fails_and_names_the_bound() {
+        let probe = Err(VcsError::Timeout {
+            op: "ls-remote".to_string(),
+            elapsed: Duration::from_secs(10),
+        });
+        let r = evaluate_remote_auth("vault", "origin", probe);
+        assert_eq!(r.status, Status::Fail);
+        assert!(
+            r.detail.contains("did not answer"),
+            "timeout wording: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn first_line_summarizes_and_handles_blank() {
+        assert_eq!(first_line("  fatal: nope\nmore\n"), "fatal: nope");
+        assert_eq!(first_line("\n\n  \n"), "(no details)");
+    }
+
+    // --- records (machine shape) --------------------------------------------
+
+    #[test]
+    fn records_carry_watch_only_on_per_watch_rows() {
+        let rows = vec![
+            row("git", Status::Ok, "fine"),
+            watch_row("remote-auth", "notes", Status::Ok, "reachable"),
+        ];
+        let recs = records(&rows);
+        // The global git row has no `watch` field at all.
+        assert!(
+            recs[0].fields.iter().all(|f| f.key != "watch"),
+            "global row must omit watch"
+        );
+        // The per-watch row carries it.
+        assert!(
+            recs[1].fields.iter().any(|f| f.key == "watch"),
+            "per-watch row must carry watch"
+        );
     }
 
     // --- status / exit-code folding -----------------------------------------

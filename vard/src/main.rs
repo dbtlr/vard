@@ -61,7 +61,7 @@ fn main() -> ExitCode {
         Some(Command::Notify) => notify::run(cli.color, cli.format),
         Some(Command::Status(args)) => status::run(args, cli.color, cli.format),
         Some(Command::Logs(args)) => cmd::logs::run(args, cli.color, cli.format),
-        Some(Command::Doctor) => doctor::run(cli.color, cli.format),
+        Some(Command::Doctor(args)) => doctor::run(cli.color, cli.format, args.offline),
         // A bare `vard config` (no subcommand) prints config's short help, like
         // a bare `vard watch`.
         Some(Command::Config { command: None }) => {
