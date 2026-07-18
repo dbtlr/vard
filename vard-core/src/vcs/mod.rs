@@ -175,8 +175,9 @@ pub trait VcsBackend {
     /// git child (and, on unix, its whole process group, so an ssh transport's
     /// children die with it) is killed and [`VcsError::Timeout`] is returned.
     /// The caller owns the policy — a hung network operation cannot block a
-    /// worker forever. This is the only network-facing method here besides
-    /// [`push`](Self::push); non-network operations stay unbounded.
+    /// worker forever. The network-facing methods here are this,
+    /// [`push`](Self::push), and [`probe_remote`](Self::probe_remote); every
+    /// other operation stays unbounded.
     fn fetch(&self, timeout: Duration) -> Result<RemoteState, VcsError>;
 
     /// Reconciles the configured branch with the already-fetched upstream by
@@ -318,6 +319,33 @@ pub trait VcsBackend {
     /// on expiry the git child and its process group are killed and
     /// [`VcsError::Timeout`] is returned.
     fn push(&self, timeout: Duration) -> Result<PushOutcome, VcsError>;
+
+    /// Probes that the configured remote is reachable and the caller is
+    /// authenticated to it, **read-only** — a `git ls-remote` against the
+    /// configured remote that lists its refs and discards them, writing to
+    /// neither repository.
+    ///
+    /// This is the network reach/auth check behind [`vard doctor`]'s remote-auth
+    /// row — the diagnostic counterpart to [`fetch`](Self::fetch), which also
+    /// *consumes* the refs. `Ok(())` means the remote answered and
+    /// authentication succeeded. An unreachable endpoint, a refused
+    /// authentication, or a configured remote that resolves to no URL all
+    /// surface as [`VcsError::CommandFailed`] carrying git's stderr for the
+    /// caller to summarize; a hung endpoint surfaces as [`VcsError::Timeout`].
+    ///
+    /// `timeout` bounds the wall-clock time exactly as [`fetch`](Self::fetch)
+    /// and [`push`](Self::push) do: on expiry the git child and its process
+    /// group are killed. Like every network op the backend sets
+    /// `GIT_TERMINAL_PROMPT=0`, so a remote demanding credentials fails fast
+    /// instead of blocking on a prompt. It never mutates either repository. The
+    /// default returns `Ok(())` for backends with no notion of a remote (test
+    /// doubles); the git backend performs the real probe.
+    ///
+    /// [`vard doctor`]: crate
+    fn probe_remote(&self, timeout: Duration) -> Result<(), VcsError> {
+        let _ = timeout;
+        Ok(())
+    }
 }
 
 /// What [`VcsBackend::snapshot`] should commit: why, with what optional user
