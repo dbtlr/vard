@@ -283,11 +283,12 @@ protective snapshot, since nothing is modified). A whole-tree dry-run excludes \
 files added after the chosen point, which a restore keeps rather than removes.
 
 If the daemon is running it keeps ownership of the repository; the restore \
-still proceeds (git's own index lock serializes it against the daemon), and the \
-daemon will snapshot the restored state afterward — that is by design. In that \
-daemon-running case the restore is NOT journaled (only the lock holder journals), \
-so if this command crashes mid-restore a leftover git lock may need clearing by \
-hand — a tracked doctor-tool follow-up. Restoring a path that does not exist at \
+still proceeds (the watch's operation lock serializes it against the daemon's \
+worker), and the daemon will snapshot the restored state afterward — that is by \
+design. The restore records a recoverable journal entry whether or not a daemon \
+is running, so a crash mid-restore leaves a record a later daemon start or \
+`watch remove` uses to prove any leftover git lock stale and clean it. \
+Restoring a path that does not exist at \
 the chosen reference reports a friendly error naming the path and the reference.")]
     Restore(RestoreArgs),
 
