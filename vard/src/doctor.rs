@@ -34,6 +34,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anstyle::Style;
+use vard_core::{SecretMatch, SecretScanner, VcsBackend};
 
 use crate::cli::{ColorWhen, OutputFormat};
 use crate::command::{self, CmdError, CmdResult, OutCtx};
@@ -47,8 +48,13 @@ use crate::paths;
 use crate::request;
 
 /// The check registry, run in order. Each returns one or more [`CheckRow`]s.
-const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] =
-    &[check_git, check_inotify, check_health, check_request_dir];
+const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] = &[
+    check_git,
+    check_inotify,
+    check_health,
+    check_request_dir,
+    check_secret_audit,
+];
 
 /// A single check's status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,9 +124,7 @@ fn row(name: &str, status: Status, detail: impl Into<String>) -> CheckRow {
 /// [`watches`](Ctx::watches); the rest read the resolved state-dir paths.
 struct Ctx {
     /// Every configured watch, paused ones included (config order). Read by the
-    /// Linux inotify check (and, in a later checkpoint, the per-watch secret
-    /// audit on every platform); unused on a non-Linux build until then.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// per-watch secret audit (every platform) and the Linux inotify check.
     watches: Vec<ResolvedWatch>,
     /// The single-instance lock file (for the daemon-liveness probe).
     lock_file: PathBuf,
@@ -551,6 +555,121 @@ fn evaluate_request_dir(leftovers: &[String]) -> CheckRow {
     }
 }
 
+// --- check 5: per-watch secret audit --------------------------------------
+
+/// How many example paths a `fail` detail lists before eliding the rest.
+const SECRET_EXAMPLE_CAP: usize = 5;
+
+/// Audits every configured watch's already-tracked filenames for secret shapes
+/// (VRD-22) — one row per watch. This is the complement to snapshot quarantine:
+/// quarantine keeps *newly-added* secrets out of history, but a secret committed
+/// before scanning was on (or force-added) is already tracked, and only this
+/// audit catches it. With no watches configured there is nothing to audit.
+fn check_secret_audit(ctx: &Ctx) -> Vec<CheckRow> {
+    if ctx.watches.is_empty() {
+        return vec![row(
+            "secret-audit",
+            Status::Ok,
+            "no watches configured to audit",
+        )];
+    }
+    ctx.watches.iter().map(audit_watch).collect()
+}
+
+/// Audits one watch. Opens the repository the vetted way the per-watch CLI
+/// commands do ([`vard_core::open_git_backend`]), lists its tracked files, and
+/// runs the **filename-only** audit built from this watch's own
+/// `secret_scan`/`secret_patterns`. A disabled scanner is `skipped`; an
+/// unopenable repository (or an unlistable tree, or a bad extra pattern) is a
+/// `warn` that names the watch and never blocks the other watches' rows.
+fn audit_watch(rw: &ResolvedWatch) -> CheckRow {
+    let spec = &rw.spec;
+    let name = spec.name();
+
+    // A watch with scanning off is not audited — a deliberate opt-out, not a
+    // problem. Reported `skipped`, mirroring the daemon's per-watch policy.
+    if !spec.secret_scan() {
+        return row(
+            "secret-audit",
+            Status::Skipped,
+            format!("watch {name:?}: secret scanning is disabled (secret_scan = false)"),
+        );
+    }
+
+    // Compile the same scanner the daemon/CLI build per watch. A bad extra
+    // pattern warns (it would also fail the daemon), not crashes.
+    let scanner = match SecretScanner::compile(spec.secret_scan(), spec.secret_patterns()) {
+        Ok(scanner) => scanner,
+        Err(e) => {
+            return row("secret-audit", Status::Warn, format!("watch {name:?}: {e}"));
+        }
+    };
+
+    // Open only the vetted way, matching every other per-watch command. An
+    // unopenable repository is this watch's own warn — never a crash, never a
+    // block on the rest.
+    let backend = match vard_core::open_git_backend(spec) {
+        Ok(backend) => backend,
+        Err(e) => {
+            return row(
+                "secret-audit",
+                Status::Warn,
+                format!(
+                    "watch {name:?}: repository could not be opened ({e}); skipped — fix it and \
+                     re-run"
+                ),
+            );
+        }
+    };
+
+    let tracked = match backend.tracked_files() {
+        Ok(tracked) => tracked,
+        Err(e) => {
+            return row(
+                "secret-audit",
+                Status::Warn,
+                format!("watch {name:?}: could not list tracked files ({e})"),
+            );
+        }
+    };
+
+    evaluate_secret_audit(name, &scanner.audit_tracked(&tracked))
+}
+
+/// Decides one watch's secret-audit row from the audit findings, so it tests
+/// with injected [`SecretMatch`]es. No findings is `ok`; any finding is `fail`
+/// with the count and up to [`SECRET_EXAMPLE_CAP`] example repo-relative paths.
+fn evaluate_secret_audit(watch: &str, findings: &[SecretMatch]) -> CheckRow {
+    if findings.is_empty() {
+        return row(
+            "secret-audit",
+            Status::Ok,
+            format!("watch {watch:?}: no tracked file has a secret-shaped name"),
+        );
+    }
+    let examples: Vec<String> = findings
+        .iter()
+        .take(SECRET_EXAMPLE_CAP)
+        .map(|m| m.path.display().to_string())
+        .collect();
+    let elided = findings.len().saturating_sub(examples.len());
+    let more = if elided > 0 {
+        format!(" (+{elided} more)")
+    } else {
+        String::new()
+    };
+    row(
+        "secret-audit",
+        Status::Fail,
+        format!(
+            "watch {watch:?}: {} tracked file(s) have a secret-shaped name, already committed — \
+             quarantine only stops NEW secrets, so review these: {}{more}",
+            findings.len(),
+            examples.join(", ")
+        ),
+    )
+}
+
 // --- rendering ------------------------------------------------------------
 
 /// Renders the checks in the resolved format: glyph lines on a terminal (the
@@ -818,6 +937,50 @@ mod tests {
         let times = std::fs::FileTimes::new().set_modified(t);
         let f = std::fs::File::options().write(true).open(path).unwrap();
         f.set_times(times).unwrap();
+    }
+
+    // --- secret audit -------------------------------------------------------
+
+    fn secret_named(path: &str) -> SecretMatch {
+        SecretMatch {
+            path: std::path::PathBuf::from(path),
+            reason: vard_core::SecretReason::FilenamePattern {
+                pattern: ".env".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn secret_audit_clean_watch_is_ok() {
+        let r = evaluate_secret_audit("notes", &[]);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("notes"), "names the watch: {}", r.detail);
+    }
+
+    #[test]
+    fn secret_audit_findings_fail_with_count_and_capped_examples() {
+        let findings: Vec<SecretMatch> = (0..8)
+            .map(|i| secret_named(&format!("dir/secret{i}.env")))
+            .collect();
+        let r = evaluate_secret_audit("vault", &findings);
+        assert_eq!(r.status, Status::Fail);
+        assert!(r.detail.contains("8 tracked"), "count: {}", r.detail);
+        // At most SECRET_EXAMPLE_CAP paths are shown, and the rest are elided.
+        assert!(r.detail.contains("dir/secret0.env"));
+        assert!(
+            !r.detail.contains("dir/secret5.env"),
+            "past the cap must be elided: {}",
+            r.detail
+        );
+        assert!(r.detail.contains("+3 more"), "elision note: {}", r.detail);
+    }
+
+    #[test]
+    fn secret_audit_names_committed_provenance() {
+        // The fail wording must make clear the file is ALREADY committed — that
+        // is precisely what quarantine cannot catch.
+        let r = evaluate_secret_audit("w", &[secret_named("id_rsa")]);
+        assert!(r.detail.contains("already committed"), "got: {}", r.detail);
     }
 
     // --- status / exit-code folding -----------------------------------------

@@ -169,6 +169,8 @@ printf '%s\n' "$doctor_json" | grep -q '"check":"git"' \
   || fail "vard doctor --format json did not emit the git check row"
 printf '%s\n' "$doctor_json" | grep -q '"check":"health-file"' \
   || fail "vard doctor --format json did not emit the health-file check row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"secret-audit"' \
+  || fail "vard doctor --format json did not emit the per-watch secret-audit row"
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit
