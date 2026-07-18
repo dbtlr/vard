@@ -29,7 +29,7 @@ Every check but `remote-auth` is local; `remote-auth` is the one that touches th
 | `git` | The `git` executable is on `PATH` and new enough. vard's snapshot log format reads the trigger trailer with `%(trailers:key=…,valueonly)`, which needs **git 2.22+**; an older git `warn`s and a missing git `fail`s. |
 | `inotify` | **Linux only.** The kernel's inotify limits (`max_user_watches`, `max_user_instances`) against how many directories the configured watches would register (the notify backend watches every directory in a tree recursively, one watch descriptor each). It `warn`s once the totals reach 80% of either limit. On macOS this is `skipped` — vard uses FSEvents there, which has no such per-user limit. |
 | `health-file` | Whether the daemon's health file is fresh. A running daemon whose file has gone stale (past the staleness window) `warn`s — it may be wedged or unable to write. A daemon that is **not** running is a legitimate state, reported `ok` with a note (start one with [`vard run`](run.md)). |
-| `request-dir` | Stale entries in the request queue, older than the request staleness window. Two distinct cases, both `warn`, both flag-only (doctor never deletes): **crashed-writer leftovers** — unsettled temp/dot names an interrupted atomic write stranded, safe to delete — and **settled requests piling up unconsumed**, which mean no daemon is draining the queue (a running daemon would discard them as stale anyway). |
+| `request-dir` | Stale entries in the request queue, older than the request staleness window. Three distinct cases, all `warn`, all flag-only (doctor never deletes): **crashed-writer leftovers** — files matching vard's own atomic-write temp scheme (`.<name>.tmp-<pid>`) that an interrupted write stranded, safe to delete; **settled requests piling up unconsumed**, which mean no daemon is draining the queue (a running daemon would discard them as stale anyway); and **unrecognized files** — anything else stale that vard did not write, flagged with "investigate before deleting" rather than called safe to remove. A queue directory that cannot be read (short of simply not existing) also `warn`s, naming the I/O error, so a read failure is never reported `ok`. |
 | `secret-audit` | Per configured watch, whether any already-tracked file has a secret-shaped **name**. See [the secret audit](#the-secret-audit) below. |
 | `remote-auth` | Per sync-enabled watch, whether the configured remote is reachable and authenticated. See [the remote-auth probe](#the-remote-auth-probe) below. |
 
@@ -61,7 +61,7 @@ Per-watch outcomes:
 | Outcome | Row |
 |---|---|
 | The remote answered and authentication succeeded | `ok`. |
-| The remote is unreachable, refused authentication, or the probe timed out | `fail` — with git's reason (its first stderr line, not a dump). |
+| The remote is unreachable, refused authentication, or the probe timed out | `fail` — with git's reason (its first stderr line, not a dump), sanitized so any credential embedded in a remote URL (`scheme://user:token@host`) is redacted to `scheme://***@host` before it is shown. |
 | The watch does not sync (`sync = false`), or syncs but has no remote defined in its repository | `skipped` — with the reason. |
 | `--offline` was passed | `skipped` — "offline mode", without touching the network. |
 | The repository cannot be opened | `warn` naming the watch — never a crash, and never a block on the other watches' rows (consistent with the secret audit). |

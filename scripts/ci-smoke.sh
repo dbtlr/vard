@@ -214,6 +214,8 @@ printf '%s\n' "$logs_out" | grep -q 'no daemon logfile yet' \
 # logs is text-only like diff: an explicit --format json must be rejected (exit 2).
 if "$VARD" --format json logs >/dev/null 2>&1; then
   fail "vard --format json logs must be rejected as text-only"
+else
+  test "$?" -eq 2 || fail "vard --format json logs must exit 2 (text-only rejection)"
 fi
 
 # Snapshot/log round-trip (VRD-16), no daemon: an in-process snapshot must land

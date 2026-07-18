@@ -37,6 +37,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use anstyle::Style;
 use vard_core::{SecretMatch, SecretScanner, VcsBackend, VcsError};
 
+use crate::atomic;
 use crate::cli::{ColorWhen, OutputFormat};
 use crate::command::{self, CmdError, CmdResult, OutCtx};
 use crate::config::{Config, ResolvedWatch};
@@ -532,60 +533,103 @@ fn check_request_dir(ctx: &Ctx) -> Vec<CheckRow> {
     vec![evaluate_request_dir(&scan)]
 }
 
-/// The two kinds of stale entry the request-dir check flags, both older than
-/// [`request::STALE_AFTER`] and both flag-only (doctor never deletes).
+/// The kinds of stale entry the request-dir check flags — all older than
+/// [`request::STALE_AFTER`] and all flag-only (doctor never deletes) — plus any
+/// I/O failures reading the queue, so a directory we could not inspect never
+/// masquerades as a clean one.
 #[derive(Default)]
 struct RequestDirScan {
-    /// Unsettled temp/dot names from an interrupted atomic write — a crashed
-    /// writer's leftovers. Sorted.
+    /// Temp names matching the atomic writer's scheme
+    /// ([`atomic::is_temp_name`]) that an interrupted write stranded — a crashed
+    /// writer's leftovers, safe to delete. Sorted.
     crashed: Vec<String>,
     /// Settled `*.toml` requests still sitting in the queue past the staleness
     /// window — requests piling up unconsumed (typically no daemon is running;
     /// the daemon would discard them as stale anyway). Sorted.
     stale_settled: Vec<String>,
+    /// Stale entries vard did not write and cannot vouch for — neither a settled
+    /// request nor a recognizable atomic-write temp. Flagged for investigation
+    /// rather than labeled safe to delete. Sorted.
+    unrecognized: Vec<String>,
+    /// I/O failures encountered while scanning (an unreadable dir short of
+    /// `NotFound`, or a per-entry stat that failed). Non-empty turns the row into
+    /// a `warn` so a read failure is never silently reported `ok`.
+    errors: Vec<String>,
 }
 
-/// Scans the request dir, sorting stale entries into the two
-/// [`RequestDirScan`] buckets. A settled `*.toml`
-/// ([`request::is_settled_request_name`]) older than [`request::STALE_AFTER`]
-/// is a piling-up unconsumed request; an *unsettled* name that old is a crashed
-/// writer's leftover. A *fresh* entry of either kind is a writer or daemon
-/// mid-flight and is not flagged. A missing dir yields an empty scan.
+/// Scans the request dir, sorting stale entries into the [`RequestDirScan`]
+/// buckets. A settled `*.toml` ([`request::is_settled_request_name`]) older than
+/// [`request::STALE_AFTER`] is a piling-up unconsumed request; a stale name
+/// matching the atomic writer's temp scheme ([`atomic::is_temp_name`]) is a
+/// crashed writer's leftover; any other stale name is unrecognized — vard did
+/// not write it. A *fresh* entry is a writer or daemon mid-flight and is not
+/// flagged. A missing dir (`NotFound`) yields an empty, clean scan; any other
+/// read failure — the dir itself, an entry, or a stat — is recorded so the check
+/// `warn`s instead of falsely reporting `ok`.
 fn scan_request_dir(dir: &Path, now: u64) -> RequestDirScan {
+    let mut scan = RequestDirScan::default();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return RequestDirScan::default(),
+        // A missing queue dir is the ordinary "no requests yet" state.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return scan,
+        Err(e) => {
+            scan.errors
+                .push(format!("could not read the request dir: {e}"));
+            return scan;
+        }
     };
-    let mut scan = RequestDirScan::default();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                scan.errors
+                    .push(format!("could not read a request-dir entry: {e}"));
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
-        let age = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| now.saturating_sub(d.as_secs()));
+        // A stat failure must not silently drop the entry — fold it into the warn.
+        let age = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| now.saturating_sub(d.as_secs())),
+            Err(e) => {
+                scan.errors
+                    .push(format!("could not stat request-dir entry {name:?}: {e}"));
+                continue;
+            }
+        };
         if age.is_none_or(|age| age <= request::STALE_AFTER.as_secs()) {
             continue;
         }
         if request::is_settled_request_name(&name) {
             scan.stale_settled.push(name);
-        } else {
+        } else if atomic::is_temp_name(&name) {
             scan.crashed.push(name);
+        } else {
+            scan.unrecognized.push(name);
         }
     }
     scan.crashed.sort();
     scan.stale_settled.sort();
+    scan.unrecognized.sort();
     scan
 }
 
 /// Decides the request-dir check from a [`RequestDirScan`], so it tests with
-/// injected values. Either bucket alone or both together `warn` (still
-/// flag-only); a clean scan is `ok`. The two conditions carry distinct wording:
-/// crashed-writer leftovers are safe to delete, while piled-up settled requests
-/// point at a daemon that is not consuming them.
+/// injected values. Any populated bucket, or any recorded I/O error, `warn`s
+/// (still flag-only); a clean scan is `ok`. The conditions carry distinct
+/// wording: crashed-writer temps are safe to delete, piled-up settled requests
+/// point at a daemon that is not consuming them, and unrecognized entries — which
+/// vard did not write — are flagged for investigation, never called safe to
+/// remove.
 fn evaluate_request_dir(scan: &RequestDirScan) -> CheckRow {
-    if scan.crashed.is_empty() && scan.stale_settled.is_empty() {
+    if scan.crashed.is_empty()
+        && scan.stale_settled.is_empty()
+        && scan.unrecognized.is_empty()
+        && scan.errors.is_empty()
+    {
         return row(
             "request-dir",
             Status::Ok,
@@ -600,6 +644,14 @@ fn evaluate_request_dir(scan: &RequestDirScan) -> CheckRow {
             scan.crashed.join(", ")
         ));
     }
+    if !scan.unrecognized.is_empty() {
+        parts.push(format!(
+            "{} unrecognized file(s) in the request dir — vard did not write this; investigate \
+             before deleting: {}",
+            scan.unrecognized.len(),
+            scan.unrecognized.join(", ")
+        ));
+    }
     if !scan.stale_settled.is_empty() {
         parts.push(format!(
             "{} settled request(s) piling up unconsumed past the staleness window — no daemon is \
@@ -607,6 +659,9 @@ fn evaluate_request_dir(scan: &RequestDirScan) -> CheckRow {
             scan.stale_settled.len(),
             scan.stale_settled.join(", ")
         ));
+    }
+    for err in &scan.errors {
+        parts.push(err.clone());
     }
     row("request-dir", Status::Warn, parts.join("; "))
 }
@@ -868,7 +923,7 @@ fn evaluate_remote_auth(watch: &str, remote: &str, probe: Result<(), VcsError>) 
             Status::Fail,
             format!(
                 "watch {watch:?}: remote {remote:?} is unreachable or refused authentication: {}",
-                first_line(&stderr)
+                redact_userinfo(&first_line(&stderr))
             ),
         ),
         Err(e) => watch_row(
@@ -889,6 +944,38 @@ fn first_line(text: &str) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("(no details)")
         .to_string()
+}
+
+/// Redacts credentials embedded in any URL-shaped token in `line`, so a remote
+/// URL carrying userinfo (`https://user:token@host/...` or the token-only
+/// `https://token@host/...`) never leaks the secret into doctor's output or JSON
+/// when git echoes the URL back in its stderr. The *whole* userinfo is replaced
+/// with `***` — the username is not preserved, since it can itself be the secret
+/// — while the scheme, host, and the rest of the line are kept for diagnosis.
+/// Text with no `scheme://user@host` shape passes through unchanged.
+fn redact_userinfo(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find("://") {
+        out.push_str(&rest[..pos + 3]);
+        let after = &rest[pos + 3..];
+        // The authority runs to the first path/query/fragment/space boundary.
+        let auth_end = after
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len());
+        let authority = &after[..auth_end];
+        match authority.rfind('@') {
+            // Everything before the last `@` is userinfo; drop it wholesale.
+            Some(at) => {
+                out.push_str("***@");
+                out.push_str(&authority[at + 1..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &after[auth_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // --- rendering ------------------------------------------------------------
@@ -1109,10 +1196,12 @@ mod tests {
 
     // --- request-dir --------------------------------------------------------
 
-    fn scan(crashed: &[&str], stale_settled: &[&str]) -> RequestDirScan {
+    fn scan(crashed: &[&str], stale_settled: &[&str], unrecognized: &[&str]) -> RequestDirScan {
         RequestDirScan {
             crashed: crashed.iter().map(|s| s.to_string()).collect(),
             stale_settled: stale_settled.iter().map(|s| s.to_string()).collect(),
+            unrecognized: unrecognized.iter().map(|s| s.to_string()).collect(),
+            errors: Vec::new(),
         }
     }
 
@@ -1126,10 +1215,10 @@ mod tests {
 
     #[test]
     fn request_dir_with_crashed_leftovers_warns_and_names_them() {
-        let r = evaluate_request_dir(&scan(&[".req-123.toml.tmp"], &[]));
+        let r = evaluate_request_dir(&scan(&[".req-123.toml.tmp-99"], &[], &[]));
         assert_eq!(r.status, Status::Warn);
         assert!(
-            r.detail.contains(".req-123.toml.tmp"),
+            r.detail.contains(".req-123.toml.tmp-99"),
             "names it: {}",
             r.detail
         );
@@ -1137,8 +1226,28 @@ mod tests {
     }
 
     #[test]
+    fn request_dir_with_unrecognized_entry_warns_and_does_not_call_it_safe() {
+        // A stale name vard never wrote (not a settled request, not a temp).
+        let r = evaluate_request_dir(&scan(&[], &[], &["mystery.dat"]));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("mystery.dat"), "names it: {}", r.detail);
+        assert!(
+            r.detail.contains("vard did not write this")
+                && r.detail.contains("investigate before deleting"),
+            "honest unrecognized wording: {}",
+            r.detail
+        );
+        // An unrecognized file is never labeled safe to delete.
+        assert!(
+            !r.detail.contains("safe to delete"),
+            "must not call an unrecognized file safe to delete: {}",
+            r.detail
+        );
+    }
+
+    #[test]
     fn request_dir_with_stale_settled_warns_about_piling_up() {
-        let r = evaluate_request_dir(&scan(&[], &["req-1.toml"]));
+        let r = evaluate_request_dir(&scan(&[], &["req-1.toml"], &[]));
         assert_eq!(r.status, Status::Warn);
         assert!(r.detail.contains("req-1.toml"), "names it: {}", r.detail);
         assert!(
@@ -1156,14 +1265,24 @@ mod tests {
 
     #[test]
     fn request_dir_with_both_kinds_warns_and_reports_each() {
-        let r = evaluate_request_dir(&scan(&[".req-1.toml.tmp"], &["req-2.toml"]));
+        let r = evaluate_request_dir(&scan(&[".req-1.toml.tmp-7"], &["req-2.toml"], &[]));
         assert_eq!(r.status, Status::Warn);
         assert!(r.detail.contains("crashed writer"), "crashed: {}", r.detail);
         assert!(r.detail.contains("piling up"), "settled: {}", r.detail);
     }
 
     #[test]
-    fn scan_sorts_stale_entries_into_the_two_buckets_and_ignores_fresh() {
+    fn request_dir_scan_error_warns_and_is_never_a_silent_ok() {
+        let mut s = RequestDirScan::default();
+        s.errors
+            .push("could not read the request dir: boom".to_string());
+        let r = evaluate_request_dir(&s);
+        assert_eq!(r.status, Status::Warn, "a read failure must not report ok");
+        assert!(r.detail.contains("boom"), "names the error: {}", r.detail);
+    }
+
+    #[test]
+    fn scan_sorts_stale_entries_into_the_three_buckets_and_ignores_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_000_000u64;
         let stale = now - request::STALE_AFTER.as_secs() - 60;
@@ -1171,11 +1290,15 @@ mod tests {
 
         // A stale settled request: piling up unconsumed.
         std::fs::write(dir.path().join("req.toml"), "x").unwrap();
-        // A stale unsettled leftover (a crashed writer's temp name).
-        let leftover = dir.path().join(".req-1.toml.tmp");
+        // A stale crashed-writer leftover: the real atomic temp scheme
+        // (`.{final}.tmp-{pid}`).
+        let leftover = dir.path().join(".req-1.toml.tmp-4242");
         std::fs::write(&leftover, "x").unwrap();
-        // A fresh unsettled file (a writer mid-flight): not flagged.
-        let inflight = dir.path().join(".req-2.toml.tmp");
+        // A stale name vard never wrote: unrecognized, not "safe to delete".
+        let stray = dir.path().join("mystery.dat");
+        std::fs::write(&stray, "x").unwrap();
+        // A fresh temp (a writer mid-flight): not flagged.
+        let inflight = dir.path().join(".req-2.toml.tmp-4243");
         std::fs::write(&inflight, "x").unwrap();
         // A fresh settled request (the daemon just has not drained it yet): not
         // flagged.
@@ -1184,27 +1307,68 @@ mod tests {
 
         set_mtime(&dir.path().join("req.toml"), stale);
         set_mtime(&leftover, stale);
+        set_mtime(&stray, stale);
         set_mtime(&inflight, fresh);
         set_mtime(&queued, fresh);
 
         let found = scan_request_dir(dir.path(), now);
         assert_eq!(
             found.crashed,
-            vec![".req-1.toml.tmp".to_string()],
-            "only the stale unsettled leftover is a crashed-writer entry"
+            vec![".req-1.toml.tmp-4242".to_string()],
+            "only the stale atomic-temp leftover is a crashed-writer entry"
         );
         assert_eq!(
             found.stale_settled,
             vec!["req.toml".to_string()],
             "only the stale settled request piles up"
         );
+        assert_eq!(
+            found.unrecognized,
+            vec!["mystery.dat".to_string()],
+            "the stale stray is unrecognized, not crashed"
+        );
+        assert!(found.errors.is_empty(), "a clean scan records no errors");
     }
 
     #[test]
     fn scan_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let found = scan_request_dir(&dir.path().join("nope"), 1_000);
-        assert!(found.crashed.is_empty() && found.stale_settled.is_empty());
+        assert!(
+            found.crashed.is_empty()
+                && found.stale_settled.is_empty()
+                && found.unrecognized.is_empty()
+                && found.errors.is_empty(),
+            "a missing dir is an empty, clean, error-free scan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_unreadable_dir_records_an_error_not_a_clean_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Drop all permissions so read_dir fails with something other than
+        // NotFound. Running as root defeats this, so skip-gate on that case.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Captured while the dir is unreadable; restore afterwards for cleanup.
+        let found = scan_request_dir(dir.path(), 1_000);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        if found.errors.is_empty() {
+            // The chmod did not actually block reads (running as root, or a
+            // permissive FS) — nothing to assert.
+            eprintln!("skipping: permissions did not block directory reads");
+            return;
+        }
+        assert!(
+            !found.errors.is_empty(),
+            "an unreadable dir must record an error, not report a clean ok"
+        );
+        assert_eq!(
+            evaluate_request_dir(&found).status,
+            Status::Warn,
+            "an unreadable request dir warns"
+        );
     }
 
     /// Sets a file's mtime to `secs` past the epoch, via a `SystemTime` on the
@@ -1289,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_auth_command_failure_fails_with_first_stderr_line_only() {
+    fn remote_auth_command_failure_fails_with_first_sanitized_stderr_line_only() {
         let probe = Err(VcsError::CommandFailed {
             op: "ls-remote".to_string(),
             status: Some(128),
@@ -1298,6 +1462,7 @@ mod tests {
         });
         let r = evaluate_remote_auth("vault", "origin", probe);
         assert_eq!(r.status, Status::Fail);
+        // Credential-free text passes through verbatim (the first line only).
         assert!(
             r.detail.contains("does not exist"),
             "summarizes the first line: {}",
@@ -1308,6 +1473,54 @@ mod tests {
             !r.detail.contains("Could not read"),
             "must not dump the whole stderr: {}",
             r.detail
+        );
+    }
+
+    #[test]
+    fn remote_auth_command_failure_redacts_url_credentials() {
+        // git echoes the remote URL back in its stderr; a URL with embedded
+        // userinfo must never leak the secret into doctor's output or JSON.
+        let secret = concat!("gh", "p_", "s3cr3tt0ken");
+        let probe = Err(VcsError::CommandFailed {
+            op: "ls-remote".to_string(),
+            status: Some(128),
+            stderr: format!(
+                "fatal: unable to access 'https://alice:{secret}@github.com/acme/vault.git/': \
+                 authentication failed\n"
+            ),
+        });
+        let r = evaluate_remote_auth("vault", "origin", probe);
+        assert_eq!(r.status, Status::Fail);
+        // The credential (both the username and the token) is gone…
+        assert!(
+            !r.detail.contains(secret) && !r.detail.contains("alice"),
+            "the credential must be redacted: {}",
+            r.detail
+        );
+        // …the userinfo collapses to `***`, and the host survives for diagnosis.
+        assert!(
+            r.detail.contains("https://***@github.com") && r.detail.contains("authentication"),
+            "host and reason must survive: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_covers_token_only_and_leaves_plain_text() {
+        // Token-only userinfo (`https://token@host`) is redacted too.
+        assert_eq!(
+            redact_userinfo("clone https://t0ken@example.com/x.git failed"),
+            "clone https://***@example.com/x.git failed"
+        );
+        // A URL without userinfo is untouched.
+        assert_eq!(
+            redact_userinfo("fetch https://example.com/x.git timed out"),
+            "fetch https://example.com/x.git timed out"
+        );
+        // Non-URL text passes through unchanged.
+        assert_eq!(
+            redact_userinfo("fatal: not a git repository"),
+            "fatal: not a git repository"
         );
     }
 

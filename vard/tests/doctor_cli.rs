@@ -120,9 +120,11 @@ fn secret_audit_skips_a_watch_with_scanning_disabled() {
 
     let out = env.vard(&["--format", "json", "doctor"]);
     let json = stdout(&out);
+    // Bind the status to the secret-audit row itself — a `skipped` on some other
+    // row (e.g. inotify off Linux) must not let this pass.
     assert!(
-        json.contains(r#""check":"secret-audit""#) && json.contains(r#""status":"skipped""#),
-        "a disabled watch must skip the audit: {json}"
+        json.contains(r#""check":"secret-audit","status":"skipped""#),
+        "the secret-audit row itself must be skipped: {json}"
     );
     // With scanning off, that fail is gone; git/health/etc are all ok → exit 0.
     assert_eq!(

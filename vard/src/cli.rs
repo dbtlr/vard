@@ -399,7 +399,8 @@ mutates anything (it reads /proc, the config, the health file, the request \
 queue, and each watch's repository, and reports; it does not clean, restore, or \
 write). Each row is `ok`, `warn`, `fail`, or `skipped`.
 
-The checks in this release, all local (no network):
+The checks in this release (all local except `remote-auth`, the one network \
+probe, which `--offline` skips):
 
   git           the git executable is on PATH and new enough — vard's snapshot
                 log format needs git 2.22+; older git `warn`s, a missing git
