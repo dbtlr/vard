@@ -50,6 +50,7 @@ use crate::output::primitives::clean_line;
 use crate::output::record::{self, Record, RecordField, format_duration};
 use crate::paths;
 use crate::request;
+use crate::service::launchd::LaunchctlPrint;
 
 /// The check registry, run in order. Each returns one or more [`CheckRow`]s.
 const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] = &[
@@ -1121,21 +1122,6 @@ enum SystemctlEnv {
     Unavailable(String),
 }
 
-/// macOS: what `launchctl print` reported about the loaded LaunchAgent.
-#[derive(Debug)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-enum LaunchctlPrint {
-    /// A `pid = ` line is present — the daemon is running.
-    Running,
-    /// No `pid = ` line, but a `last exit code = N` (nonzero) is — the
-    /// service is loaded but not running, having exited on its own.
-    Exited { code: i32 },
-    /// `launchctl print` exited nonzero — the label is not loaded.
-    NotLoaded,
-    /// The output does not match a recognized shape. Carries a short detail.
-    Unparsed(String),
-}
-
 /// Whether `url` is an ssh-style git remote (`git@host:path`, `ssh://…`, or
 /// anything else that is not plain HTTP(S)) — the shapes that need a running
 /// ssh-agent (or an interactively-unlocked key) to authenticate, unlike an
@@ -1273,52 +1259,14 @@ fn check_service_agent(_ctx: &Ctx) -> Vec<CheckRow> {
         .unwrap_or(false);
     let target = crate::service::launchd::service_target(uid);
     let out = crate::service::run_bounded("launchctl", &["print", &target], SERVICE_PROBE_TIMEOUT);
-    let print = parse_launchctl_print(&out);
+    let print = crate::service::launchd::parse_launchctl_print(&out);
     vec![evaluate_service_agent_macos(plist_exists, &print)]
 }
 
-/// Parses a captured `launchctl print` run for the shapes doctor cares about.
-/// Pure over the runner's output, so it is unit-tested against representative
-/// fixtures without a real launchd. `launchctl` failing to spawn or timing out
-/// is a probe failure, not evidence the service is unloaded, so only a *ran
-/// and exited nonzero* result is read as [`LaunchctlPrint::NotLoaded`] —
-/// everything else doctor cannot confidently interpret is
-/// [`LaunchctlPrint::Unparsed`], never a guess.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn parse_launchctl_print(out: &crate::service::RunOutput) -> LaunchctlPrint {
-    if !out.spawned || out.timed_out {
-        return LaunchctlPrint::Unparsed(out.detail());
-    }
-    if !out.success() {
-        return LaunchctlPrint::NotLoaded;
-    }
-    let running = out.stdout.lines().any(|l| {
-        l.trim()
-            .strip_prefix("pid = ")
-            .is_some_and(|rest| rest.trim().parse::<u64>().is_ok())
-    });
-    if running {
-        return LaunchctlPrint::Running;
-    }
-    let exited = out.stdout.lines().find_map(|l| {
-        let rest = l.trim().strip_prefix("last exit code = ")?;
-        rest.trim().parse::<i32>().ok()
-    });
-    match exited {
-        Some(code) if code != 0 => LaunchctlPrint::Exited { code },
-        _ => {
-            let sample = if out.stdout.trim().is_empty() {
-                &out.stderr
-            } else {
-                &out.stdout
-            };
-            LaunchctlPrint::Unparsed(first_line(sample))
-        }
-    }
-}
-
 /// Decides the macOS service-agent row from the plist's presence and the
-/// parsed `launchctl print` state, so it tests without a real launchd.
+/// parsed `launchctl print` state (the parser lives in the launchd backend —
+/// the single source of truth shared with the `start` verb, VRD-59), so it
+/// tests without a real launchd.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn evaluate_service_agent_macos(plist_exists: bool, print: &LaunchctlPrint) -> CheckRow {
     if !plist_exists {
@@ -2082,109 +2030,9 @@ mod tests {
         );
     }
 
-    // --- launchctl print parser (macOS) ------------------------------------
-
-    /// A successful, zero-exit run with the given captured stdout — the shape
-    /// [`crate::service::run_bounded`] returns for a clean `launchctl print`.
-    fn run_ok(stdout: &str) -> crate::service::RunOutput {
-        crate::service::RunOutput {
-            spawned: true,
-            code: Some(0),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        }
-    }
-
-    #[test]
-    fn launchctl_print_running_from_pid_line() {
-        let out =
-            run_ok("com.dbtlr.vard = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n");
-        assert!(matches!(
-            parse_launchctl_print(&out),
-            LaunchctlPrint::Running
-        ));
-    }
-
-    #[test]
-    fn launchctl_print_nonzero_last_exit_without_pid() {
-        let out = run_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n");
-        match parse_launchctl_print(&out) {
-            LaunchctlPrint::Exited { code } => assert_eq!(code, 2),
-            other => panic!("expected Exited, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn launchctl_print_not_loaded_on_command_failure() {
-        // launchctl ran and exited nonzero — the ordinary "label not loaded"
-        // shape.
-        let out = crate::service::RunOutput {
-            spawned: true,
-            code: Some(113),
-            stdout: String::new(),
-            stderr: "Could not find service \"com.dbtlr.vard\" in domain for port".to_string(),
-            timed_out: false,
-        };
-        assert!(matches!(
-            parse_launchctl_print(&out),
-            LaunchctlPrint::NotLoaded
-        ));
-    }
-
-    #[test]
-    fn launchctl_print_missing_binary_is_unparsed_not_not_loaded() {
-        // launchctl itself failed to spawn — a probe failure, not evidence the
-        // service is unloaded, so this must not be misread as "not loaded"
-        // (which would wrongly advise `vard service start`).
-        let out = crate::service::RunOutput {
-            spawned: false,
-            code: None,
-            stdout: String::new(),
-            stderr: "No such file or directory (os error 2)".to_string(),
-            timed_out: false,
-        };
-        assert!(matches!(
-            parse_launchctl_print(&out),
-            LaunchctlPrint::Unparsed(_)
-        ));
-    }
-
-    #[test]
-    fn launchctl_print_timeout_is_unparsed_not_not_loaded() {
-        let out = crate::service::RunOutput {
-            spawned: true,
-            code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: true,
-        };
-        assert!(matches!(
-            parse_launchctl_print(&out),
-            LaunchctlPrint::Unparsed(_)
-        ));
-    }
-
-    #[test]
-    fn launchctl_print_clean_last_exit_with_no_pid_is_unparsed() {
-        // Loaded, no pid line, and a *zero* last exit code is an ambiguous
-        // quiescent shape doctor does not claim to interpret — skipped, not
-        // guessed at.
-        let out = run_ok("com.dbtlr.vard = {\n\tlast exit code = 0\n\tstate = not running\n}\n");
-        assert!(matches!(
-            parse_launchctl_print(&out),
-            LaunchctlPrint::Unparsed(_)
-        ));
-    }
-
-    #[test]
-    fn launchctl_print_unrecognized_shape_is_unparsed_with_detail() {
-        let out = run_ok("something unexpected\n");
-        match parse_launchctl_print(&out) {
-            LaunchctlPrint::Unparsed(detail) => assert_eq!(detail, "something unexpected"),
-            other => panic!("expected Unparsed, got {other:?}"),
-        }
-    }
+    // The `launchctl print` parser now lives in the launchd backend
+    // (`crate::service::launchd`), the single source of truth shared with the
+    // `start` verb's state probe (VRD-59); its unit tests live there too.
 
     // --- service-agent (macOS) ----------------------------------------------
 

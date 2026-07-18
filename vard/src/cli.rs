@@ -845,13 +845,15 @@ Start the vard service.
 
 Like `install`, it first pre-flights the daemon's config (`vard run`'s own \
 startup check): a missing, watch-less, or invalid config refuses with exit 2 and \
-advice before any service-manager call.
+advice before any service-manager call. If no unit is installed, the command \
+exits with an error pointing at `vard service install`.
 
-Loads the installed service (or kicks an already-loaded one) so the daemon runs, \
-then verifies it came up. If no unit is installed, the command exits with an \
-error pointing at `vard service install`. If the service starts but the daemon \
-does not take the instance lock within five seconds, it exits 1 and points at \
-`vard run` in the foreground.")]
+Otherwise it probes the service's real state and acts on it: an already-running \
+service is left alone (an exit-0 no-op), and any other state — not loaded, \
+stopped, or crash-loop-throttled — is brought up so `start` is reliable from \
+every state. It then verifies the daemon came up; if it does not take the \
+instance lock within five seconds, it exits 1 and points at `vard run` in the \
+foreground.")]
     Start,
 
     /// Unload the service, stopping the daemon.
@@ -877,11 +879,13 @@ pick up an upgraded `vard` binary or a changed unit. Like `install`, it first \
 pre-flights the daemon's config and refuses with exit 2 and advice if `vard run` \
 itself could not start, before touching the service manager.
 
-launchd has no reload signal, so a restart is how macOS re-execs the daemon; if \
-the service is not loaded, restart loads it. On Linux the systemd unit also \
+launchd has no reload signal, so a restart is how macOS re-execs the daemon; \
+there it runs an unconditional reload-then-start sequence that is reliable from \
+every state (running, stopped, or crash-loop-throttled), and advises \
+`vard service install` if no unit is installed. On Linux the systemd unit also \
 carries an `ExecReload` that sends SIGHUP for a config-only reload without a full \
-restart. A restart that leaves the daemon down exits 1 and points at `vard run` \
-in the foreground.")]
+restart, and `restart` starts a stopped unit as well. A restart that leaves the \
+daemon down exits 1 and points at `vard run` in the foreground.")]
     Restart,
 }
 

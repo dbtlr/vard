@@ -122,9 +122,9 @@ Stops and unloads the service, then removes its unit file. Nothing in your repos
 
 ## start, stop, restart
 
-- **start** loads (macOS) or starts (Linux) the installed service and verifies the daemon came up. It first runs the [config pre-flight](#config-pre-flight) (refusing with exit `2` if `vard run` could not start); with no unit installed it exits with an error pointing at `vard service install`.
+- **start** brings the installed service up and verifies the daemon came up. It first runs the [config pre-flight](#config-pre-flight) (refusing with exit `2` if `vard run` could not start), then, with no unit installed, exits with an error pointing at `vard service install`. Otherwise it probes the service's real state: an **already-running** service is left untouched (an exit-`0` no-op), while every other state — not loaded, stopped, or **crash-loop-throttled** — is brought up. On macOS the bring-up is an unconditional `bootout`-then-`bootstrap`, which recovers even a bootstrapped-but-throttled agent; a probe that cannot run falls through to that same safe path rather than refusing. On Linux it is `systemctl --user start`.
 - **stop** unloads (macOS) or stops (Linux) the service. Stopping an already-stopped service is an idempotent success. It does **not** pre-flight — stopping never needs a startable config.
-- **restart** restarts the service and verifies the daemon came back up — the way to pick up an upgraded `vard` binary or a changed unit. It runs the same [config pre-flight](#config-pre-flight) first. If the service is not loaded, restart loads it.
+- **restart** restarts the service and verifies the daemon came back up — the way to pick up an upgraded `vard` binary or a changed unit. It runs the same [config pre-flight](#config-pre-flight) first. On macOS it then runs an unconditional `bootout` (result ignored) → `bootstrap` → verify sequence, correct from every state (running, stopped, throttled, not loaded); with no unit installed it points at `vard service install`. On Linux `systemctl --user restart` is itself state-agnostic (it starts a stopped unit and restarts a running one).
 
 ### stop is not uninstall
 

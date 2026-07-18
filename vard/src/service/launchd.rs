@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::atomic;
 use crate::command::CmdError;
 
-use super::{OpEnv, PreflightOutcome};
+use super::{OpEnv, PreflightOutcome, RunOutput, first_line};
 
 /// The LaunchAgent label and plist basename stem.
 const LABEL: &str = "com.dbtlr.vard";
@@ -101,6 +101,66 @@ fn domain(uid: u32) -> String {
 /// service's actual loaded/running state.
 pub(crate) fn service_target(uid: u32) -> String {
     format!("gui/{uid}/{LABEL}")
+}
+
+/// What `launchctl print gui/<uid>/<label>` reported about the loaded
+/// LaunchAgent. The single parse of that output — shared by the `start` verb's
+/// state probe (VRD-59) and doctor's `service-agent` check — so the two can
+/// never disagree on what a given `launchctl print` means.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum LaunchctlPrint {
+    /// A `pid = ` line is present — the daemon is running.
+    Running,
+    /// No `pid = ` line, but a `last exit code = N` (nonzero) is — the service
+    /// is loaded but not running, having exited on its own.
+    Exited { code: i32 },
+    /// `launchctl print` exited nonzero — the label is not loaded.
+    NotLoaded,
+    /// The output does not match a recognized shape. Carries a short detail.
+    Unparsed(String),
+}
+
+/// Parses a captured `launchctl print` run for the shapes callers care about.
+/// Pure over the runner's output, so it is unit-tested against representative
+/// fixtures without a real launchd. `launchctl` failing to spawn or timing out
+/// is a *probe* failure, not evidence the service is unloaded, so only a *ran
+/// and exited nonzero* result is read as [`LaunchctlPrint::NotLoaded`] —
+/// everything else that cannot be confidently interpreted is
+/// [`LaunchctlPrint::Unparsed`], never a guess. (The `start` verb treats every
+/// non-`Running` outcome, `Unparsed` included, as "recover it", so a probe that
+/// cannot run never becomes a refusal.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn parse_launchctl_print(out: &RunOutput) -> LaunchctlPrint {
+    if !out.spawned || out.timed_out {
+        return LaunchctlPrint::Unparsed(out.detail());
+    }
+    if !out.success() {
+        return LaunchctlPrint::NotLoaded;
+    }
+    let running = out.stdout.lines().any(|l| {
+        l.trim()
+            .strip_prefix("pid = ")
+            .is_some_and(|rest| rest.trim().parse::<u64>().is_ok())
+    });
+    if running {
+        return LaunchctlPrint::Running;
+    }
+    let exited = out.stdout.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("last exit code = ")?;
+        rest.trim().parse::<i32>().ok()
+    });
+    match exited {
+        Some(code) if code != 0 => LaunchctlPrint::Exited { code },
+        _ => {
+            let sample = if out.stdout.trim().is_empty() {
+                &out.stderr
+            } else {
+                &out.stdout
+            };
+            LaunchctlPrint::Unparsed(first_line(sample))
+        }
+    }
 }
 
 /// The failure message shared by install/start/restart when the unit is in place
@@ -229,10 +289,15 @@ pub(crate) fn uninstall(env: &OpEnv, uid: u32, plist: &Path) -> Result<Vec<Strin
     Ok(lines)
 }
 
-/// `vard service start`: load the service, or kick an already-loaded one, then
-/// verify. A missing plist advises `vard service install`. Pre-flights the
-/// daemon config first (VRD-58): a config `vard run` could not start refuses
-/// before any launchctl call.
+/// `vard service start`: bring the installed service up, verifying it came up.
+/// A missing plist advises `vard service install`. Otherwise the real launchd
+/// state is probed first (`launchctl print`, parsed by
+/// [`parse_launchctl_print`]): a confirmed **Running** service is an exit-0
+/// no-op (the documented idempotency); every other outcome — not loaded,
+/// throttled, exited, or a probe that could not even run — is recovered by the
+/// same unconditional `bootout`-then-`bootstrap` sequence `install` uses, which
+/// is safe from every state. Probe failure therefore never yields a refusal
+/// (VRD-59).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn start(
     env: &OpEnv,
@@ -249,24 +314,27 @@ pub(crate) fn start(
         ));
     }
 
+    let target = service_target(uid);
+    let probe = env.runner.run("launchctl", &["print", target.as_str()]);
+    if let LaunchctlPrint::Running = parse_launchctl_print(&probe) {
+        return Ok(vec![format!("{LABEL} is already running.")]);
+    }
+
+    // Any non-running (or unreadable) state: recover with install's proven
+    // bootout → bootstrap sequence, ignoring the bootout result (it fails
+    // harmlessly when nothing is loaded).
+    let _ = env.runner.run("launchctl", &["bootout", target.as_str()]);
     let dom = domain(uid);
     let plist_str = plist.to_string_lossy();
-    let plist_str = plist_str.as_ref();
-
-    let out = env
-        .runner
-        .run("launchctl", &["bootstrap", dom.as_str(), plist_str]);
-    if !out.success() {
-        // Already loaded: kick it so a running-but-idle service is (re)started.
-        let kick = env
-            .runner
-            .run("launchctl", &["kickstart", service_target(uid).as_str()]);
-        if !kick.success() {
-            return Err(CmdError::err(format!(
-                "launchctl could not start the service: {}",
-                kick.detail()
-            )));
-        }
+    let boot = env.runner.run(
+        "launchctl",
+        &["bootstrap", dom.as_str(), plist_str.as_ref()],
+    );
+    if !boot.success() {
+        return Err(CmdError::err(format!(
+            "launchctl could not start the service: {}",
+            boot.detail()
+        )));
     }
 
     finish_with_verify(env, vec![format!("Started {LABEL}.")])
@@ -292,11 +360,12 @@ pub(crate) fn stop(env: &OpEnv, uid: u32) -> Result<Vec<String>, CmdError> {
     }
 }
 
-/// `vard service restart`: kickstart with `-k` (kill and restart), loading the
-/// service first if it is not yet loaded, then verify. This is how macOS
-/// re-execs the daemon — launchd has no reload signal. Pre-flights the daemon
-/// config first (VRD-58): a config `vard run` could not start refuses before any
-/// launchctl call.
+/// `vard service restart`: re-exec the daemon (launchd has no reload signal). A
+/// missing plist advises `vard service install`. Otherwise run `install`'s
+/// proven sequence **unconditionally** — `bootout` (result ignored) →
+/// `bootstrap` → liveness verify — which is correct from every state (running,
+/// stopped, throttled, not loaded) and sidesteps the loaded-state inference that
+/// misfired against a bootstrapped-but-throttled service (VRD-59).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn restart(
     env: &OpEnv,
@@ -307,29 +376,27 @@ pub(crate) fn restart(
     // Refuse before touching launchd if `vard run` itself could not start.
     preflight.require_startable()?;
 
+    if !plist.exists() {
+        return Err(CmdError::err(
+            "no vard service is installed — run `vard service install` first",
+        ));
+    }
+
     let target = service_target(uid);
-    let out = env
-        .runner
-        .run("launchctl", &["kickstart", "-k", target.as_str()]);
-    if !out.success() {
-        // Not loaded: bootstrap it (the plist must exist to load).
-        if !plist.exists() {
-            return Err(CmdError::err(
-                "no vard service is installed — run `vard service install` first",
-            ));
-        }
-        let dom = domain(uid);
-        let plist_str = plist.to_string_lossy();
-        let boot = env.runner.run(
-            "launchctl",
-            &["bootstrap", dom.as_str(), plist_str.as_ref()],
-        );
-        if !boot.success() {
-            return Err(CmdError::err(format!(
-                "launchctl could not start the service: {}",
-                boot.detail()
-            )));
-        }
+    // Bootout first to clear any prior (possibly throttled) load; a not-loaded
+    // service boots out harmlessly, so the result is deliberately ignored.
+    let _ = env.runner.run("launchctl", &["bootout", target.as_str()]);
+    let dom = domain(uid);
+    let plist_str = plist.to_string_lossy();
+    let boot = env.runner.run(
+        "launchctl",
+        &["bootstrap", dom.as_str(), plist_str.as_ref()],
+    );
+    if !boot.success() {
+        return Err(CmdError::err(format!(
+            "launchctl bootstrap failed: {}",
+            boot.detail()
+        )));
     }
 
     finish_with_verify(env, vec![format!("Restarted {LABEL}.")])
@@ -364,6 +431,18 @@ mod tests {
         PreflightOutcome::Refused(
             "nothing to watch — add a watch with `vard watch add`".to_string(),
         )
+    }
+
+    /// A successful, zero-exit `launchctl print` run with the given stdout — the
+    /// shape [`crate::service::run_bounded`] returns for a clean probe.
+    fn print_ok(stdout: &str) -> RunOutput {
+        RunOutput {
+            spawned: true,
+            code: Some(0),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        }
     }
 
     #[test]
@@ -639,18 +718,69 @@ mod tests {
     }
 
     #[test]
-    fn start_kicks_when_already_loaded() {
+    fn start_is_a_no_op_when_already_running() {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
-        let runner = FakeRunner::new(vec![fail("already bootstrapped"), ok()]); // bootstrap fails, kickstart ok
+        // The probe reports a running daemon (a `pid = ` line).
+        let runner = FakeRunner::new(vec![print_ok(
+            "com.dbtlr.vard = {\n\tpid = 4242\n\tstate = running\n}\n",
+        )]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = start(&e, 501, &plist, &startable()).unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "a running service is probed and left alone");
+        assert!(calls[0].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(lines.iter().any(|l| l.contains("already running")));
+    }
+
+    #[test]
+    fn start_recovers_from_a_throttled_or_unloaded_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        // Probe reports a nonzero last exit (throttled/crash-looping), then the
+        // bootout+bootstrap recovery both succeed.
+        let runner = FakeRunner::new(vec![
+            print_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n"),
+            ok(), // bootout
+            ok(), // bootstrap
+        ]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
         start(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert!(calls[1].starts_with("launchctl kickstart gui/501/com.dbtlr.vard"));
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[1].starts_with("launchctl bootout gui/501/com.dbtlr.vard"));
+        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
+    }
+
+    #[test]
+    fn start_recovers_even_when_the_probe_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        // A probe that fails to interpret (here: launchctl print itself errored)
+        // must fall through to recovery, never a refusal.
+        let runner = FakeRunner::new(vec![
+            fail("Could not find service in domain"), // probe -> NotLoaded
+            ok(),                                     // bootout
+            ok(),                                     // bootstrap
+        ]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        start(&e, 501, &plist, &startable()).unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
@@ -676,33 +806,54 @@ mod tests {
     }
 
     #[test]
-    fn restart_kickstarts_k_and_verifies() {
+    fn restart_runs_the_unconditional_bootout_bootstrap_sequence() {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
-        let runner = FakeRunner::new(vec![ok()]);
+        // From a bootstrapped-but-throttled state, bootout succeeds then
+        // bootstrap succeeds — the sequence install proved live.
+        let runner = FakeRunner::new(vec![ok(), ok()]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
         restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert_eq!(calls[0], "launchctl kickstart -k gui/501/com.dbtlr.vard");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "launchctl bootout gui/501/com.dbtlr.vard");
+        assert!(calls[1].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
-    fn restart_bootstraps_when_not_loaded() {
+    fn restart_bootstraps_even_when_bootout_fails_because_not_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
-        let runner = FakeRunner::new(vec![fail("No such process"), ok()]); // kickstart fails, bootstrap ok
+        // bootout fails harmlessly (nothing loaded); its result is ignored and
+        // bootstrap still runs — proving the sequence works from every state.
+        let runner = FakeRunner::new(vec![fail("Boot-out failed: 3: No such process"), ok()]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
         restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
         assert!(calls[1].starts_with("launchctl bootstrap gui/501"));
+    }
+
+    #[test]
+    fn restart_without_plist_advises_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist"); // missing
+        let runner = FakeRunner::new(vec![]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = restart(&e, 501, &plist, &startable()).unwrap_err();
+        assert!(err.message().contains("vard service install"));
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
@@ -718,5 +869,92 @@ mod tests {
         let err = restart(&e, 501, &plist, &refused()).unwrap_err();
         assert!(err.message().contains("vard watch add"));
         assert!(runner.calls().is_empty());
+    }
+
+    // --- launchctl print parser (moved from doctor; single source of truth) ---
+
+    #[test]
+    fn launchctl_print_running_from_pid_line() {
+        let out = print_ok(
+            "com.dbtlr.vard = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n",
+        );
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Running
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_nonzero_last_exit_without_pid() {
+        let out = print_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n");
+        match parse_launchctl_print(&out) {
+            LaunchctlPrint::Exited { code } => assert_eq!(code, 2),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launchctl_print_not_loaded_on_command_failure() {
+        let out = RunOutput {
+            spawned: true,
+            code: Some(113),
+            stdout: String::new(),
+            stderr: "Could not find service \"com.dbtlr.vard\" in domain for port".to_string(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_missing_binary_is_unparsed_not_not_loaded() {
+        // launchctl itself failed to spawn — a probe failure, not evidence the
+        // service is unloaded.
+        let out = RunOutput {
+            spawned: false,
+            code: None,
+            stdout: String::new(),
+            stderr: "No such file or directory (os error 2)".to_string(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_timeout_is_unparsed_not_not_loaded() {
+        let out = RunOutput {
+            spawned: true,
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_clean_last_exit_with_no_pid_is_unparsed() {
+        let out = print_ok("com.dbtlr.vard = {\n\tlast exit code = 0\n\tstate = not running\n}\n");
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_unrecognized_shape_is_unparsed_with_detail() {
+        let out = print_ok("something unexpected\n");
+        match parse_launchctl_print(&out) {
+            LaunchctlPrint::Unparsed(detail) => assert_eq!(detail, "something unexpected"),
+            other => panic!("expected Unparsed, got {other:?}"),
+        }
     }
 }
