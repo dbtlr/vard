@@ -651,15 +651,21 @@ impl VcsBackend for GitBackend {
     }
 
     fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
-        // `-z` delimits with NUL so unusual filenames arrive unquoted (the same
-        // discipline `scan_untracked` uses). An unborn HEAD (nothing committed
-        // yet) simply lists nothing — success, not an error.
-        let out = self.run(&[], ["ls-files", "-z"])?;
-        Ok(out
-            .split('\0')
+        // `-z` delimits with NUL so unusual filenames arrive unquoted, and the
+        // output stays raw bytes end-to-end (the same discipline
+        // `scan_untracked` uses): a lossy decode would rewrite a non-UTF-8
+        // tracked name and let it slip past a filename-pattern audit. An
+        // unborn HEAD (nothing committed yet) simply lists nothing — success,
+        // not an error.
+        let out = git_output(&self.path, &[], ["ls-files", "-z"], false)?;
+        if !out.status.success() {
+            return Err(classify_failure("ls-files", &out));
+        }
+        out.stdout
+            .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .collect())
+            .map(bytes_to_path)
+            .collect()
     }
 
     fn diff(
@@ -1094,9 +1100,10 @@ fn exclude_pathspec(path: &Path) -> OsString {
 
 /// Turns a raw NUL-delimited `ls-files -z` path field into a [`PathBuf`] with no
 /// lossy decoding (VRD-22). On unix the bytes become an `OsStr` verbatim, so a
-/// non-UTF-8 path round-trips exactly into the exclude pathspec. On a platform
-/// without `OsStrExt`, a non-UTF-8 path cannot be reconstructed byte-exact, so
-/// rather than risk staging a secret the exclude would miss, the pass fails.
+/// non-UTF-8 path round-trips exactly — into an exclude pathspec, or through the
+/// tracked-file audit unchanged. On a platform without `OsStrExt`, a non-UTF-8
+/// path cannot be reconstructed byte-exact, so rather than risk a secret the
+/// exclusion or audit would miss, the operation fails.
 #[cfg(unix)]
 fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
     use std::os::unix::ffi::OsStrExt;
@@ -1108,8 +1115,8 @@ fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
     match std::str::from_utf8(raw) {
         Ok(s) => Ok(PathBuf::from(s)),
         Err(_) => Err(VcsError::Parse(format!(
-            "untracked path is not valid UTF-8 and cannot be handled byte-exact on \
-             this platform, so it cannot be safely quarantined: {:?}",
+            "path is not valid UTF-8 and cannot be handled byte-exact on this \
+             platform, so secret scanning cannot act on it safely: {:?}",
             String::from_utf8_lossy(raw)
         ))),
     }
