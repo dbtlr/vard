@@ -119,7 +119,10 @@ fn tail_lines(files: &[PathBuf], n: usize) -> io::Result<Vec<u8>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut lines: VecDeque<Vec<u8>> = VecDeque::with_capacity(n);
+    // `n` is raw user input; cap the pre-allocation so a huge `-n` cannot
+    // reserve unbounded memory (or overflow capacity) up front — the deque
+    // still grows to the real line count on demand.
+    let mut lines: VecDeque<Vec<u8>> = VecDeque::with_capacity(n.min(4096));
     'outer: for path in files.iter().rev() {
         let content = std::fs::read(path)?;
         let mut segs: Vec<&[u8]> = content.split(|b| *b == b'\n').collect();
@@ -290,6 +293,17 @@ mod tests {
         let new = write(dir, "vard.log.2026-07-18", "b1\nb2\n");
         let out = tail_lines(&[old, new], 4).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "a2\na3\nb1\nb2\n");
+    }
+
+    #[test]
+    fn tail_huge_n_does_not_overallocate_or_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let f = write(dir, "vard.log.2026-07-18", "l1\nl2\n");
+        // A pathological -n must not pre-reserve `n` slots (capacity overflow
+        // panics at usize::MAX; huge-but-valid values reserve absurd memory).
+        let out = tail_lines(&[f], usize::MAX).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "l1\nl2\n");
     }
 
     #[test]
