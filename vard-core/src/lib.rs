@@ -20,13 +20,14 @@ pub mod event;
 pub mod excludes;
 pub mod gate;
 pub mod scheduler;
+pub mod secret_scan;
 pub mod timefmt;
 pub mod vcs;
 pub mod watcher;
 
 pub use config::{
-    ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SYNC,
-    DEFAULT_SYNC_INTERVAL, DEFAULT_TRIGGER, TriggerMode, WatchSpec, WatchSpecBuilder,
+    ConfigError, DEFAULT_INTERVAL, DEFAULT_QUIESCE, DEFAULT_REMOTE, DEFAULT_SECRET_SCAN,
+    DEFAULT_SYNC, DEFAULT_SYNC_INTERVAL, DEFAULT_TRIGGER, TriggerMode, WatchSpec, WatchSpecBuilder,
     parse_duration,
 };
 pub use engine::{
@@ -42,6 +43,7 @@ pub use event::{
 };
 pub use gate::{NoOpGate, OpGate, OpGateError, OpGuard, SharedGate};
 pub use scheduler::{ScheduleHandle, Scheduler, SchedulerError, SchedulerRx, SchedulerSignal};
+pub use secret_scan::{MAX_SCAN_BYTES, SecretMatch, SecretReason, SecretScanError, SecretScanner};
 pub use vcs::git::GitBackend;
 pub use vcs::{
     AdvanceOutcome, ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome,
