@@ -413,9 +413,11 @@ probe, which `--offline` skips):
   health-file   whether the daemon's health file is fresh; a running daemon
                 whose file has gone stale `warn`s. A daemon that is not running
                 is a legitimate state, reported `ok` with a note
-  request-dir   stale leftovers a crashed request writer stranded in the queue;
-                `warn`s with the file names and a note that they are safe to
-                delete (doctor flags them, it does not delete them)
+  request-dir   stale files in the request queue; `warn`s with the file names,
+                distinguishing crashed-writer temp files (safe to delete),
+                settled requests piling up unconsumed (usually: no daemon
+                running), and unrecognized files vard did not write
+                (investigate before deleting). Doctor flags, it never deletes
   secret-audit  per configured watch, whether any already-tracked file has a
                 secret-shaped NAME (`.env`, `id_rsa`, `*.pem`, plus the watch's
                 extra patterns). The complement to snapshot quarantine, which
