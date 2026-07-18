@@ -39,10 +39,11 @@ pub(crate) use vard_core::timefmt;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use std::time::Duration;
 
-use vard_core::{GitBackend, VcsBackend, VcsError, WatchSpec};
+use vard_core::{GitBackend, SecretScanner, VcsBackend, VcsError, WatchSpec};
 
 use crate::config::{Config, ConfigError, ResolvedWatch};
 use crate::journal::JournalOpGate;
@@ -114,6 +115,19 @@ fn select_one(config: &Config, target: &str) -> Result<ResolvedWatch, CmdError> 
 fn open_backend(spec: &WatchSpec) -> Result<GitBackend, CmdError> {
     vard_core::open_git_backend(spec)
         .map_err(|e| CmdError::err(format!("opening watch {:?}: {e}", spec.name())))
+}
+
+/// Compiles a watch's secret scanner (VRD-22) from its resolved spec — the same
+/// `SecretScanner::compile(secret_scan, secret_patterns)` the engine performs
+/// per watch. Always returns a scanner (disabled when `secret_scan = false`),
+/// so the in-process snapshot paths quarantine exactly as the daemon's passes
+/// do. A bad extra pattern is a command error whose wording mirrors the engine's
+/// `EngineError::SecretScan` (`watch "<name>": invalid secret pattern …`), so a
+/// misconfiguration reads the same however it surfaces.
+fn compile_scanner(spec: &WatchSpec) -> Result<Arc<SecretScanner>, CmdError> {
+    SecretScanner::compile(spec.secret_scan(), spec.secret_patterns())
+        .map(Arc::new)
+        .map_err(|source| CmdError::err(format!("watch {:?}: {source}", spec.name())))
 }
 
 /// How long a CLI operation waits for a watch's per-watch **operation lock**
@@ -206,15 +220,16 @@ fn with_op_gate<T>(
 
 /// Takes one in-process snapshot for the watch rooted at `repo_path` under the
 /// op-lock + journal bracket via [`with_op_gate`]. Returns the backend's own
-/// result untouched inside [`Gated`]; the caller maps it (and the busy case) to
-/// exit semantics.
+/// [`SnapshotReport`](vard_core::SnapshotReport) untouched inside [`Gated`] — both
+/// the commit (if any) and any quarantined secrets (VRD-22) — so the caller can
+/// report withheld files as well as map the busy case to exit semantics.
 fn journaled_snapshot(
     journal_dir: &std::path::Path,
     repo_path: &std::path::Path,
     watch_name: &str,
     backend: &GitBackend,
     req: &vard_core::SnapshotRequest,
-) -> Gated<Result<Option<vard_core::SnapshotOutcome>, VcsError>> {
+) -> Gated<Result<vard_core::SnapshotReport, VcsError>> {
     // In-process `snapshot` runs only while holding the instance lock (no daemon),
     // so the CLI is the sole vard actor — an op-gate error is non-fatal.
     with_op_gate(

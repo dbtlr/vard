@@ -13,13 +13,30 @@
 //! keys and sections are rejected with an error naming the offender, so a typo
 //! (`[default]`, `qiesce`) cannot silently change behavior. The known-future
 //! surface from spec §12 is explicitly tolerated as opaque values until its
-//! owning tasks land typed models: top-level `[ai]` and `[update]`, and
-//! `secret_scan` in `[defaults]`/`[[watch]]`. Top-level `[daemon]` is typed
-//! (VRD-14; see [`DaemonConfig`]) since it is binary-level per ADR 0003. Hooks
-//! (VRD-21) are typed too: top-level `[hooks]`, per-watch `[watch.hooks]`, and
-//! `hook_timeout`/`hook_rate_limit` in `[defaults]`/`[[watch]]` — see the
-//! hook configuration docs below. The top-level `version` key remains the
-//! migration lever for real schema breaks.
+//! owning tasks land typed models: top-level `[ai]` and `[update]`. Top-level
+//! `[daemon]` is typed (VRD-14; see [`DaemonConfig`]) since it is binary-level
+//! per ADR 0003. Hooks (VRD-21) are typed: top-level `[hooks]`, per-watch
+//! `[watch.hooks]`, and `hook_timeout`/`hook_rate_limit` in
+//! `[defaults]`/`[[watch]]` — see the hook configuration docs below. Secret
+//! quarantine (VRD-22) is typed too: `secret_scan` and `secret_patterns` in
+//! `[defaults]`/`[[watch]]` — see the secret-scan configuration docs below.
+//! The top-level `version` key remains the migration lever for real schema
+//! breaks.
+//!
+//! # Secret-scan configuration (VRD-22)
+//!
+//! `secret_scan` (a bool, default [`vard_core::DEFAULT_SECRET_SCAN`]) toggles
+//! per-watch secret quarantine; it resolves watch override > `[defaults]` >
+//! the core constant, the same inheritance shape as `sync`. Because it is now
+//! typed, a non-bool value (`secret_scan = "yes"`) is a parse error naming the
+//! key rather than a silently-ignored one.
+//!
+//! `secret_patterns` (a list of gitignore-dialect filename patterns) adds extra
+//! secret filename shapes on top of the built-in
+//! [`SECRET_PATTERNS`](vard_core::excludes::SECRET_PATTERNS) catalog. Unlike the
+//! duration keys, a watch's `secret_patterns` *replaces* `[defaults].secret_patterns`
+//! when set (Option semantics, not element-wise merge); either way the resolved
+//! list is additive over the built-in catalog, never a replacement for it.
 //!
 //! # Hook configuration (VRD-21)
 //!
@@ -96,6 +113,7 @@ pub(crate) const WATCH_HOOK_EVENTS: &[&str] = &[
     "snapshot_completed",
     "snapshot_failed",
     "snapshot_skipped",
+    "snapshot_quarantined",
     "sync_pushed",
     "sync_pulled",
     "sync_conflict",
@@ -261,9 +279,15 @@ pub(crate) struct Defaults {
     pub sync: Option<bool>,
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub sync_interval: Option<Duration>,
-    /// Tolerated opaquely for the known-future spec §12 surface.
-    #[allow(dead_code)]
-    secret_scan: Option<toml::Value>,
+    /// Default for whether watches scan for leaked secrets (VRD-22),
+    /// overridable per watch. Falls back to [`vard_core::DEFAULT_SECRET_SCAN`]
+    /// when unset here and on the watch.
+    pub secret_scan: Option<bool>,
+    /// Default extra secret filename patterns (VRD-22), added on top of the
+    /// built-in catalog. A watch's own `secret_patterns` *replaces* this list
+    /// rather than appending to it (Option semantics); both are additive over
+    /// the built-in catalog.
+    pub secret_patterns: Option<Vec<String>>,
     /// Default hook command timeout (VRD-21), overridable per watch. Falls
     /// back to [`DEFAULT_HOOK_TIMEOUT`] when unset here and on the watch.
     #[serde(default, deserialize_with = "de::opt_duration")]
@@ -275,14 +299,15 @@ pub(crate) struct Defaults {
 }
 
 /// One `[[watch]]` table. `name` and `path` are required. Of the optional
-/// fields, five inherit from `[defaults]` before falling back to the core
-/// constants: `trigger`, `interval`, `quiesce`, `sync`, and `sync_interval`.
-/// `hook_timeout` and `hook_rate_limit` (VRD-21) also inherit from
-/// `[defaults]`, but fall back to the binary-side [`DEFAULT_HOOK_TIMEOUT`]/
-/// [`DEFAULT_HOOK_RATE_LIMIT`] rather than a core constant. `branch`,
-/// `remote`, `exclude`, and `poll_interval` have no `[defaults]` home and fall
-/// back to the core defaults directly. `hooks` (VRD-21) likewise has no
-/// `[defaults]` home — hook commands are per-watch by nature.
+/// fields, seven inherit from `[defaults]` before falling back to the core
+/// constants: `trigger`, `interval`, `quiesce`, `sync`, `sync_interval`,
+/// `secret_scan`, and `secret_patterns` (VRD-22). `hook_timeout` and
+/// `hook_rate_limit` (VRD-21) also inherit from `[defaults]`, but fall back to
+/// the binary-side [`DEFAULT_HOOK_TIMEOUT`]/[`DEFAULT_HOOK_RATE_LIMIT`] rather
+/// than a core constant. `branch`, `remote`, `exclude`, and `poll_interval`
+/// have no `[defaults]` home and fall back to the core defaults directly.
+/// `hooks` (VRD-21) likewise has no `[defaults]` home — hook commands are
+/// per-watch by nature.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WatchConfig {
@@ -312,9 +337,12 @@ pub(crate) struct WatchConfig {
     /// `vard watch pause` / `vard watch resume`; absent means not paused.
     #[serde(default)]
     pub paused: bool,
-    /// Tolerated opaquely for the known-future spec §12 surface.
-    #[allow(dead_code)]
-    secret_scan: Option<toml::Value>,
+    /// Per-watch override of `[defaults].secret_scan` (VRD-22).
+    pub secret_scan: Option<bool>,
+    /// Per-watch extra secret filename patterns (VRD-22). When set, *replaces*
+    /// `[defaults].secret_patterns` (Option semantics); both are additive over
+    /// the built-in catalog.
+    pub secret_patterns: Option<Vec<String>>,
     /// This watch's `[watch.hooks]` table (VRD-21): raw, unvalidated
     /// underscored event keys mapped to shell commands. Validated and
     /// converted to dotted event names during [`Config::resolve_all`]; see
@@ -529,6 +557,19 @@ impl Config {
             }
             if !watch.exclude.is_empty() {
                 builder = builder.exclude(watch.exclude.clone());
+            }
+            // secret_scan: watch > defaults > core default (the builder preset).
+            if let Some(secret_scan) = watch.secret_scan.or(self.defaults.secret_scan) {
+                builder = builder.secret_scan(secret_scan);
+            }
+            // secret_patterns: a watch's list REPLACES defaults if present
+            // (Option semantics); both sit on top of the built-in catalog.
+            if let Some(patterns) = watch
+                .secret_patterns
+                .as_ref()
+                .or(self.defaults.secret_patterns.as_ref())
+            {
+                builder = builder.secret_patterns(patterns.clone());
             }
 
             let spec = builder.build().map_err(|e| ConfigError::Watch {
@@ -1795,6 +1836,10 @@ update_available = "echo nope"
                 trigger: Trigger::Manual,
                 reason: SkipReason::Clean,
             },
+            Event::SnapshotQuarantined {
+                watch: "w".to_string(),
+                count: 1,
+            },
             Event::SyncPushed {
                 watch: "w".to_string(),
                 new_ref: "r".to_string(),
@@ -1874,5 +1919,121 @@ update_available = "echo nope"
             watch_set.is_disjoint(&daemon_set),
             "an event must belong to exactly one hook scope"
         );
+    }
+
+    // --- secret scan (VRD-22) ----------------------------------------------
+
+    #[test]
+    fn secret_scan_defaults_to_the_core_constant_when_unset() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "bare"
+path = "/data/bare"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].secret_scan(), vard_core::DEFAULT_SECRET_SCAN);
+        assert!(specs[0].secret_patterns().is_empty());
+    }
+
+    #[test]
+    fn secret_scan_inherits_from_defaults_section() {
+        // [defaults] chosen to differ from the core default (true) so the
+        // inheritance layer is distinguishable.
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+secret_scan = false
+secret_patterns = ["*.secret"]
+
+[[watch]]
+name = "plain"
+path = "/data/plain"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert!(!specs[0].secret_scan());
+        assert_eq!(specs[0].secret_patterns(), ["*.secret".to_string()]);
+    }
+
+    #[test]
+    fn secret_scan_watch_override_wins_over_defaults() {
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+secret_scan = true
+secret_patterns = ["*.default"]
+
+[[watch]]
+name = "custom"
+path = "/data/custom"
+secret_scan = false
+secret_patterns = ["*.custom", "creds.json"]
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert!(!specs[0].secret_scan());
+        // The watch's list REPLACES the defaults list (Option semantics), not
+        // merges with it: "*.default" is gone.
+        assert_eq!(
+            specs[0].secret_patterns(),
+            ["*.custom".to_string(), "creds.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_patterns_watch_replaces_defaults_and_sibling_inherits() {
+        // A watch that sets secret_patterns replaces the defaults list; a
+        // sibling that omits it still inherits the defaults list.
+        let config = Config::from_toml_str(
+            r#"
+version = 1
+
+[defaults]
+secret_patterns = ["*.default"]
+
+[[watch]]
+name = "overrides"
+path = "/data/overrides"
+secret_patterns = ["*.own"]
+
+[[watch]]
+name = "inherits"
+path = "/data/inherits"
+"#,
+        )
+        .unwrap();
+        let specs = config.resolve().unwrap();
+        assert_eq!(specs[0].secret_patterns(), ["*.own".to_string()]);
+        assert_eq!(specs[1].secret_patterns(), ["*.default".to_string()]);
+    }
+
+    #[test]
+    fn non_bool_secret_scan_is_a_strict_parse_error() {
+        // Previously tolerated as an opaque toml::Value; now a typed bool, so a
+        // string value is a clean, key-naming parse error.
+        let err = Config::from_toml_str(
+            r#"
+version = 1
+
+[[watch]]
+name = "w"
+path = "/data/w"
+secret_scan = "yes"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
+        assert!(err.to_string().contains("secret_scan"), "got: {err}");
     }
 }

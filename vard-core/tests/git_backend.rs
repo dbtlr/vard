@@ -13,8 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use vard_core::vcs::git::GitBackend;
 use vard_core::{
-    AdvanceOutcome, LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState, SnapshotId,
-    SnapshotOutcome, SnapshotRequest, Trigger, UnsafeReason, VcsBackend, VcsError, VcsRef,
+    AdvanceOutcome, LogFilter, PushOutcome, ReconcileOutcome, RestoreTarget, SafeState,
+    SecretReason, SecretScanner, SnapshotId, SnapshotOutcome, SnapshotRequest, Trigger,
+    UnsafeReason, VcsBackend, VcsError, VcsRef,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -88,9 +89,14 @@ fn write(dir: &Path, name: &str, content: &str) {
     fs::write(dir.join(name), content).unwrap();
 }
 
-/// Snapshots the whole tree with the given trigger.
+/// Snapshots the whole tree with the given trigger, returning the commit it
+/// produced (if any). A plain `SnapshotRequest::new` carries no scanner, so
+/// these helpers exercise the byte-identical no-quarantine path.
 fn snap(backend: &GitBackend, trigger: Trigger) -> Option<SnapshotOutcome> {
-    backend.snapshot(&SnapshotRequest::new(trigger)).unwrap()
+    backend
+        .snapshot(&SnapshotRequest::new(trigger))
+        .unwrap()
+        .committed
 }
 
 /// Like [`snap`], asserting a commit was made and returning its id.
@@ -518,8 +524,13 @@ fn snapshot_writes_user_text_and_extra_trailers() {
         trigger: Trigger::Manual,
         user_text: Some("before the demo".to_string()),
         extra_trailers: vec![("Vard-Host".to_string(), "laptop".to_string())],
+        scanner: None,
     };
-    backend.snapshot(&req).unwrap().expect("a commit was made");
+    backend
+        .snapshot(&req)
+        .unwrap()
+        .committed
+        .expect("a commit was made");
 
     let body = git(tmp.path(), &["log", "-1", "--format=%B"]);
     let body = String::from_utf8_lossy(&body.stdout);
@@ -537,12 +548,11 @@ fn snapshot_returns_none_on_a_clean_tree() {
     write(tmp.path(), "a.txt", "1\n");
     snap(&backend, Trigger::Manual);
     // Nothing changed since the last snapshot.
-    assert_eq!(
-        backend
-            .snapshot(&SnapshotRequest::new(Trigger::Interval))
-            .unwrap(),
-        None
-    );
+    let report = backend
+        .snapshot(&SnapshotRequest::new(Trigger::Interval))
+        .unwrap();
+    assert_eq!(report.committed, None);
+    assert!(report.quarantined.is_empty());
 }
 
 #[test]
@@ -571,6 +581,410 @@ fn snapshot_reports_lock_contention() {
     }
     // The backend must never remove the lock; that is the engine's job.
     assert!(git_dir(tmp.path()).join("index.lock").exists());
+}
+
+// --- secret quarantine (VRD-22) --------------------------------------------
+
+/// A snapshot request carrying an ENABLED scanner with the given extra
+/// filename patterns (on top of the built-in catalog).
+fn scanning_req(trigger: Trigger, extra: &[&str]) -> SnapshotRequest {
+    let patterns: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    let scanner = Arc::new(SecretScanner::compile(true, &patterns).unwrap());
+    SnapshotRequest {
+        trigger,
+        user_text: None,
+        extra_trailers: Vec::new(),
+        scanner: Some(scanner),
+    }
+}
+
+/// The names tracked in `HEAD` (the committed tree), sorted.
+fn tracked(dir: &Path) -> Vec<String> {
+    let out = git(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(out.status.success(), "ls-tree failed");
+    let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn quarantine_withholds_a_token_secret_and_reports_the_match() {
+    let (tmp, backend) = new_repo();
+    // A file whose CONTENT is a credential (AWS access key), name innocuous.
+    write(tmp.path(), "creds.txt", "aws_key = AKIAIOSFODNN7EXAMPLE\n");
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    // The secret was the only change, so nothing was committed...
+    assert_eq!(report.committed, None);
+    // ...but the withheld match is reported, with a content reason and no bytes.
+    assert_eq!(report.quarantined.len(), 1);
+    assert_eq!(report.quarantined[0].path, PathBuf::from("creds.txt"));
+    assert!(matches!(
+        report.quarantined[0].reason,
+        SecretReason::TokenPrefix { .. }
+    ));
+    // The file is untracked (never staged), and still on disk unharmed.
+    assert!(
+        git(tmp.path(), &["ls-files", "--error-unmatch", "creds.txt"])
+            .status
+            .code()
+            != Some(0)
+    );
+    assert!(tmp.path().join("creds.txt").exists());
+}
+
+#[test]
+fn quarantine_commits_legit_change_and_excludes_the_secret_beside_it() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "app.rs", "fn main() {}\n");
+    write(tmp.path(), ".env", "TOKEN=hunter2\n"); // matches the `.env` catalog pattern
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Manual, &[]))
+        .unwrap();
+
+    // The legit file committed; the secret is withheld, not blocked.
+    let committed = report.committed.expect("the legit change was committed");
+    assert_eq!(committed.summary.added, 1);
+    assert_eq!(report.quarantined.len(), 1);
+    assert_eq!(report.quarantined[0].path, PathBuf::from(".env"));
+    assert!(matches!(
+        report.quarantined[0].reason,
+        SecretReason::FilenamePattern { .. }
+    ));
+    // The commit contains app.rs and NOT .env.
+    assert_eq!(tracked(tmp.path()), vec!["app.rs".to_string()]);
+    // .env remains on disk, untracked.
+    assert!(tmp.path().join(".env").exists());
+}
+
+#[test]
+fn quarantine_only_pass_commits_nothing_then_clears_when_the_secret_is_removed() {
+    let (tmp, backend) = new_repo();
+    write(
+        tmp.path(),
+        "id_rsa",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    );
+
+    // Pass 1: only a secret present → no commit, but reported.
+    let first = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+    assert_eq!(first.committed, None);
+    assert_eq!(first.quarantined.len(), 1);
+    assert_eq!(first.quarantined[0].path, PathBuf::from("id_rsa"));
+
+    // The user removes the secret; the next pass is clean with nothing withheld.
+    fs::remove_file(tmp.path().join("id_rsa")).unwrap();
+    let second = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+    assert_eq!(second.committed, None);
+    assert!(second.quarantined.is_empty());
+}
+
+#[test]
+fn quarantine_matches_an_extra_pattern_not_in_the_builtin_catalog() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "readme.md", "hello\n");
+    write(tmp.path(), "prod.secret", "anything\n"); // only matched via the extra
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Manual, &["*.secret"]))
+        .unwrap();
+
+    assert!(report.committed.is_some());
+    assert_eq!(report.quarantined.len(), 1);
+    assert_eq!(report.quarantined[0].path, PathBuf::from("prod.secret"));
+    match &report.quarantined[0].reason {
+        SecretReason::FilenamePattern { pattern } => assert_eq!(pattern, "*.secret"),
+        other => panic!("expected FilenamePattern, got {other:?}"),
+    }
+    assert_eq!(tracked(tmp.path()), vec!["readme.md".to_string()]);
+}
+
+#[test]
+fn quarantine_recurses_an_untracked_directory_file_by_file() {
+    let (tmp, backend) = new_repo();
+    fs::create_dir(tmp.path().join(".aws")).unwrap();
+    // A `.aws/` dir dropped in wholesale: only its secret member is withheld.
+    write(
+        tmp.path(),
+        ".aws/credentials",
+        "aws_key = AKIAIOSFODNN7EXAMPLE\n",
+    );
+    write(tmp.path(), ".aws/config", "region = us-east-1\n");
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    // The non-secret member committed; the secret member is withheld — proof the
+    // directory was scanned member by member, not excluded wholesale.
+    assert!(report.committed.is_some());
+    assert_eq!(report.quarantined.len(), 1);
+    assert_eq!(
+        report.quarantined[0].path,
+        PathBuf::from(".aws/credentials")
+    );
+    assert_eq!(tracked(tmp.path()), vec![".aws/config".to_string()]);
+    assert!(tmp.path().join(".aws/credentials").exists());
+}
+
+#[test]
+fn a_disabled_scanner_commits_the_secret_verbatim() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), ".env", "TOKEN=AKIAIOSFODNN7EXAMPLE\n");
+    // A disabled scanner (secret_scan = false) flags nothing, so the sweep is
+    // the plain total add: the secret is committed, none withheld.
+    let scanner = Arc::new(SecretScanner::compile(false, &[]).unwrap());
+    let req = SnapshotRequest {
+        trigger: Trigger::Event,
+        user_text: None,
+        extra_trailers: Vec::new(),
+        scanner: Some(scanner),
+    };
+    let report = backend.snapshot(&req).unwrap();
+    assert!(report.committed.is_some());
+    assert!(report.quarantined.is_empty());
+    assert_eq!(tracked(tmp.path()), vec![".env".to_string()]);
+}
+
+#[test]
+fn no_scanner_request_is_byte_identical_and_commits_a_secret() {
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), ".env", "TOKEN=AKIAIOSFODNN7EXAMPLE\n");
+    // `SnapshotRequest::new` carries no scanner: the historical total sweep,
+    // which commits the secret and quarantines nothing.
+    let report = backend
+        .snapshot(&SnapshotRequest::new(Trigger::Event))
+        .unwrap();
+    assert!(report.committed.is_some());
+    assert!(report.quarantined.is_empty());
+    assert_eq!(tracked(tmp.path()), vec![".env".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn quarantine_scans_only_regular_files_never_symlinks() {
+    use std::os::unix::fs::symlink;
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "real.txt", "just text\n");
+    // A symlink whose NAME matches a secret filename pattern (`id_rsa`), pointing
+    // at a regular file: git commits it as its link string, never the target's
+    // content, so it can never leak — it must be neither scanned nor quarantined.
+    symlink("real.txt", tmp.path().join("id_rsa")).unwrap();
+    // A DANGLING symlink whose name also matches a pattern (`.env`): same
+    // treatment, and it must never be followed (its target does not exist).
+    symlink("nowhere", tmp.path().join(".env")).unwrap();
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    assert!(
+        report.quarantined.is_empty(),
+        "symlinks must never be quarantined: {:?}",
+        report.quarantined
+    );
+    let names = tracked(tmp.path());
+    assert!(
+        names.contains(&"id_rsa".to_string()),
+        "the symlink commits as a link: {names:?}"
+    );
+    assert!(
+        names.contains(&".env".to_string()),
+        "the dangling symlink commits as a link: {names:?}"
+    );
+    assert!(names.contains(&"real.txt".to_string()));
+    // git stored id_rsa as a symlink (mode 120000) — the link string, not the
+    // target's content — direct proof nothing was read through it.
+    let ls = git(tmp.path(), &["ls-files", "-s", "id_rsa"]);
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).starts_with("120000"),
+        "id_rsa must be committed as a symlink, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn quarantine_does_not_hang_or_read_a_fifo() {
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "keep.txt", "hi\n");
+    // The real wedge vector: git does not list a bare FIFO as an untracked
+    // candidate, but it DOES list a symlink — and a symlink whose name matches
+    // no filename pattern previously fell through to the content layer, where
+    // a blocking `open()` follows the link into the FIFO and never returns.
+    // Only regular files may be scan candidates; the snapshot must return
+    // promptly without ever opening the link target.
+    let status = Command::new("mkfifo")
+        .arg(tmp.path().join("pipe"))
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo failed");
+    symlink("pipe", tmp.path().join("data.bin")).expect("symlink to fifo");
+
+    // Run the snapshot on a worker thread and bound it: on regression (a blocking
+    // open of the FIFO) this fails after the timeout instead of hanging forever.
+    let (tx, rx) = mpsc::channel();
+    let backend2 = backend.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(backend2.snapshot(&scanning_req(Trigger::Event, &[])));
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("snapshot hung on a FIFO (did not return within 10s)")
+        .unwrap();
+
+    assert!(
+        report.quarantined.is_empty(),
+        "a non-regular candidate is never scanned or quarantined"
+    );
+    // The regular file still commits; the symlink commits as a link string
+    // (mode 120000); git itself does not track a bare FIFO.
+    assert!(tracked(tmp.path()).contains(&"keep.txt".to_string()));
+    let ls = git(tmp.path(), &["ls-files", "-s", "data.bin"]);
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).starts_with("120000"),
+        "data.bin must be committed as a symlink, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}
+
+// Linux-only: macOS (APFS/HFS+) and the BSDs reject non-UTF-8 filenames at the
+// filesystem layer (EILSEQ), so the case can only be exercised where the kernel
+// permits such names. The code path itself is unix-wide (`bytes_to_path` uses
+// `OsStrExt` on every unix); this test just needs a filesystem that will hold
+// the name.
+#[cfg(target_os = "linux")]
+#[test]
+fn quarantine_is_byte_exact_under_a_non_utf8_directory() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let (tmp, backend) = new_repo();
+
+    // A directory whose name carries a non-UTF-8 byte (legal on Linux).
+    let mut dir_name = b"dir-".to_vec();
+    dir_name.push(0xFF);
+    let dir = tmp.path().join(OsStr::from_bytes(&dir_name));
+    fs::create_dir(&dir).unwrap();
+    // A valid-UTF-8 secret FILENAME nested under it, with innocuous content, so
+    // only the filename layer can catch it: a hit proves path-layer matching
+    // works even under a non-UTF-8 parent.
+    fs::write(dir.join(".env"), "innocuous\n").unwrap();
+    write(tmp.path(), "keep.txt", "hi\n");
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    // The legit file committed; exactly one secret was withheld, its path
+    // byte-exact (no lossy U+FFFD substitution).
+    assert!(report.committed.is_some());
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the nested .env must be withheld"
+    );
+    let mut expected = b"dir-".to_vec();
+    expected.push(0xFF);
+    expected.extend_from_slice(b"/.env");
+    assert_eq!(
+        report.quarantined[0].path.as_os_str().as_bytes(),
+        &expected[..],
+        "the withheld path must be byte-exact"
+    );
+
+    // Prove the withhold via the COMMITTED TREE, not the report: the exclusion
+    // byte-matched, so the secret is absent from HEAD while keep.txt is present.
+    let tree = git(tmp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD"]);
+    assert!(tree.status.success(), "ls-tree failed");
+    let committed: Vec<&[u8]> = tree
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert!(
+        committed.contains(&b"keep.txt".as_slice()),
+        "keep.txt must be committed"
+    );
+    assert!(
+        !committed.contains(&expected.as_slice()),
+        "the non-UTF-8 secret path must NOT be in the commit"
+    );
+    // Still on disk, untracked.
+    assert!(dir.join(".env").exists());
+}
+
+// --- tracked-file audit (VRD-22) -------------------------------------------
+
+#[test]
+fn tracked_files_lists_committed_paths_and_is_empty_on_an_unborn_repo() {
+    let (tmp, backend) = new_repo();
+    // Nothing committed yet: an unborn HEAD lists no tracked files (not an error).
+    assert!(backend.tracked_files().unwrap().is_empty());
+
+    write(tmp.path(), "main.rs", "fn main() {}\n");
+    write(
+        tmp.path(),
+        "id_rsa",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    );
+    // Commit both directly (no scanner) so they become TRACKED — the audit's
+    // domain, exactly the case quarantine cannot reach (already committed).
+    git_ok(tmp.path(), &["add", "-A"]);
+    git_ok(tmp.path(), &["commit", "-m", "seed", "--no-verify"]);
+
+    let mut tracked = backend.tracked_files().unwrap();
+    tracked.sort();
+    assert_eq!(
+        tracked,
+        vec![PathBuf::from("id_rsa"), PathBuf::from("main.rs")]
+    );
+}
+
+#[test]
+fn audit_reports_a_precommitted_secret_name_and_nothing_on_a_clean_repo() {
+    // A pre-committed `id_rsa` is reported by the audit...
+    let (tmp, backend) = new_repo();
+    write(
+        tmp.path(),
+        "id_rsa",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    );
+    write(tmp.path(), "main.rs", "fn main() {}\n");
+    git_ok(tmp.path(), &["add", "-A"]);
+    git_ok(tmp.path(), &["commit", "-m", "seed", "--no-verify"]);
+
+    let scanner = SecretScanner::compile(true, &[]).unwrap();
+    let hits = scanner.audit_tracked(&backend.tracked_files().unwrap());
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, PathBuf::from("id_rsa"));
+    assert!(matches!(
+        hits[0].reason,
+        SecretReason::FilenamePattern { .. }
+    ));
+
+    // ...and a repo with no secret-shaped names audits clean.
+    let (tmp2, backend2) = new_repo();
+    write(tmp2.path(), "main.rs", "fn main() {}\n");
+    git_ok(tmp2.path(), &["add", "-A"]);
+    git_ok(tmp2.path(), &["commit", "-m", "seed", "--no-verify"]);
+    assert!(
+        scanner
+            .audit_tracked(&backend2.tracked_files().unwrap())
+            .is_empty()
+    );
 }
 
 // --- log -------------------------------------------------------------------

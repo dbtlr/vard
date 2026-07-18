@@ -120,6 +120,18 @@ pub enum Event {
         /// Why nothing was committed.
         reason: SkipReason,
     },
+    /// A snapshot pass withheld one or more newly-added files from the commit as
+    /// likely secrets (VRD-22). Emitted *alongside* the pass's completion or
+    /// skip outcome (it does not replace them) whenever a pass quarantines at
+    /// least one file, so a reactor can react to the withholding — surface it,
+    /// notify, or run a hook — without inspecting watch state. Carries only the
+    /// count, never the paths or any secret bytes.
+    SnapshotQuarantined {
+        /// Stable name of the watch whose pass quarantined files.
+        watch: String,
+        /// How many files this pass withheld as likely secrets (always ≥ 1).
+        count: usize,
+    },
     /// Local snapshots were pushed to the remote.
     SyncPushed {
         /// Stable name of the watch.
@@ -227,6 +239,7 @@ impl Event {
             Event::SnapshotCompleted { .. } => "snapshot.completed",
             Event::SnapshotFailed { .. } => "snapshot.failed",
             Event::SnapshotSkipped { .. } => "snapshot.skipped",
+            Event::SnapshotQuarantined { .. } => "snapshot.quarantined",
             Event::SyncPushed { .. } => "sync.pushed",
             Event::SyncPulled { .. } => "sync.pulled",
             Event::SyncConflict { .. } => "sync.conflict",
@@ -366,13 +379,16 @@ impl fmt::Display for WatchState {
 ///   successful pass on this exact watch is direct evidence it recovered.
 /// - **Latching** (`latches() == true`): a successful pass on this worker
 ///   proves *nothing* about the condition, so the engine must never guess
-///   `Ok` on its own. That covers two different shapes for the same reason:
-///   a human-decision condition (moving a secret out of a snapshot,
-///   acknowledging a moved directory — none exist in this codebase yet) where
-///   only an explicit operator action may resolve it, and [`SourceDied`](TroubleKind::SourceDied),
-///   where only the daemon replacing this worker outright proves the signal
-///   source is alive again — a commit this same (dying) worker manages to
-///   make in the meantime says nothing about that.
+///   `Ok` on its own. The one shipping latching kind is
+///   [`SourceDied`](TroubleKind::SourceDied), where only the daemon replacing
+///   this worker outright proves the signal source is alive again — a commit
+///   this same (dying) worker manages to make in the meantime says nothing
+///   about that. (Secret quarantine might look like a human-decision latch —
+///   "move the secret out" — but it is *self-clearing*: with quarantine
+///   re-derived every pass from the working tree, a pass that finds no secret
+///   is direct proof the condition is gone, and a pass that still finds one
+///   re-asserts [`SecretsQuarantined`](TroubleKind::SecretsQuarantined) on its
+///   own. No acknowledgement verb, no durable state — see that variant.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TroubleKind {
@@ -399,6 +415,22 @@ pub enum TroubleKind {
     ///
     /// Self-clearing: this watch's own next successful pass clears it.
     SnapshotsFailing,
+    /// This watch's most recent snapshot pass withheld one or more newly-added
+    /// files from the commit as likely secrets (VRD-22). Carries the count of
+    /// files quarantined by that pass.
+    ///
+    /// Self-clearing: quarantine holds no durable state and has no
+    /// acknowledgement verb — it is re-derived from the working tree every pass.
+    /// A later pass that finds no secret is direct proof the condition is gone
+    /// (the engine returns the watch to `Ok`); a pass that still finds one
+    /// re-asserts this trouble with the current count. Moving the secret out of
+    /// the watch is what a user does to resolve it, but the *engine* learns that
+    /// from the next clean pass, not from any explicit acknowledgement — which
+    /// is exactly what makes this self-clearing rather than latching.
+    SecretsQuarantined {
+        /// How many files the most recent pass withheld as likely secrets.
+        count: usize,
+    },
     /// Any other condition needing attention: a channel overflow, a panicked
     /// backend call, and so on. The signal source itself is still alive.
     ///
@@ -413,6 +445,7 @@ impl fmt::Display for TroubleKind {
         let s = match self {
             TroubleKind::SourceDied => "source-died",
             TroubleKind::SnapshotsFailing => "snapshots-failing",
+            TroubleKind::SecretsQuarantined { .. } => "secrets-quarantined",
             TroubleKind::Degraded => "degraded",
         };
         f.write_str(s)
@@ -437,6 +470,7 @@ impl TroubleKind {
         match self {
             TroubleKind::SourceDied => true,
             TroubleKind::SnapshotsFailing => false,
+            TroubleKind::SecretsQuarantined { .. } => false,
             TroubleKind::Degraded => false,
         }
     }
@@ -660,6 +694,13 @@ mod tests {
                 "snapshot.skipped",
             ),
             (
+                Event::SnapshotQuarantined {
+                    watch: "w".to_string(),
+                    count: 2,
+                },
+                "snapshot.quarantined",
+            ),
+            (
                 Event::SyncPushed {
                     watch: "w".to_string(),
                     new_ref: "abc".to_string(),
@@ -757,6 +798,10 @@ mod tests {
             TroubleKind::SnapshotsFailing.to_string(),
             "snapshots-failing"
         );
+        assert_eq!(
+            TroubleKind::SecretsQuarantined { count: 3 }.to_string(),
+            "secrets-quarantined"
+        );
         assert_eq!(TroubleKind::Degraded.to_string(), "degraded");
 
         assert_eq!(SkipReason::Clean.to_string(), "clean");
@@ -774,6 +819,13 @@ mod tests {
         // next successful pass is direct proof they are gone.
         assert!(!TroubleKind::SnapshotsFailing.latches());
         assert!(!TroubleKind::Degraded.latches());
+    }
+
+    #[test]
+    fn secrets_quarantined_self_clears_because_it_is_re_derived_each_pass() {
+        // Quarantine holds no durable state: the next pass finding no secret is
+        // direct proof the condition is gone, so it must not latch.
+        assert!(!TroubleKind::SecretsQuarantined { count: 1 }.latches());
     }
 
     #[test]

@@ -186,6 +186,7 @@ Syncing, the paused flag, the path, and the name each have their own verb and ar
 - **paused** — [`vard watch pause`](#pause--resume) / `resume`.
 - **path** — re-run [`vard watch add`](#add) at the new location to relink a moved directory.
 - **name** and **exclude** — not editable through `set`.
+- **secret scanning** (`secret_scan` / `secret_patterns`) — config-file-only; edit them in `[defaults]` or the watch's `[[watch]]` table with [`vard config edit`](config.md#secret-scanning-secret_scan--secret_patterns). There is no `watch set` flag (a per-watch boolean like this has no dedicated verb, and `secret_patterns` is a list).
 
 ## pause / resume
 

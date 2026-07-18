@@ -27,7 +27,7 @@ use tokio::time::timeout;
 use vard_core::{
     AdvanceOutcome, ChangeSummary, Engine, Event, EventReceiver, LogFilter, PushOutcome,
     ReconcileOutcome, RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome,
-    SnapshotRequest, TriggerMode, VcsBackend, VcsError, VcsRef, WatchSpec,
+    SnapshotReport, SnapshotRequest, TriggerMode, VcsBackend, VcsError, VcsRef, WatchSpec,
 };
 
 /// A short quiescence window: long enough to absorb event-delivery latency,
@@ -75,25 +75,32 @@ impl VcsBackend for FakeBackend {
         Ok(self.dirty.load(Ordering::SeqCst))
     }
 
-    fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
+    fn snapshot(&self, _req: &SnapshotRequest) -> Result<SnapshotReport, VcsError> {
         if self.dirty.swap(false, Ordering::SeqCst) {
             self.committed.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(SnapshotOutcome {
-                id: SnapshotId::new("cafef00d"),
-                summary: ChangeSummary {
-                    changed: 1,
-                    added: 0,
-                    deleted: 0,
-                    notable: vec!["notes.md".to_string()],
-                },
-            }))
+            Ok(SnapshotReport {
+                committed: Some(SnapshotOutcome {
+                    id: SnapshotId::new("cafef00d"),
+                    summary: ChangeSummary {
+                        changed: 1,
+                        added: 0,
+                        deleted: 0,
+                        notable: vec!["notes.md".to_string()],
+                    },
+                }),
+                quarantined: Vec::new(),
+            })
         } else {
-            Ok(None)
+            Ok(SnapshotReport::default())
         }
     }
 
     fn log(&self, _filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError> {
         Ok(Vec::new())
+    }
+
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        unimplemented!("tracked_files is out of scope for the snapshot engine")
     }
 
     fn diff(
@@ -282,9 +289,9 @@ impl VcsBackend for GatedBackend {
         Ok(self.dirty.load(Ordering::SeqCst))
     }
 
-    fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
+    fn snapshot(&self, _req: &SnapshotRequest) -> Result<SnapshotReport, VcsError> {
         if !self.dirty.swap(false, Ordering::SeqCst) {
-            return Ok(None);
+            return Ok(SnapshotReport::default());
         }
         // A dirty commit: park on the gate if one is installed, so the test can
         // hold the pass in flight across a shutdown.
@@ -294,19 +301,26 @@ impl VcsBackend for GatedBackend {
             self.at_gate.store(false, Ordering::SeqCst);
         }
         self.committed.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(SnapshotOutcome {
-            id: SnapshotId::new("beadfeed"),
-            summary: ChangeSummary {
-                changed: 1,
-                added: 0,
-                deleted: 0,
-                notable: vec!["notes.md".to_string()],
-            },
-        }))
+        Ok(SnapshotReport {
+            committed: Some(SnapshotOutcome {
+                id: SnapshotId::new("beadfeed"),
+                summary: ChangeSummary {
+                    changed: 1,
+                    added: 0,
+                    deleted: 0,
+                    notable: vec!["notes.md".to_string()],
+                },
+            }),
+            quarantined: Vec::new(),
+        })
     }
 
     fn log(&self, _filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError> {
         Ok(Vec::new())
+    }
+
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        unimplemented!("tracked_files is out of scope for the snapshot engine")
     }
 
     fn diff(

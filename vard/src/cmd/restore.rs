@@ -104,6 +104,12 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
         return dry_run(&out, &backend, &rev, file.as_deref(), name);
     }
 
+    // Compile the watch's secret scanner (VRD-22) for the protective pre-restore
+    // snapshot: a newly-added secret must not be swept into history right before
+    // a restore any more than during a normal pass. Withholding it loses nothing
+    // — a never-tracked file is untouched by the checkout, so it stays on disk.
+    let scanner = super::compile_scanner(&rw.spec)?;
+
     // Instance-lock dispatch is unchanged (who SHOULD do the work); journaling is
     // now the per-watch op lock's job (who MAY mutate), so BOTH branches journal
     // under the op gate — including the daemon-running case, closing the VRD-16
@@ -122,6 +128,7 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
                 file.as_deref(),
                 name,
                 super::OpGateActor::Sole,
+                &scanner,
             );
             drop(lock);
             result
@@ -140,6 +147,7 @@ fn run_inner(args: RestoreArgs, color: ColorWhen, format: Option<OutputFormat>) 
             file.as_deref(),
             name,
             super::OpGateActor::DaemonCoexists,
+            &scanner,
         ),
         Ok(CliLock::BusyPeerCli) => Err(CmdError::err(
             "another vard command is running; retry in a moment",
@@ -163,6 +171,7 @@ fn real_restore(
     file: Option<&Path>,
     name: &str,
     actor: super::OpGateActor,
+    scanner: &std::sync::Arc<vard_core::SecretScanner>,
 ) -> CmdResult {
     // Protective snapshot first — a real restore may never destroy the only
     // copy of uncommitted work. The repo must be safe to commit into to protect
@@ -185,6 +194,11 @@ fn real_restore(
         trigger: Trigger::PreRestore,
         user_text: Some(format!("pre-restore snapshot before restoring to {rev}")),
         extra_trailers: Vec::new(),
+        // Scan the protective snapshot too (VRD-22): a newly-added secret is
+        // withheld here just as in any pass. This never loses data — the withheld
+        // file is untracked, so the checkout that follows leaves it on disk
+        // untouched.
+        scanner: Some(scanner.clone()),
     };
     let target = RestoreTarget {
         rev: rev.clone(),
@@ -196,7 +210,16 @@ fn real_restore(
     // no nested bracket that would clobber the outer `restore` one.
     let flow = || -> Result<Option<SnapshotOutcome>, CmdError> {
         let protective = match backend.snapshot(&req) {
-            Ok(outcome) => outcome,
+            Ok(report) => {
+                // Surface any withheld secrets on stderr exactly as `vard
+                // snapshot` does — a pre-restore withhold must never be silent.
+                // The restore then proceeds: the withheld files are untracked, so
+                // the checkout leaves them on disk untouched.
+                if !report.quarantined.is_empty() {
+                    super::snapshot::warn_quarantined(name, &report.quarantined);
+                }
+                report.committed
+            }
             Err(VcsError::UnsafeState(reason)) => {
                 return Err(CmdError::attention(format!(
                     "cannot restore {name:?}: repository became unsafe ({reason}); \

@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use vard_core::{
-    CommitMessage, SafeState, SnapshotOutcome, SnapshotRequest, Trigger, UnsafeReason, VcsBackend,
-    VcsError,
+    CommitMessage, SafeState, SecretMatch, SnapshotOutcome, SnapshotReport, SnapshotRequest,
+    Trigger, UnsafeReason, VcsBackend, VcsError,
 };
 
 use super::{
@@ -134,10 +134,25 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
         }
     }
 
+    // Compile the watch's secret scanner (VRD-22) just as the daemon does, so an
+    // in-process manual snapshot quarantines newly-added secrets exactly as a
+    // daemon pass would. A bad `secret_patterns` fails the watch with the config
+    // error rather than silently snapshotting unscanned.
+    let scanner = match super::compile_scanner(spec) {
+        Ok(scanner) => scanner,
+        Err(e) => {
+            return (
+                result_record(name, "error", Some(e.message()), None, None),
+                2,
+            );
+        }
+    };
+
     let req = SnapshotRequest {
         trigger: Trigger::Manual,
         user_text: message.map(str::to_string),
         extra_trailers: Vec::new(),
+        scanner: Some(scanner),
     };
 
     match journaled_snapshot(&paths.journal_dir, spec.path(), name, &backend, &req) {
@@ -155,8 +170,7 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
         // In-process snapshot is a sole vard actor, so `with_op_gate` never fails
         // closed here; handle it defensively as an error rather than panicking.
         Gated::LockFailed(detail) => (result_record(name, "error", Some(&detail), None, None), 2),
-        Gated::Ran(Ok(Some(outcome))) => (committed_record(name, &outcome), 0),
-        Gated::Ran(Ok(None)) => (result_record(name, "no changes", None, None, None), 0),
+        Gated::Ran(Ok(report)) => snapshot_result(name, report),
         Gated::Ran(Err(VcsError::UnsafeState(reason))) => (
             result_record(name, "unsafe", Some(&unsafe_detail(&reason)), None, None),
             1,
@@ -235,15 +249,82 @@ fn unsafe_detail(reason: &UnsafeReason) -> String {
     )
 }
 
+/// Maps a completed in-process snapshot [`SnapshotReport`] to its result record
+/// and exit code (VRD-22). Quarantine is a **warning, not a failure**: a pass
+/// that withheld secrets still exits `0` if the snapshot itself succeeded, but it
+/// is never silent — the withheld paths and why are printed to stderr (an
+/// output-class warning, distinct from the stdout result record). The three
+/// dispositions:
+///
+/// * a commit (with or without a withhold beside it) → `committed`;
+/// * nothing committed but something withheld → `quarantined` (not `no changes`,
+///   which would hide that a change *was* seen and held back);
+/// * a clean tree with nothing withheld → `no changes`.
+fn snapshot_result(name: &str, report: SnapshotReport) -> (Record, u8) {
+    let withheld = report.quarantined.len();
+    if !report.quarantined.is_empty() {
+        warn_quarantined(name, &report.quarantined);
+    }
+    match report.committed {
+        Some(outcome) => (committed_record(name, &outcome, withheld), 0),
+        None if withheld > 0 => (
+            result_record(
+                name,
+                "quarantined",
+                Some(&withheld_detail(withheld)),
+                None,
+                None,
+            ),
+            0,
+        ),
+        None => (result_record(name, "no changes", None, None, None), 0),
+    }
+}
+
+/// Prints the quarantine warning to **stderr** (an output-class warning, kept off
+/// the stdout result stream): the count, then each withheld path and its reason
+/// family, then how to include one anyway. It names paths and reason families
+/// only — never any file content (a [`SecretMatch`] carries none).
+///
+/// Shared with `restore`'s protective snapshot ([`super::restore`]) so a
+/// withhold during a pre-restore snapshot is surfaced identically, never
+/// silently dropped.
+pub(super) fn warn_quarantined(name: &str, withheld: &[SecretMatch]) {
+    eprintln!(
+        "vard: {name}: {} — each stays on disk, uncommitted:",
+        withheld_detail(withheld.len())
+    );
+    for m in withheld {
+        eprintln!("vard:   {} — {}", m.path.display(), m.reason);
+    }
+    eprintln!(
+        "vard: to snapshot one anyway, move it out of the watch, or set `secret_scan = false` \
+         for this watch to turn scanning off"
+    );
+}
+
+/// The one-line "N file(s) withheld as likely secret(s)" phrasing shared by the
+/// result record's `detail` and the stderr warning's lead line.
+fn withheld_detail(count: usize) -> String {
+    if count == 1 {
+        "withheld 1 newly-added file as a likely secret".to_string()
+    } else {
+        format!("withheld {count} newly-added files as likely secrets")
+    }
+}
+
 /// Builds the result record for a committed snapshot: full id and the commit's
-/// change-summary subject.
-fn committed_record(name: &str, outcome: &SnapshotOutcome) -> Record {
+/// change-summary subject. `withheld` is the count of files quarantined beside
+/// the commit (VRD-22); when nonzero it is noted in `detail` so the machine
+/// shape carries the fact the stderr warning also reports.
+fn committed_record(name: &str, outcome: &SnapshotOutcome, withheld: usize) -> Record {
     let subject =
         CommitMessage::new(outcome.summary.clone(), Trigger::Manual, None, Vec::new()).subject();
+    let detail = (withheld > 0).then(|| withheld_detail(withheld));
     result_record(
         name,
         "committed",
-        None,
+        detail.as_deref(),
         Some(outcome.id.as_str()),
         Some(&subject),
     )

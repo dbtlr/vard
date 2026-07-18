@@ -66,8 +66,9 @@
 //! Each hook receives an enumerated `VARD_*` environment (stdin stays closed):
 //! `VARD_EVENT` and `VARD_SUPPRESSED` always; `VARD_WATCH`/`VARD_PATH` for
 //! watch-scoped events; and per-payload `VARD_REF`, `VARD_PREV_REF`,
-//! `VARD_FILES_CHANGED`, `VARD_ERROR`. An unset variable is absent from the
-//! environment, never an empty string. See [`hook_env`].
+//! `VARD_FILES_CHANGED`, `VARD_ERROR`, `VARD_QUARANTINED_COUNT`. An unset
+//! variable is absent from the environment, never an empty string. See
+//! [`hook_env`].
 //!
 //! # State for observability
 //!
@@ -614,6 +615,7 @@ fn event_watch(event: &Event) -> Option<&str> {
         | Event::SnapshotCompleted { watch, .. }
         | Event::SnapshotFailed { watch, .. }
         | Event::SnapshotSkipped { watch, .. }
+        | Event::SnapshotQuarantined { watch, .. }
         | Event::SyncPushed { watch, .. }
         | Event::SyncPulled { watch, .. }
         | Event::SyncConflict { watch, .. }
@@ -650,6 +652,11 @@ fn hook_env(event: &Event, watch_path: Option<&Path>) -> Vec<(String, String)> {
         }
         Event::SnapshotFailed { error, .. } => {
             env.push(("VARD_ERROR".to_string(), error.clone()));
+        }
+        Event::SnapshotQuarantined { count, .. } => {
+            // Count-only per the VRD-21/VRD-22 contract: never the paths or any
+            // secret bytes.
+            env.push(("VARD_QUARANTINED_COUNT".to_string(), count.to_string()));
         }
         Event::SyncPushed { new_ref, .. } => {
             env.push(("VARD_REF".to_string(), new_ref.clone()));
@@ -733,6 +740,24 @@ mod tests {
         let env = hook_env(&event, Some(Path::new("/w")));
         assert_eq!(find(&env, "VARD_ERROR"), Some("boom"));
         assert_eq!(find(&env, "VARD_REF"), None);
+    }
+
+    #[test]
+    fn snapshot_quarantined_sets_only_the_count() {
+        // VRD-22: the quarantine hook is count-only — never the paths or bytes.
+        let event = Event::SnapshotQuarantined {
+            watch: "notes".to_string(),
+            count: 3,
+        };
+        let env = hook_env(&event, Some(Path::new("/home/u/notes")));
+        assert_eq!(find(&env, "VARD_EVENT"), Some("snapshot.quarantined"));
+        assert_eq!(find(&env, "VARD_WATCH"), Some("notes"));
+        assert_eq!(find(&env, "VARD_PATH"), Some("/home/u/notes"));
+        assert_eq!(find(&env, "VARD_QUARANTINED_COUNT"), Some("3"));
+        // No ref/error/files-changed leak into the quarantine env.
+        assert_eq!(find(&env, "VARD_REF"), None);
+        assert_eq!(find(&env, "VARD_ERROR"), None);
+        assert_eq!(find(&env, "VARD_FILES_CHANGED"), None);
     }
 
     #[test]
@@ -876,6 +901,10 @@ mod tests {
                 watch: "w".to_string(),
                 trigger: Trigger::Manual,
                 reason: SkipReason::Clean,
+            },
+            Event::SnapshotQuarantined {
+                watch: "w".to_string(),
+                count: 1,
             },
             Event::SyncPushed {
                 watch: "w".to_string(),

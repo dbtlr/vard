@@ -47,6 +47,11 @@ pub const DEFAULT_SYNC: bool = false;
 /// Default trigger mode: arm both change and interval triggers.
 pub const DEFAULT_TRIGGER: TriggerMode = TriggerMode::Both;
 
+/// Default for whether a watch scans for leaked secrets (VRD-22). On: quarantine
+/// is a safety default, so a freshly-added watch scans its content and filenames
+/// for credentials unless explicitly turned off (`secret_scan = false`).
+pub const DEFAULT_SECRET_SCAN: bool = true;
+
 /// Default remote name a watch pushes to and pulls from.
 pub const DEFAULT_REMOTE: &str = "origin";
 
@@ -121,6 +126,8 @@ pub struct WatchSpec {
     remote: String,
     poll_interval: Option<Duration>,
     scratch_dir: Option<PathBuf>,
+    secret_scan: bool,
+    secret_patterns: Vec<String>,
 }
 
 impl WatchSpec {
@@ -181,6 +188,22 @@ impl WatchSpec {
     /// Gitignore-style patterns excluded from snapshots.
     pub fn exclude(&self) -> &[String] {
         &self.exclude
+    }
+
+    /// Whether the watch scans for leaked secrets (VRD-22). When `true`, the
+    /// host re-derives a quarantine each snapshot pass from a
+    /// [`SecretScanner`](crate::SecretScanner) built over this watch; when
+    /// `false`, no scanning happens.
+    pub fn secret_scan(&self) -> bool {
+        self.secret_scan
+    }
+
+    /// Extra secret filename patterns (gitignore dialect) for this watch, added
+    /// on top of the built-in [`SECRET_PATTERNS`](crate::excludes::SECRET_PATTERNS)
+    /// catalog when a [`SecretScanner`](crate::SecretScanner) is compiled. Empty
+    /// by default.
+    pub fn secret_patterns(&self) -> &[String] {
+        &self.secret_patterns
     }
 
     /// Branch the watch commits to. `None` adopts HEAD's branch at registration.
@@ -251,6 +274,8 @@ pub struct WatchSpecBuilder {
     remote: String,
     poll_interval: Option<Duration>,
     scratch_dir: Option<PathBuf>,
+    secret_scan: bool,
+    secret_patterns: Vec<String>,
 }
 
 impl WatchSpecBuilder {
@@ -268,6 +293,8 @@ impl WatchSpecBuilder {
             remote: DEFAULT_REMOTE.to_string(),
             poll_interval: None,
             scratch_dir: None,
+            secret_scan: DEFAULT_SECRET_SCAN,
+            secret_patterns: Vec::new(),
         }
     }
 
@@ -305,6 +332,22 @@ impl WatchSpecBuilder {
     /// Replaces the exclude patterns.
     pub fn exclude(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.exclude = patterns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets whether the watch scans for leaked secrets (VRD-22).
+    pub fn secret_scan(mut self, secret_scan: bool) -> Self {
+        self.secret_scan = secret_scan;
+        self
+    }
+
+    /// Replaces the extra secret filename patterns (added on top of the built-in
+    /// catalog when a scanner is compiled).
+    pub fn secret_patterns(
+        mut self,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.secret_patterns = patterns.into_iter().map(Into::into).collect();
         self
     }
 
@@ -396,6 +439,8 @@ impl WatchSpecBuilder {
             remote: self.remote,
             poll_interval: self.poll_interval,
             scratch_dir: self.scratch_dir,
+            secret_scan: self.secret_scan,
+            secret_patterns: self.secret_patterns,
         })
     }
 }
@@ -603,6 +648,8 @@ mod tests {
         assert_eq!(spec.remote(), DEFAULT_REMOTE);
         assert_eq!(spec.poll_interval(), None);
         assert_eq!(spec.scratch_dir(), None);
+        assert_eq!(spec.secret_scan(), DEFAULT_SECRET_SCAN);
+        assert!(spec.secret_patterns().is_empty());
     }
 
     #[test]
@@ -626,6 +673,10 @@ mod tests {
             .remote("origin2")
             .poll_interval(Duration::from_secs(30))
             .scratch_dir("/tmp/reconcile/proj")
+            // secret_scan is on by default, so `false` is the non-default value
+            // that proves the setter overrides rather than matching the default.
+            .secret_scan(false)
+            .secret_patterns(["*.secret", "credentials.json"])
             .build()
             .unwrap();
         assert_eq!(spec.trigger(), TriggerMode::Events);
@@ -638,6 +689,11 @@ mod tests {
         assert_eq!(spec.remote(), "origin2");
         assert_eq!(spec.poll_interval(), Some(Duration::from_secs(30)));
         assert_eq!(spec.scratch_dir(), Some(Path::new("/tmp/reconcile/proj")));
+        assert!(!spec.secret_scan());
+        assert_eq!(
+            spec.secret_patterns(),
+            ["*.secret".to_string(), "credentials.json".to_string()]
+        );
     }
 
     #[test]

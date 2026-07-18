@@ -30,6 +30,7 @@
 //! | `Paused` (unsafe-repo auto-pause) | `blocked`          | `unsafe-pause`     |
 //! | `Attention` + `SnapshotsFailing` | `snapshots-failing`| `snapshots-failing`|
 //! | `Attention` + `SourceDied`       | `attention`        | `source-died`      |
+//! | `Attention` + `SecretsQuarantined` | `attention`      | `secret-quarantined`|
 //! | `Attention` (other)              | `attention`        | `attention`        |
 //! | `Conflicted`                     | `conflicted`       | `conflicted`       |
 //! | `SyncError`                      | `sync-error`       | `sync-error`       |
@@ -84,6 +85,13 @@
 //! state = "attention"
 //! kind = "hook-failing"       # a hook has failed 3+ times running (VRD-21)
 //! summary = "hook for snapshot.completed has failed 3 times ..."
+//! since = 1752000000
+//!
+//! [[problem]]
+//! watch = "vault"
+//! state = "attention"
+//! kind = "secret-quarantined" # a pass withheld likely secrets (VRD-22)
+//! summary = "2 newly-added files were withheld from the snapshot ..."
 //! since = 1752000000
 //!
 //! [[suppression]]
@@ -200,6 +208,15 @@ enum ProblemKind {
     SnapshotsFailing,
     /// A watch's signal source died; the daemon rebuilds it automatically.
     SourceDied,
+    /// A watch's most recent snapshot pass withheld one or more newly-added
+    /// files as likely secrets (VRD-22). Carries the count so the summary can
+    /// name it. Self-clearing: quarantine is re-derived every pass, so the next
+    /// pass that finds no secret returns the watch to `Ok` — there is nothing to
+    /// acknowledge. NEVER carries the file names or any secret bytes.
+    SecretsQuarantined {
+        /// How many files the most recent pass withheld.
+        count: usize,
+    },
     /// Any other attention condition (a degraded backend, a channel overflow).
     Attention,
     /// A sync conflict blocks progress (sync lands in a later task).
@@ -225,7 +242,9 @@ impl ProblemKind {
         match self {
             ProblemKind::Blocked => "blocked",
             ProblemKind::SnapshotsFailing => "snapshots-failing",
-            ProblemKind::SourceDied | ProblemKind::Attention => "attention",
+            ProblemKind::SourceDied
+            | ProblemKind::SecretsQuarantined { .. }
+            | ProblemKind::Attention => "attention",
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
             ProblemKind::Unopenable => "attention",
@@ -239,6 +258,7 @@ impl ProblemKind {
             ProblemKind::Blocked => "unsafe-pause",
             ProblemKind::SnapshotsFailing => "snapshots-failing",
             ProblemKind::SourceDied => "source-died",
+            ProblemKind::SecretsQuarantined { .. } => "secret-quarantined",
             ProblemKind::Attention => "attention",
             ProblemKind::Conflicted => "conflicted",
             ProblemKind::SyncError => "sync-error",
@@ -262,6 +282,22 @@ impl ProblemKind {
             },
             ProblemKind::SourceDied => {
                 "watcher died; the daemon is rebuilding it automatically".to_string()
+            }
+            // Count + action guidance, built here (never echoing the reason,
+            // which would repeat the count without the hint, and never the file
+            // names): move or delete the file, or exclude it. Scanning is
+            // per-watch configurable (`secret_scan`).
+            ProblemKind::SecretsQuarantined { count } => {
+                let files = if count == 1 {
+                    "1 newly-added file was".to_string()
+                } else {
+                    format!("{count} newly-added files were")
+                };
+                format!(
+                    "{files} withheld from the snapshot as a likely secret; move or delete it, \
+                     or exclude it — it stays on disk and this clears on its own once it is gone \
+                     (secret scanning is per-watch configurable)"
+                )
             }
             ProblemKind::Attention => reason
                 .map(str::to_string)
@@ -299,6 +335,9 @@ fn classify(state: WatchState, trouble: Option<TroubleKind>) -> Option<ProblemKi
         WatchState::Attention => Some(match trouble {
             Some(TroubleKind::SnapshotsFailing) => ProblemKind::SnapshotsFailing,
             Some(TroubleKind::SourceDied) => ProblemKind::SourceDied,
+            Some(TroubleKind::SecretsQuarantined { count }) => {
+                ProblemKind::SecretsQuarantined { count }
+            }
             _ => ProblemKind::Attention,
         }),
         // `WatchState` is `#[non_exhaustive]`: a future state defaults to a
@@ -664,6 +703,51 @@ mod tests {
         assert_eq!(p.state, "attention");
         assert_eq!(p.kind, "source-died");
         assert!(p.summary.contains("rebuilding"), "got: {}", p.summary);
+    }
+
+    #[test]
+    fn secrets_quarantined_renders_as_a_secret_quarantined_kind_with_count_and_hint() {
+        let states = vec![status(
+            "vault",
+            WatchState::Attention,
+            Some(TroubleKind::SecretsQuarantined { count: 2 }),
+            "2 newly-added files withheld as likely secrets",
+        )];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
+        assert_eq!(p.state, "attention");
+        assert_eq!(p.kind, "secret-quarantined");
+        assert!(
+            p.summary.contains('2'),
+            "the count is surfaced: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("move or delete") || p.summary.contains("exclude"),
+            "action guidance is present: {}",
+            p.summary
+        );
+        assert!(
+            p.summary.contains("per-watch configurable"),
+            "the config hint is present: {}",
+            p.summary
+        );
+    }
+
+    #[test]
+    fn a_single_quarantined_file_reads_in_the_singular() {
+        let states = vec![status(
+            "vault",
+            WatchState::Attention,
+            Some(TroubleKind::SecretsQuarantined { count: 1 }),
+            "",
+        )];
+        let p = &doc_from_states(&states, &[], 2000).problems[0];
+        assert_eq!(p.kind, "secret-quarantined");
+        assert!(
+            p.summary.contains("1 newly-added file was"),
+            "singular phrasing: {}",
+            p.summary
+        );
     }
 
     #[test]

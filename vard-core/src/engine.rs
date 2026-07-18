@@ -173,10 +173,11 @@ use crate::config::{TriggerMode, WatchSpec};
 use crate::event::{Event, EventBus, EventReceiver, SkipReason, Trigger, TroubleKind, WatchState};
 use crate::gate::{OpGuard, SharedGate, default_gate};
 use crate::scheduler::{ScheduleHandle, Scheduler, SchedulerRx, SchedulerSignal};
+use crate::secret_scan::{SecretMatch, SecretScanError, SecretScanner};
 use crate::vcs::git::GitBackend;
 use crate::vcs::{
     AdvanceOutcome, LogFilter, PushOutcome, ReconcileOutcome, SafeState, SnapshotId,
-    SnapshotOutcome, SnapshotRequest, UnsafeReason, VcsBackend, VcsError,
+    SnapshotOutcome, SnapshotReport, SnapshotRequest, UnsafeReason, VcsBackend, VcsError,
 };
 use crate::watcher::{MuteGuard, WatchHandle, Watcher, WatcherRx, WatcherSignal};
 
@@ -537,11 +538,18 @@ impl Drop for MuteHold {
 }
 
 /// The outcome of one attempt to bring the tree to a committed snapshot.
+///
+/// The two success arms each carry the pass's quarantined secrets (VRD-22),
+/// empty when nothing was withheld. The failure arms carry none: a pass that
+/// failed to snapshot asserts its own trouble and never reaches the quarantine
+/// reflection, so quarantine yields to the more urgent failure/pause (it
+/// re-derives once snapshots resume).
 enum PassResult {
-    /// A snapshot was committed.
-    Committed(SnapshotOutcome),
-    /// The sweep found nothing to commit (clean tree): a no-op.
-    Clean,
+    /// A snapshot was committed, and any secrets this pass withheld.
+    Committed(SnapshotOutcome, Vec<SecretMatch>),
+    /// The sweep committed nothing (a clean tree, or a tree whose only
+    /// newly-added changes were quarantined), and any secrets this pass withheld.
+    Clean(Vec<SecretMatch>),
     /// The repository became unsafe between the guard check and the commit.
     Unsafe(UnsafeReason),
     /// The index lock stayed contended through every retry: requeue and retry
@@ -757,6 +765,12 @@ struct Worker {
     /// op-lock-backed gate.
     gate: SharedGate,
     mute: MuteSource,
+    /// The per-watch secret scanner (VRD-22), compiled once at engine build from
+    /// the watch's [`WatchSpec`], injected into every pass's [`SnapshotRequest`]
+    /// so newly-added secrets are withheld from the commit. `None` disables
+    /// scanning entirely (byte-identical to a plain sweep); a *disabled* scanner
+    /// (`secret_scan = false`) is still `Some` but flags nothing.
+    scanner: Option<Arc<SecretScanner>>,
     // Kept only to hold the snapshot-interval schedule armed for this worker's
     // lifetime.
     _schedule: Option<ScheduleHandle>,
@@ -1139,6 +1153,13 @@ impl Worker {
         // this loop while holding the mute.
         let mut committed_in_pass = false;
 
+        // Emit `snapshot.quarantined` at most once per run_pass invocation: the
+        // post-op re-sweep re-derives the same withheld secrets, but the user
+        // sees one logical trigger, so the bus event (and any hook it fires)
+        // must not double-fire. The Attention *state* is set idempotently below
+        // regardless.
+        let mut quarantine_emitted = false;
+
         while let Some(prov) = self.pending.take() {
             match check_safe(Arc::clone(&self.backend)).await {
                 Ok(Ok(SafeState::Safe)) => self.on_safe(),
@@ -1205,15 +1226,24 @@ impl Worker {
             // (F2): the guard moves into the blocking scope and is closed there, so
             // an async abort cannot separate lock-release from git-completion. This
             // await borrows no `self` (owned backend/cfg, the local `prov`).
-            match run_snapshot_under_guard(Arc::clone(&self.backend), self.cfg, &prov, guard).await
+            match run_snapshot_under_guard(
+                Arc::clone(&self.backend),
+                self.cfg,
+                self.scanner.clone(),
+                &prov,
+                guard,
+            )
+            .await
             {
-                PassResult::Committed(outcome) => {
+                PassResult::Committed(outcome, quarantined) => {
                     self.emit_completed(prov.trigger, &outcome);
                     // A commit means any prior retry has converged.
                     self.clear_retry();
                     // A successful commit clears a snapshots-failing (or blocked)
-                    // state: the watch is demonstrably healthy again.
-                    self.recover_to_ok();
+                    // state — unless this same pass withheld secrets, in which
+                    // case the watch rests in Attention/SecretsQuarantined
+                    // instead of Ok (VRD-22). One or the other, never a flap.
+                    self.reflect_pass(&quarantined, &mut quarantine_emitted);
                     // New local history is worth propagating: fire an automatic
                     // sync so the commit reaches the remote without waiting for a
                     // timer. A no-op unless the watch syncs, and self-suppressed
@@ -1235,17 +1265,20 @@ impl Worker {
                     // the muted window is caught and snapshotted as a follow-up.
                     self.pending = Some(prov);
                 }
-                PassResult::Clean => {
+                PassResult::Clean(quarantined) => {
                     // Nothing to commit: the pending change resolved (it was
-                    // committed or reverted elsewhere). Close the started
-                    // bracket, then clear any retry so a prior failure episode
-                    // does not keep ticking.
+                    // committed or reverted elsewhere), OR its only newly-added
+                    // content was quarantined. Close the started bracket, then
+                    // clear any retry so a prior failure episode does not keep
+                    // ticking.
                     self.emit_skipped(prov.trigger, SkipReason::Clean);
                     self.clear_retry();
-                    // Skip-to-clean also clears a snapshots-failing state: the
-                    // pending change resolved (committed or reverted elsewhere),
-                    // so the watch is healthy again.
-                    self.recover_to_ok();
+                    // Skip-to-clean clears a snapshots-failing state — unless this
+                    // pass withheld secrets, in which case the watch rests in
+                    // Attention/SecretsQuarantined. A quarantine-only pass (the
+                    // secret is the sole change) commits nothing but must still
+                    // assert the trouble (VRD-22).
+                    self.reflect_pass(&quarantined, &mut quarantine_emitted);
                 }
                 PassResult::Unsafe(reason) => {
                     // The repo turned unsafe between the probe and the commit:
@@ -1443,6 +1476,51 @@ impl Worker {
             None,
             Some("snapshots are succeeding".into()),
         );
+    }
+
+    /// Reflects a completed (committed or clean) pass's quarantine result into
+    /// watch state (VRD-22). With nothing withheld, the pass proves the watch
+    /// healthy and it returns to `Ok` ([`recover_to_ok`](Self::recover_to_ok)).
+    /// With secrets withheld, the watch rests in
+    /// [`WatchState::Attention`]/[`TroubleKind::SecretsQuarantined`] carrying
+    /// this pass's count, and — at most once per `run_pass`, guarded by
+    /// `emitted` — emits [`Event::SnapshotQuarantined`].
+    ///
+    /// This is the single branch between "healthy again" and "still withholding"
+    /// so the two never flap: a quarantining pass never calls `recover_to_ok`
+    /// (which would emit an `Ok` transition only to be overwritten by the
+    /// Attention one). `set_state` is idempotent, so the post-op re-sweep's
+    /// identical result re-affirms the state silently. Reached only from the
+    /// success arms, so a failing/paused pass's own (more urgent) trouble wins —
+    /// quarantine re-derives once snapshots resume.
+    fn reflect_pass(&mut self, quarantined: &[SecretMatch], emitted: &mut bool) {
+        if quarantined.is_empty() {
+            self.recover_to_ok();
+            return;
+        }
+        let count = quarantined.len();
+        if !*emitted {
+            self.emit_quarantined(count);
+            *emitted = true;
+        }
+        let reason = match count {
+            1 => "1 newly-added file withheld as a likely secret".to_string(),
+            n => format!("{n} newly-added files withheld as likely secrets"),
+        };
+        self.set_state(
+            WatchState::Attention,
+            Some(TroubleKind::SecretsQuarantined { count }),
+            Some(reason),
+        );
+    }
+
+    /// Emits [`Event::SnapshotQuarantined`] for a pass that withheld `count`
+    /// files. Count-only: never the paths or any secret bytes.
+    fn emit_quarantined(&self, count: usize) {
+        self.bus.emit(Event::SnapshotQuarantined {
+            watch: self.name.clone(),
+            count,
+        });
     }
 
     /// Surfaces a panicked backend call: emits [`Event::SnapshotFailed`], moves
@@ -1926,7 +2004,13 @@ impl Worker {
             let _mute = self.mute.acquire();
             // `behind == 0`: nothing to integrate, run the push-only window.
             let scratch = (remote.behind > 0).then(|| scratch.to_path_buf());
-            run_locked_window(Arc::clone(&self.backend), scratch, guard).await
+            run_locked_window(
+                Arc::clone(&self.backend),
+                self.scanner.clone(),
+                scratch,
+                guard,
+            )
+            .await
         };
         let (tip, presync_committed, pulled_moved) = match locked {
             LockedResult::Reconciled {
@@ -2233,15 +2317,25 @@ async fn sync_push(backend: SharedBackend, timeout: Duration) -> Result<PushOutc
 /// not to exist.
 async fn run_locked_window(
     backend: SharedBackend,
+    scanner: Option<Arc<SecretScanner>>,
     scratch: Option<PathBuf>,
     guard: Box<dyn OpGuard>,
 ) -> LockedResult {
     let joined = tokio::task::spawn_blocking(move || {
         // Snapshot local first, always: commit any pending local work before the
         // tree can be moved by advance. A no-op on a clean tree. The commit
-        // carries a `Vard-Host` trailer so multi-machine history stays legible.
-        let presync_committed = match backend.snapshot(&pre_sync_request()) {
-            Ok(outcome) => outcome.is_some(),
+        // carries a `Vard-Host` trailer so multi-machine history stays legible,
+        // and the scanner so a secret is never swept in right before a push.
+        // The report's `quarantined` is intentionally discarded here: the
+        // exclusion itself is what matters (a secret is never swept into the
+        // pushed commit), and the watch's ordinary snapshot pass is what reflects
+        // quarantine into state and emits `snapshot.quarantined`. The one edge is
+        // an interval-only watch whose secret is first seen by this pre-sync pass
+        // (before any ordinary pass runs): the file is still correctly withheld
+        // from the commit, but its Attention state surfaces only on the next
+        // ordinary pass, not from here.
+        let presync_committed = match backend.snapshot(&pre_sync_request(scanner)) {
+            Ok(report) => report.committed.is_some(),
             Err(err) => {
                 guard.complete();
                 return LockedResult::Failed(format!("pre-sync snapshot: {err}"));
@@ -2321,11 +2415,20 @@ async fn run_locked_window(
 /// [`Trigger::PreSync`] commit tagged with a `Vard-Host: <hostname>` trailer.
 /// The trailer records which machine took the snapshot, so a branch synced
 /// across several hosts reads legibly (and a future tool can attribute commits).
-fn pre_sync_request() -> SnapshotRequest {
+///
+/// The watch's `scanner` is threaded in so the pre-sync snapshot quarantines
+/// secrets exactly as an ordinary pass does (VRD-22). This is load-bearing:
+/// the pre-sync snapshot is the commit that immediately precedes a push, so
+/// without scanning it a secret an ordinary pass had kept untracked would be
+/// swept in here and pushed to the remote — the one place quarantine most needs
+/// to hold. The sync path reads only whether it committed; the quarantine is
+/// reflected into watch state by the ordinary snapshot pass, not here.
+fn pre_sync_request(scanner: Option<Arc<SecretScanner>>) -> SnapshotRequest {
     SnapshotRequest {
         trigger: Trigger::PreSync,
         user_text: None,
         extra_trailers: vec![("Vard-Host".to_string(), host_name())],
+        scanner,
     }
 }
 
@@ -2411,6 +2514,7 @@ async fn check_safe(backend: SharedBackend) -> Result<Result<SafeState, VcsError
 async fn run_snapshot_under_guard(
     backend: SharedBackend,
     cfg: EngineConfig,
+    scanner: Option<Arc<SecretScanner>>,
     prov: &Provenance,
     guard: Box<dyn OpGuard>,
 ) -> PassResult {
@@ -2418,6 +2522,7 @@ async fn run_snapshot_under_guard(
         trigger: prov.trigger,
         user_text: prov.user_text.clone(),
         extra_trailers: Vec::new(),
+        scanner,
     };
 
     let mut guard = guard;
@@ -2440,8 +2545,14 @@ async fn run_snapshot_under_guard(
         };
         guard = returned_guard;
         match outcome {
-            Ok(Some(outcome)) => break PassResult::Committed(outcome),
-            Ok(None) => break PassResult::Clean,
+            Ok(SnapshotReport {
+                committed: Some(committed),
+                quarantined,
+            }) => break PassResult::Committed(committed, quarantined),
+            Ok(SnapshotReport {
+                committed: None,
+                quarantined,
+            }) => break PassResult::Clean(quarantined),
             Err(VcsError::UnsafeState(reason)) => break PassResult::Unsafe(reason),
             Err(VcsError::LockContended { .. }) => {
                 if attempt < cfg.lock_retry_attempts {
@@ -2565,6 +2676,19 @@ impl Engine {
                 MuteSource::Silent
             };
 
+            // Compile the per-watch secret scanner (VRD-22) — unconditionally,
+            // regardless of trigger mode: an interval-only or manual watch
+            // quarantines just as an events watch does. An invalid extra pattern
+            // is a config fault surfaced like an invalid `exclude` pattern.
+            let scanner = Arc::new(
+                SecretScanner::compile(cw.spec.secret_scan(), cw.spec.secret_patterns()).map_err(
+                    |source| EngineError::SecretScan {
+                        watch: name.clone(),
+                        source,
+                    },
+                )?,
+            );
+
             let schedule = if matches!(mode, TriggerMode::Interval | TriggerMode::Both) {
                 let handle = scheduler
                     .arm(name.clone(), cw.spec.interval())
@@ -2601,6 +2725,7 @@ impl Engine {
                 name,
                 backend: cw.backend,
                 gate: cw.gate,
+                scanner: Some(scanner),
                 mute,
                 _schedule: schedule,
                 _sync_schedule: sync_schedule,
@@ -3244,6 +3369,18 @@ pub enum EngineError {
     Watcher(crate::watcher::WatcherError),
     /// A watch's interval schedule could not be armed.
     Scheduler(crate::scheduler::SchedulerError),
+    /// A watch's secret scanner could not be compiled — one of its extra
+    /// `secret_patterns` is not valid gitignore syntax (VRD-22). Surfaced at
+    /// engine start exactly as an invalid watcher `exclude` pattern is
+    /// ([`Watcher`](EngineError::Watcher) carrying
+    /// [`InvalidExclude`](crate::watcher::WatcherError::InvalidExclude)): a
+    /// configuration fault the daemon reports rather than starting the watch.
+    SecretScan {
+        /// The watch whose scanner failed to compile.
+        watch: String,
+        /// The underlying compile error naming the offending pattern.
+        source: SecretScanError,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -3260,6 +3397,9 @@ impl fmt::Display for EngineError {
             }
             EngineError::Watcher(e) => write!(f, "could not arm watcher: {e}"),
             EngineError::Scheduler(e) => write!(f, "could not arm scheduler: {e}"),
+            EngineError::SecretScan { watch, source } => {
+                write!(f, "watch {watch:?}: {source}")
+            }
         }
     }
 }
@@ -3270,6 +3410,7 @@ impl Error for EngineError {
             EngineError::Backend { source, .. } => Some(source),
             EngineError::Watcher(e) => Some(e),
             EngineError::Scheduler(e) => Some(e),
+            EngineError::SecretScan { source, .. } => Some(source),
             EngineError::DuplicateWatch { .. } => None,
         }
     }
@@ -3282,6 +3423,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::event::{EventReceiver, TryRecvError};
+    use crate::secret_scan::SecretReason;
     use crate::vcs::{ChangeSummary, SnapshotId};
 
     use super::*;
@@ -3293,6 +3435,9 @@ mod tests {
         Commit(usize),
         /// Return a clean (no-op) sweep.
         Clean,
+        /// Return a clean sweep that quarantined this many newly-added secrets:
+        /// nothing committed, but the report lists the withheld matches (VRD-22).
+        Quarantine(usize),
         /// Return a contended lock.
         Lock,
         /// Return a hard command failure.
@@ -3558,7 +3703,7 @@ mod tests {
             Ok(inner.has_remote)
         }
 
-        fn snapshot(&self, _req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
+        fn snapshot(&self, _req: &SnapshotRequest) -> Result<SnapshotReport, VcsError> {
             let (result, gate) = {
                 let mut inner = self.inner.lock().unwrap();
                 inner.snapshot_calls += 1;
@@ -3583,16 +3728,30 @@ mod tests {
             }
             match result {
                 Scripted::Panic => panic!("scripted backend panic"),
-                Scripted::Commit(files) => Ok(Some(SnapshotOutcome {
-                    id: SnapshotId::new("deadbeef"),
-                    summary: ChangeSummary {
-                        changed: files,
-                        added: 0,
-                        deleted: 0,
-                        notable: Vec::new(),
-                    },
-                })),
-                Scripted::Clean => Ok(None),
+                Scripted::Commit(files) => Ok(SnapshotReport {
+                    committed: Some(SnapshotOutcome {
+                        id: SnapshotId::new("deadbeef"),
+                        summary: ChangeSummary {
+                            changed: files,
+                            added: 0,
+                            deleted: 0,
+                            notable: Vec::new(),
+                        },
+                    }),
+                    quarantined: Vec::new(),
+                }),
+                Scripted::Clean => Ok(SnapshotReport::default()),
+                Scripted::Quarantine(n) => Ok(SnapshotReport {
+                    committed: None,
+                    quarantined: (0..n)
+                        .map(|i| SecretMatch {
+                            path: PathBuf::from(format!(".env.{i}")),
+                            reason: SecretReason::FilenamePattern {
+                                pattern: ".env*".to_string(),
+                            },
+                        })
+                        .collect(),
+                }),
                 Scripted::Lock => Err(VcsError::LockContended {
                     op: "commit".into(),
                 }),
@@ -3609,6 +3768,10 @@ mod tests {
             _filter: &crate::vcs::LogFilter,
         ) -> Result<Vec<crate::vcs::Snapshot>, VcsError> {
             Ok(Vec::new())
+        }
+
+        fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+            unimplemented!("tracked_files is out of scope for the snapshot engine")
         }
 
         fn diff(
@@ -3828,6 +3991,7 @@ mod tests {
             name: "w".to_string(),
             backend: backend as SharedBackend,
             gate,
+            scanner: None,
             mute: MuteSource::Counter(Arc::clone(&counter)),
             _schedule: None,
             _sync_schedule: None,
@@ -3901,6 +4065,7 @@ mod tests {
             name: "w".to_string(),
             backend: backend as SharedBackend,
             gate,
+            scanner: None,
             mute: MuteSource::Silent,
             _schedule: None,
             _sync_schedule: None,
@@ -6596,6 +6761,116 @@ mod tests {
         assert!(
             saw_recovery,
             "a successful pass after a panic must clear Attention back to Ok"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quarantining_pass_moves_to_attention_and_emits_the_event() {
+        // VRD-22: a pass that withholds secrets emits `snapshot.quarantined` AND
+        // moves the watch to Attention/SecretsQuarantined carrying the count.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Quarantine(2)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+
+        let mut saw_event = false;
+        let mut saw_attention = false;
+        for _ in 0..4 {
+            match advance_until_event(&mut events, Duration::from_secs(1)).await {
+                Event::SnapshotQuarantined { count, watch } => {
+                    assert_eq!(count, 2);
+                    assert_eq!(watch, "w");
+                    saw_event = true;
+                }
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SecretsQuarantined { count }),
+                    ..
+                } => {
+                    assert_eq!(count, 2);
+                    saw_attention = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            if saw_event && saw_attention {
+                break;
+            }
+        }
+        assert!(
+            saw_event,
+            "a quarantining pass must emit snapshot.quarantined"
+        );
+        assert!(
+            saw_attention,
+            "a quarantining pass must move the watch to Attention/SecretsQuarantined"
+        );
+        // Nothing was committed — the secret was the only change.
+        assert!(no_more_outcomes(&mut events));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quarantine_attention_self_clears_on_a_later_clean_pass() {
+        // VRD-22: quarantine is self-clearing — once the secret is gone, the next
+        // pass finds nothing to withhold and the watch returns to Ok on its own.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Quarantine(1), Scripted::Clean]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let mut saw_attention = false;
+        for _ in 0..3 {
+            match advance_until_event(&mut events, Duration::from_secs(1)).await {
+                Event::SnapshotQuarantined { .. } => {}
+                Event::WatchStateChanged {
+                    to: WatchState::Attention,
+                    trouble: Some(TroubleKind::SecretsQuarantined { .. }),
+                    ..
+                } => {
+                    saw_attention = true;
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_attention,
+            "the first pass must quarantine into Attention"
+        );
+
+        // The user removed the secret; the next pass is clean and self-clears.
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        match ev {
+            Event::WatchStateChanged {
+                from: WatchState::Attention,
+                to: WatchState::Ok,
+                trouble: None,
+                ..
+            } => {}
+            other => panic!("expected Attention->Ok recovery, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_with_no_withheld_secrets_never_asserts_quarantine() {
+        // A normal (or disabled-scanner) pass withholds nothing, so no
+        // `snapshot.quarantined` is emitted and the watch stays Ok.
+        let backend = FakeBackend::new();
+        backend.script([Scripted::Commit(1)]);
+        let (tx, mut events, _counter) = spawn_worker(Arc::clone(&backend), test_cfg());
+
+        tx.send(WatchInput::Trigger(Provenance::event())).unwrap();
+        // The only effect event is the commit; no quarantine, no Attention.
+        let ev = advance_until_event(&mut events, Duration::from_secs(1)).await;
+        assert!(
+            matches!(ev, Event::SnapshotCompleted { .. }),
+            "expected a plain commit, got {ev:?}"
+        );
+        wait_snapshot_calls(&backend, 2).await;
+        assert!(
+            no_more_outcomes(&mut events),
+            "a non-withholding pass must not emit quarantine or an Attention change"
         );
     }
 

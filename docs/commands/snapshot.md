@@ -41,6 +41,24 @@ A repository that is not in a safe state — mid-merge, mid-rebase, on the wrong
 
 Requesting a snapshot of a paused watch **while a daemon is running** exits `1` rather than silently queuing work the daemon will drop — resume it, or stop the daemon to snapshot in-process.
 
+## Secret quarantine
+
+An in-process snapshot (no daemon running) scans every **newly-added** file for likely secrets before committing and **withholds** any match from the commit — the same per-watch scanning the [daemon](run.md) does on its own passes. This catches a secret-shaped filename (`.env`, `id_rsa`, `*.pem`, plus the watch's own `secret_patterns`) or a file whose content carries a recognizable credential (an AWS/GitHub/… token, a PEM private key, a high-entropy secret). Modified files already tracked are never scanned — only new ones.
+
+A withheld file **stays on disk, uncommitted**; nothing is deleted or moved. The command prints a warning to stderr naming each withheld path and why, and then **still exits `0`** — quarantine is a warning, not a failure:
+
+```text
+vard: notes: withheld 1 newly-added file as a likely secret — each stays on disk, uncommitted:
+vard:   creds.txt — contains AWS access key
+vard: to snapshot one anyway, move it out of the watch, or set `secret_scan = false` for this watch to turn scanning off
+```
+
+If the withheld file was the *only* change, the snapshot commits nothing and the watch's row reads `quarantined` (not `no changes`). If legitimate changes committed alongside a withheld secret, the row is `committed` and its `detail` notes the withhold.
+
+To include a file the scanner flags, move it out of the watched directory, or turn scanning off for the watch by setting `secret_scan = false` (see [`config`](config.md#secret-scanning-secret_scan--secret_patterns)). `secret_patterns` adds your own secret filename shapes on top of the built-in catalog.
+
+When a **daemon is running** it owns the scanning: the snapshot is handed to it and the daemon quarantines on its pass, surfacing any withhold through [`status`](status.md)/[`notify`](notify.md) as a `secret-quarantined` problem rather than on this command's stderr.
+
 ## Output
 
 A list surface (records/json/jsonl). One row per watch acted on, reporting the commit status.
@@ -75,7 +93,7 @@ vard snapshot notes --format json
 
 | Code | Meaning |
 |---|---|
-| `0` | Every named watch was snapshotted or queued (including `no changes`). |
+| `0` | Every named watch was snapshotted or queued (including `no changes`, and including a snapshot that only `quarantined` a secret — that is a warning, not a failure). |
 | `1` | A watch was skipped — an unsafe repository state, a paused watch requested while the daemon is running, or its lock is held by another operation (retry). |
 | `2` | Operational error (e.g. a selector that resolves to no watch). |
 

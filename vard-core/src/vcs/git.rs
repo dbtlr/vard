@@ -37,11 +37,23 @@
 //! # What this layer deliberately does not do
 //!
 //! Protective pre-restore/pre-sync snapshots, retry/backoff on a contended
-//! lock, watcher self-suppression, event emission, `.git/info/exclude`
-//! seeding, and secret scanning are all out of scope — they belong to later
-//! tasks. In particular this layer **never deletes a lock file**: it classifies
+//! lock, watcher self-suppression, event emission, and `.git/info/exclude`
+//! seeding are all out of scope — they belong to later tasks. In particular
+//! this layer **never deletes a lock file**: it classifies
 //! [`VcsError::LockContended`] and returns, leaving any cleanup (PID- and
 //! age-gated) to the engine.
+//!
+//! Secret scanning is the one *policy* this layer consults, and only because it
+//! is injected: [`snapshot`] excludes matched newly-added paths from staging
+//! when a [`SecretScanner`] rides the [`SnapshotRequest`], so the exclusion is
+//! decided by the caller's scanner, not by the VCS layer itself (VRD-22).
+//! Absent a scanner the sweep is a plain total `git add -A`. The scan enumerates
+//! and excludes by byte-exact path and only ever reads regular files; a file
+//! created in the window between enumeration and the `git add -A` is committed
+//! unscanned, a TOCTOU the engine's per-watch serialization narrows but cannot
+//! close (the next pass re-derives quarantine).
+//!
+//! [`snapshot`]: VcsBackend::snapshot
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -50,10 +62,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::{
     AdvanceOutcome, ChangeSummary, LogFilter, PushOutcome, ReconcileOutcome, RemoteState,
-    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest, TRAILER_KEY,
-    UnsafeReason, VcsBackend, VcsError, VcsRef, trigger_from_str,
+    RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotReport,
+    SnapshotRequest, TRAILER_KEY, UnsafeReason, VcsBackend, VcsError, VcsRef, trigger_from_str,
 };
 use crate::config::DEFAULT_REMOTE;
+use crate::secret_scan::{SecretMatch, SecretScanner};
 use crate::vcs::CommitMessage;
 
 /// The branch name a [`GitBackend::detect`] falls back to when the repository's
@@ -284,6 +297,80 @@ impl GitBackend {
         })
     }
 
+    /// Scans the paths a total sweep would newly add and returns those the
+    /// `scanner` flags as likely secrets (VRD-22).
+    ///
+    /// The candidate set is `git ls-files --others --exclude-standard -z` — the
+    /// untracked, non-ignored files, which is *exactly* what `git add -A` would
+    /// newly stage. That command lists individual files, recursing into an
+    /// untracked directory rather than collapsing it (as `status --porcelain`
+    /// would to `dir/`), so a dropped-in `.aws/` is scanned member by member and
+    /// only its secret files are excluded — the non-secret ones still commit.
+    ///
+    /// # Byte-exact paths
+    ///
+    /// The `-z` output is read as **raw bytes** and split on NUL, and each path
+    /// is turned into a [`PathBuf`] without lossy UTF-8 decoding (on unix via
+    /// `OsStrExt::from_bytes`). This is load-bearing: the resulting
+    /// [`SecretMatch::path`] becomes an `:(exclude,literal)` pathspec for the
+    /// stage step, so it must byte-match the real path exactly — a lossy `U+FFFD`
+    /// substitution would fail to exclude the real file and stage the secret
+    /// while the report claimed it was withheld. On a platform that cannot
+    /// round-trip a non-UTF-8 path (non-unix without `OsStrExt`), the pass fails
+    /// with [`VcsError::Parse`] rather than lossy-excluding — the invariant
+    /// "reported quarantined ⟺ actually withheld" holds by construction.
+    ///
+    /// # Only regular files are candidates
+    ///
+    /// Each candidate is `symlink_metadata`-checked and only **regular files**
+    /// are scanned. A symlink is committed by git as its link-target *string*,
+    /// never the target's content, so it can never leak content into the
+    /// repository — reading through it would also be wrong (its target may lie
+    /// outside the watch) and, for a FIFO, a blocking `open` would never return
+    /// and wedge the worker. FIFOs, sockets, and devices are non-regular for the
+    /// same reason. Non-regular files are simply not scan candidates (neither the
+    /// filename nor the content layer applies), so they stage normally. Modified
+    /// tracked files are never in this set and so are never scanned.
+    ///
+    /// # TOCTOU
+    ///
+    /// A file created *between* this enumeration and the `git add -A` that
+    /// follows is not seen here and is committed unscanned. The engine's
+    /// per-watch operation serialization narrows this window but cannot close it;
+    /// the next pass re-derives quarantine and catches such a file. The same
+    /// window exists between the regular-file check below and the content read:
+    /// a path swapped for a non-regular file in that instant is opened blocking.
+    /// Both races require a process actively rewriting the watched tree mid-pass,
+    /// which is outside the accidental-commit threat model this scan serves.
+    fn scan_untracked(&self, scanner: &SecretScanner) -> Result<Vec<SecretMatch>, VcsError> {
+        let out = git_output(
+            &self.path,
+            &[],
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            false,
+        )?;
+        if !out.status.success() {
+            return Err(classify_failure("ls-files", &out));
+        }
+        let mut matches = Vec::new();
+        for raw in out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let rel_path = bytes_to_path(raw)?;
+            let abs = self.path.join(&rel_path);
+            // Only regular files are scan candidates (see the doc above): a
+            // symlink/FIFO/socket/device is never read or quarantined. A path
+            // that vanished between enumeration and this stat is likewise not a
+            // candidate.
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_file() => {}
+                _ => continue,
+            }
+            if let Some(m) = scanner.scan_file(&rel_path, &abs) {
+                matches.push(m);
+            }
+        }
+        Ok(matches)
+    }
+
     /// Counts how many commits the local branch is ahead of and behind the
     /// tracking ref, via `rev-list --left-right --count`. The caller must
     /// ensure both refs exist.
@@ -434,25 +521,63 @@ impl VcsBackend for GitBackend {
         Ok(!out.trim().is_empty())
     }
 
-    fn snapshot(&self, req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError> {
+    fn snapshot(&self, req: &SnapshotRequest) -> Result<SnapshotReport, VcsError> {
         self.ensure_safe()?;
 
-        // Total sweep of the work tree: vard snapshots the directory as a
-        // whole, deliberately including (and thereby consuming) any index
-        // state a user staged by hand. Staging a deletion never loses data:
-        // the content remains reachable in history.
-        self.run(&[], ["add", "-A"])?;
+        // Secret quarantine (VRD-22): when an enabled scanner is injected, scan
+        // every newly-added path BEFORE staging and withhold the matches, so a
+        // leaked credential never enters a snapshot. With no scanner the sweep
+        // is byte-identical to the historical plain `git add -A`.
+        let quarantined = match &req.scanner {
+            Some(scanner) if scanner.is_enabled() => self.scan_untracked(scanner)?,
+            _ => Vec::new(),
+        };
+
+        if quarantined.is_empty() {
+            // Total sweep of the work tree: vard snapshots the directory as a
+            // whole, deliberately including (and thereby consuming) any index
+            // state a user staged by hand. Staging a deletion never loses data:
+            // the content remains reachable in history.
+            self.run(&[], ["add", "-A"])?;
+        } else {
+            // Same total sweep, minus the quarantined paths. `.` covers the
+            // whole tree from the repository root (open() guarantees the
+            // backend path IS the root), and each `:(exclude,literal)<path>`
+            // subtracts one matched path verbatim — literal magic disables
+            // globbing so a path containing `*`, a space, or a leading `:` is
+            // excluded exactly, never as a pattern. An exclude-only pathspec
+            // needs an including one (`.`) alongside it, which is why `.` is
+            // spelled out here rather than relying on the no-pathspec default.
+            let mut args: Vec<OsString> = vec![
+                OsString::from("add"),
+                OsString::from("-A"),
+                OsString::from("--"),
+                OsString::from("."),
+            ];
+            for m in &quarantined {
+                args.push(exclude_pathspec(&m.path));
+            }
+            self.run(&[], args)?;
+        }
 
         // One source of truth for both "is there anything to commit?" and the
         // summary: the staged diff, read after the sweep, NUL-delimited so
         // unusual filenames arrive as raw bytes rather than C-quoted. This
-        // also works on an unborn HEAD (it diffs against the empty tree).
+        // also works on an unborn HEAD (it diffs against the empty tree). The
+        // scan-then-stage-with-exclusions-then-summarize order preserves the
+        // invariant that the staged diff is the one source of truth: the
+        // summary describes exactly what the commit contains, secrets already
+        // withheld.
         let staged = self.run(&[], ["diff", "--cached", "--name-status", "-z"])?;
         let summary = parse_name_status(&staged);
         if summary.total() == 0 {
-            // Nothing staged means nothing to snapshot; never force an empty
-            // commit.
-            return Ok(None);
+            // Nothing staged means nothing to commit; never force an empty
+            // commit. A pass whose only changes were quarantined lands here — it
+            // commits nothing but still reports what it withheld.
+            return Ok(SnapshotReport {
+                committed: None,
+                quarantined,
+            });
         }
 
         let msg = CommitMessage::new(
@@ -479,10 +604,13 @@ impl VcsBackend for GitBackend {
         let head = self
             .rev_of("HEAD")?
             .ok_or_else(|| VcsError::Parse("commit succeeded but HEAD is unborn".to_string()))?;
-        Ok(Some(SnapshotOutcome {
-            id: SnapshotId::new(head),
-            summary,
-        }))
+        Ok(SnapshotReport {
+            committed: Some(SnapshotOutcome {
+                id: SnapshotId::new(head),
+                summary,
+            }),
+            quarantined,
+        })
     }
 
     fn log(&self, filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError> {
@@ -520,6 +648,24 @@ impl VcsBackend for GitBackend {
             return Err(classify_failure("log", &out));
         }
         parse_log(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        // `-z` delimits with NUL so unusual filenames arrive unquoted, and the
+        // output stays raw bytes end-to-end (the same discipline
+        // `scan_untracked` uses): a lossy decode would rewrite a non-UTF-8
+        // tracked name and let it slip past a filename-pattern audit. An
+        // unborn HEAD (nothing committed yet) simply lists nothing — success,
+        // not an error.
+        let out = git_output(&self.path, &[], ["ls-files", "-z"], false)?;
+        if !out.status.success() {
+            return Err(classify_failure("ls-files", &out));
+        }
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(bytes_to_path)
+            .collect()
     }
 
     fn diff(
@@ -940,6 +1086,42 @@ fn literal_pathspec(path: &Path) -> OsString {
     spec
 }
 
+/// Builds an *exclude* literal git pathspec (`:(exclude,literal)<path>`), which
+/// subtracts `path` from a sweep and matches it verbatim (no glob) — the
+/// combined `exclude`+`literal` magic mirrors [`literal_pathspec`]'s use of
+/// `literal` alone. Used to withhold quarantined secrets from `git add`
+/// (VRD-22). Non-UTF-8 path bytes are preserved (the path's `OsStr` is appended
+/// verbatim), so the pathspec byte-matches the enumerated path exactly.
+fn exclude_pathspec(path: &Path) -> OsString {
+    let mut spec = OsString::from(":(exclude,literal)");
+    spec.push(path.as_os_str());
+    spec
+}
+
+/// Turns a raw NUL-delimited `ls-files -z` path field into a [`PathBuf`] with no
+/// lossy decoding (VRD-22). On unix the bytes become an `OsStr` verbatim, so a
+/// non-UTF-8 path round-trips exactly — into an exclude pathspec, or through the
+/// tracked-file audit unchanged. On a platform without `OsStrExt`, a non-UTF-8
+/// path cannot be reconstructed byte-exact, so rather than risk a secret the
+/// exclusion or audit would miss, the operation fails.
+#[cfg(unix)]
+fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(OsStr::from_bytes(raw)))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => Ok(PathBuf::from(s)),
+        Err(_) => Err(VcsError::Parse(format!(
+            "path is not valid UTF-8 and cannot be handled byte-exact on this \
+             platform, so secret scanning cannot act on it safely: {:?}",
+            String::from_utf8_lossy(raw)
+        ))),
+    }
+}
+
 /// Whether two paths refer to the same directory, resolving symlinks (macOS
 /// `/tmp` -> `/private/tmp`, for instance).
 fn same_dir(a: &Path, b: &Path) -> Result<bool, VcsError> {
@@ -1347,6 +1529,21 @@ mod tests {
         );
         // Second record has no trailer.
         assert_eq!(snaps[1].trigger, None);
+    }
+
+    #[test]
+    fn exclude_pathspec_is_literal_and_verbatim() {
+        // The exclude+literal magic prefix is applied and the path is appended
+        // verbatim, so a path with glob-active characters is subtracted exactly,
+        // never re-interpreted as a pattern.
+        assert_eq!(
+            exclude_pathspec(Path::new(".env")),
+            OsString::from(":(exclude,literal).env")
+        );
+        assert_eq!(
+            exclude_pathspec(Path::new("weird [dir]/*.pem")),
+            OsString::from(":(exclude,literal)weird [dir]/*.pem")
+        );
     }
 
     #[test]

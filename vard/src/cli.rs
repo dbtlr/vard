@@ -176,6 +176,13 @@ queuing work the daemon will drop — resume it, or stop the daemon to snapshot 
 in-process (an in-process manual snapshot of a paused watch is still allowed, \
 as explicit intent).
 
+An in-process snapshot scans newly-added files for likely secrets and WITHHOLDS \
+any it finds from the commit (the same per-watch scanning the daemon does), \
+unless the watch sets `secret_scan = false`. A withheld file stays on disk, \
+uncommitted; the command names it on stderr and still exits 0 (quarantine is a \
+warning, not a failure). Move it out of the watch, or disable scanning for the \
+watch, to include it.
+
 `-m` prepends a message paragraph to the generated snapshot subject.")]
     Snapshot(SnapshotArgs),
 
@@ -276,11 +283,12 @@ protective snapshot, since nothing is modified). A whole-tree dry-run excludes \
 files added after the chosen point, which a restore keeps rather than removes.
 
 If the daemon is running it keeps ownership of the repository; the restore \
-still proceeds (git's own index lock serializes it against the daemon), and the \
-daemon will snapshot the restored state afterward — that is by design. In that \
-daemon-running case the restore is NOT journaled (only the lock holder journals), \
-so if this command crashes mid-restore a leftover git lock may need clearing by \
-hand — a tracked doctor-tool follow-up. Restoring a path that does not exist at \
+still proceeds (the watch's operation lock serializes it against the daemon's \
+worker), and the daemon will snapshot the restored state afterward — that is by \
+design. The restore records a recoverable journal entry whether or not a daemon \
+is running, so a crash mid-restore leaves a record a later daemon start or \
+`watch remove` uses to prove any leftover git lock stale and clean it. \
+Restoring a path that does not exist at \
 the chosen reference reports a friendly error naming the path and the reference.")]
     Restore(RestoreArgs),
 

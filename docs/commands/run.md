@@ -79,7 +79,9 @@ sync_pulled = "stow ."                 # and after pulling remote changes
 
 Event keys are the event's name with its first `.` written as `_` (so `snapshot.completed` is keyed `snapshot_completed`, `watch.state_changed` is keyed `watch_state_changed`). A misspelled or misplaced key is refused when the config loads, naming the bad key — it never silently does nothing.
 
-**Watch events** (under `[watch.hooks]`): `snapshot_started`, `snapshot_completed`, `snapshot_failed`, `snapshot_skipped`, `sync_pushed`, `sync_pulled`, `sync_conflict`, `sync_resolved`, `sync_failed`, `sync_skipped`, `restore_completed`, `watch_state_changed`.
+**Watch events** (under `[watch.hooks]`): `snapshot_started`, `snapshot_completed`, `snapshot_failed`, `snapshot_skipped`, `snapshot_quarantined`, `sync_pushed`, `sync_pulled`, `sync_conflict`, `sync_resolved`, `sync_failed`, `sync_skipped`, `restore_completed`, `watch_state_changed`.
+
+`snapshot_quarantined` fires when a snapshot pass withheld one or more newly-added files as likely secrets ([secret quarantine](snapshot.md#secret-quarantine)); its hook receives only a **count** (`VARD_QUARANTINED_COUNT`), never the file names or any secret bytes.
 
 **Daemon events** (under `[hooks]`): `daemon_started`, `daemon_stopped`, `update_available`.
 
@@ -111,6 +113,7 @@ Every hook is passed an enumerated set of `VARD_*` variables; an unset one is **
 | `VARD_REF` | `snapshot.completed`, `sync.pushed`, `sync.pulled`, `restore.completed` | the resulting commit / ref |
 | `VARD_PREV_REF` | `sync.pulled`, `restore.completed` | the ref before the change |
 | `VARD_FILES_CHANGED` | `snapshot.completed` | number of files changed in the snapshot |
+| `VARD_QUARANTINED_COUNT` | `snapshot.quarantined` | number of newly-added files withheld as likely secrets (count only — never the names) |
 | `VARD_ERROR` | `snapshot.failed`, `sync.failed` | the failure reason |
 
 There is no file list and no JSON payload: a hook that needs the exact set of changed files reads git history in the watched repo (`VARD_REF` and `VARD_PREV_REF` bound the range).
