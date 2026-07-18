@@ -24,10 +24,12 @@
 //! # Scope
 //!
 //! Local checks: git presence/version, inotify limits vs watched-tree size
-//! (Linux), health-file freshness, request-dir hygiene, and a per-watch secret
-//! audit. One network check: a per-watch **remote-auth** probe (a read-only
-//! `git ls-remote`), which `--offline` renders `skipped`. Agent/keychain and
-//! linger checks are deferred to service-install (VRD-24).
+//! (Linux), health-file freshness, request-dir hygiene, a per-watch secret
+//! audit, systemd linger (Linux), and service-context agent/keychain
+//! reachability. One network check: a per-watch **remote-auth** probe (a
+//! read-only `git ls-remote`), which `--offline` renders `skipped`. The linger
+//! and service-agent checks are local probes too and are never gated on
+//! `--offline`.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -57,12 +59,21 @@ const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] = &[
     check_request_dir,
     check_secret_audit,
     check_remote_auth,
+    check_linger,
+    check_service_agent,
 ];
 
 /// Wall-clock bound on each per-watch remote-auth probe, so a dead VPN or a
 /// prompt-wanting remote cannot hang doctor. Each watch is probed independently
 /// under this same bound (see [`check_remote_auth`]).
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wall-clock bound on doctor's own service-context probes (`loginctl`,
+/// `systemctl --user show-environment`, `launchctl print`) — local
+/// login-session queries that should answer in well under a second, bounded
+/// generously against a wedged session. Shorter than [`REMOTE_PROBE_TIMEOUT`]
+/// since these never touch the network.
+const SERVICE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single check's status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -978,6 +989,382 @@ fn redact_userinfo(line: &str) -> String {
     out
 }
 
+// --- check 7: systemd linger (Linux) --------------------------------------
+
+/// What [`check_linger`] found about the systemd user-service unit and, when
+/// one is installed, whether lingering is enabled for the user (so the unit
+/// survives logout).
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum LingerState {
+    /// No `vard service` unit is installed — lingering is moot.
+    NotInstalled,
+    /// A unit is installed; here is what `loginctl` reported about lingering.
+    Installed(LoginctlProbe),
+}
+
+/// The `loginctl show-user --property=Linger --value` outcome.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum LoginctlProbe {
+    /// Lingering is enabled for the user.
+    Enabled,
+    /// Lingering is disabled for the user.
+    Disabled,
+    /// `loginctl` is missing, failed, or its output could not be parsed as
+    /// `yes`/`no`. Carries a one-line detail (the command's own failure
+    /// summary, or a note about the unparseable output).
+    Unavailable(String),
+}
+
+/// Linux: the systemd user unit stops at logout unless lingering is enabled
+/// (`vard service install`'s own consent flow — see
+/// [`systemd::should_prompt`](crate::service::systemd::should_prompt)). This
+/// check reports the *current* state so a service installed non-interactively
+/// (or with `--no-linger`) is not silently stopping at every logout.
+#[cfg(target_os = "linux")]
+fn check_linger(_ctx: &Ctx) -> Vec<CheckRow> {
+    vec![evaluate_linger(&probe_linger())]
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_linger(_ctx: &Ctx) -> Vec<CheckRow> {
+    vec![row(
+        "linger",
+        Status::Skipped,
+        "not applicable on this platform — linger is a systemd concept for keeping a user \
+         service alive past logout; launchd has no equivalent",
+    )]
+}
+
+/// Gathers the linger state: the unit's install path is the service module's
+/// own [`systemd::unit_path`](crate::service::systemd::unit_path) — the same
+/// single source of truth `vard service` itself writes to — so this check
+/// never guesses a path of its own.
+#[cfg(target_os = "linux")]
+fn probe_linger() -> LingerState {
+    let unit_installed = crate::service::systemd::unit_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    if !unit_installed {
+        return LingerState::NotInstalled;
+    }
+    let user = current_user();
+    let out = crate::service::run_bounded(
+        "loginctl",
+        &["show-user", &user, "--property=Linger", "--value"],
+        SERVICE_PROBE_TIMEOUT,
+    );
+    LingerState::Installed(classify_loginctl(&out))
+}
+
+/// The identity to pass `loginctl`/`systemctl`: `$USER` when set, else the
+/// numeric UID from rustix (both tools accept a UID in place of a username).
+#[cfg(target_os = "linux")]
+fn current_user() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| rustix::process::getuid().as_raw().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn classify_loginctl(out: &crate::service::RunOutput) -> LoginctlProbe {
+    if !out.success() {
+        return LoginctlProbe::Unavailable(out.detail());
+    }
+    match out.stdout.trim() {
+        "yes" => LoginctlProbe::Enabled,
+        "no" => LoginctlProbe::Disabled,
+        other => LoginctlProbe::Unavailable(format!("unexpected `loginctl` output: {other:?}")),
+    }
+}
+
+/// Decides the linger row from the gathered [`LingerState`], so the decision
+/// table tests without a real systemd user session.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn evaluate_linger(state: &LingerState) -> CheckRow {
+    match state {
+        LingerState::NotInstalled => row(
+            "linger",
+            Status::Ok,
+            "service not installed — linger not needed yet",
+        ),
+        LingerState::Installed(LoginctlProbe::Enabled) => row(
+            "linger",
+            Status::Ok,
+            "lingering is enabled for this user — the service survives logout",
+        ),
+        LingerState::Installed(LoginctlProbe::Disabled) => row(
+            "linger",
+            Status::Warn,
+            "lingering is disabled — user services stop at logout; run `loginctl enable-linger` \
+             (or `vard service install` with `--linger`) to keep it running",
+        ),
+        LingerState::Installed(LoginctlProbe::Unavailable(detail)) => {
+            row("linger", Status::Skipped, detail.clone())
+        }
+    }
+}
+
+// --- check 8: service-context agent/keychain reachability ------------------
+
+/// Linux: the `systemd --user` environment the service context inherits from.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum SystemctlEnv {
+    /// `systemctl --user show-environment` succeeded; whether it listed an
+    /// `SSH_AUTH_SOCK=` line.
+    Read { has_ssh_auth_sock: bool },
+    /// `systemctl` is missing or the user bus is unreachable. Carries a
+    /// one-line failure summary.
+    Unavailable(String),
+}
+
+/// macOS: what `launchctl print` reported about the loaded LaunchAgent.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum LaunchctlPrint {
+    /// A `pid = ` line is present — the daemon is running.
+    Running,
+    /// No `pid = ` line, but a `last exit code = N` (nonzero) is — the
+    /// service is loaded but not running, having exited on its own.
+    Exited { code: i32 },
+    /// `launchctl print` exited nonzero — the label is not loaded.
+    NotLoaded,
+    /// The output does not match a recognized shape. Carries a short detail.
+    Unparsed(String),
+}
+
+/// Whether `url` is an ssh-style git remote (`git@host:path`, `ssh://…`, or
+/// anything else that is not plain HTTP(S)) — the shapes that need a running
+/// ssh-agent (or an interactively-unlocked key) to authenticate, unlike an
+/// HTTPS remote's credential-helper/keychain path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_ssh_remote(url: &str) -> bool {
+    !(url.starts_with("https://") || url.starts_with("http://"))
+}
+
+/// Reads the URL git has configured for a watch's remote (`git config --get
+/// remote.<name>.url`) — the same read-only, non-network lookup
+/// [`VcsBackend::has_remote`] performs internally, mirrored here directly
+/// since the trait does not expose the URL itself, only its presence. `None`
+/// for a non-syncing watch, an unopenable/unconfigured remote, or a failed
+/// lookup — such a watch simply does not count toward "has an ssh remote".
+#[cfg(target_os = "linux")]
+fn watch_remote_url(rw: &ResolvedWatch) -> Option<String> {
+    if !rw.spec.sync() {
+        return None;
+    }
+    let key = format!("remote.{}.url", rw.spec.remote());
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(rw.spec.path())
+        .args(["config", "--get", &key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Probes whether the service context (a systemd user manager, or a launchd
+/// GUI session) can reach an ssh-agent / the keychain — the credential paths a
+/// sync-enabled watch with an ssh remote needs, but which a login-session
+/// service manager does not always inherit.
+///
+/// **Linux**: a systemd user unit stops at logout unless lingering is on
+/// ([`check_linger`]), and even lingering does not guarantee `SSH_AUTH_SOCK`
+/// is exported into the user manager's environment — an ssh-agent started by
+/// a login shell lives outside it unless imported. This check probes for
+/// exactly that gap.
+///
+/// **macOS**: the LaunchAgent runs inside the user's own GUI login session
+/// (`gui/<uid>`), so the keychain and any ssh-agent socket are reachable by
+/// construction — there is nothing to probe for reachability. Instead this
+/// reports the service's actual loaded/running state, since that is the
+/// thing that can actually be wrong here.
+#[cfg(target_os = "linux")]
+fn check_service_agent(ctx: &Ctx) -> Vec<CheckRow> {
+    let has_ssh_remotes = ctx
+        .watches
+        .iter()
+        .any(|rw| watch_remote_url(rw).is_some_and(|u| is_ssh_remote(&u)));
+    let unit_installed = crate::service::systemd::unit_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let env = probe_systemctl_env();
+    vec![evaluate_service_agent_linux(
+        has_ssh_remotes,
+        unit_installed,
+        &env,
+    )]
+}
+
+#[cfg(target_os = "linux")]
+fn probe_systemctl_env() -> SystemctlEnv {
+    let out = crate::service::run_bounded(
+        "systemctl",
+        &["--user", "show-environment"],
+        SERVICE_PROBE_TIMEOUT,
+    );
+    if !out.success() {
+        return SystemctlEnv::Unavailable(out.detail());
+    }
+    let has_ssh_auth_sock = out
+        .stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("SSH_AUTH_SOCK="));
+    SystemctlEnv::Read { has_ssh_auth_sock }
+}
+
+/// Decides the Linux service-agent row, so the decision table tests without a
+/// real systemd user session.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn evaluate_service_agent_linux(
+    has_ssh_remotes: bool,
+    unit_installed: bool,
+    env: &SystemctlEnv,
+) -> CheckRow {
+    if !has_ssh_remotes {
+        return row(
+            "service-agent",
+            Status::Ok,
+            "no ssh remotes — agent not needed",
+        );
+    }
+    if !unit_installed {
+        return row(
+            "service-agent",
+            Status::Ok,
+            "service not installed — nothing to probe",
+        );
+    }
+    match env {
+        SystemctlEnv::Unavailable(detail) => row("service-agent", Status::Skipped, detail.clone()),
+        SystemctlEnv::Read {
+            has_ssh_auth_sock: true,
+        } => row(
+            "service-agent",
+            Status::Ok,
+            "SSH_AUTH_SOCK is set in the systemd user manager environment — ssh-remote syncs can \
+             reach your agent under the service",
+        ),
+        SystemctlEnv::Read {
+            has_ssh_auth_sock: false,
+        } => row(
+            "service-agent",
+            Status::Warn,
+            "the service context has no SSH_AUTH_SOCK in its systemd user manager environment, so \
+             ssh-remote sync auth may fail under the service — import it with `systemctl --user \
+             import-environment SSH_AUTH_SOCK` from a login shell (or an environment.d entry) \
+             after your agent starts",
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_service_agent(_ctx: &Ctx) -> Vec<CheckRow> {
+    let uid = rustix::process::getuid().as_raw();
+    let plist_exists = crate::service::launchd::plist_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let target = crate::service::launchd::service_target(uid);
+    let out = crate::service::run_bounded("launchctl", &["print", &target], SERVICE_PROBE_TIMEOUT);
+    let print = parse_launchctl_print(&out);
+    vec![evaluate_service_agent_macos(plist_exists, &print)]
+}
+
+/// Parses a captured `launchctl print` run for the shapes doctor cares about.
+/// Pure over the runner's output, so it is unit-tested against representative
+/// fixtures without a real launchd. `launchctl` failing to spawn or timing out
+/// is a probe failure, not evidence the service is unloaded, so only a *ran
+/// and exited nonzero* result is read as [`LaunchctlPrint::NotLoaded`] —
+/// everything else doctor cannot confidently interpret is
+/// [`LaunchctlPrint::Unparsed`], never a guess.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_launchctl_print(out: &crate::service::RunOutput) -> LaunchctlPrint {
+    if !out.spawned || out.timed_out {
+        return LaunchctlPrint::Unparsed(out.detail());
+    }
+    if !out.success() {
+        return LaunchctlPrint::NotLoaded;
+    }
+    let running = out.stdout.lines().any(|l| {
+        l.trim()
+            .strip_prefix("pid = ")
+            .is_some_and(|rest| rest.trim().parse::<u64>().is_ok())
+    });
+    if running {
+        return LaunchctlPrint::Running;
+    }
+    let exited = out.stdout.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("last exit code = ")?;
+        rest.trim().parse::<i32>().ok()
+    });
+    match exited {
+        Some(code) if code != 0 => LaunchctlPrint::Exited { code },
+        _ => {
+            let sample = if out.stdout.trim().is_empty() {
+                &out.stderr
+            } else {
+                &out.stdout
+            };
+            LaunchctlPrint::Unparsed(first_line(sample))
+        }
+    }
+}
+
+/// Decides the macOS service-agent row from the plist's presence and the
+/// parsed `launchctl print` state, so it tests without a real launchd.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn evaluate_service_agent_macos(plist_exists: bool, print: &LaunchctlPrint) -> CheckRow {
+    if !plist_exists {
+        return row(
+            "service-agent",
+            Status::Ok,
+            "service not installed — nothing to probe",
+        );
+    }
+    match print {
+        LaunchctlPrint::Running => row(
+            "service-agent",
+            Status::Ok,
+            "the LaunchAgent runs in your GUI login session, so the keychain and ssh-agent are \
+             reachable there; the service is loaded and running",
+        ),
+        LaunchctlPrint::Exited { code } => row(
+            "service-agent",
+            Status::Warn,
+            format!(
+                "the service is crash-looping/exiting (last exit {code}) — run `vard run` in the \
+                 foreground to see why"
+            ),
+        ),
+        LaunchctlPrint::NotLoaded => row(
+            "service-agent",
+            Status::Warn,
+            "the unit file is present but not loaded — run `vard service start`",
+        ),
+        LaunchctlPrint::Unparsed(detail) => row(
+            "service-agent",
+            Status::Skipped,
+            format!("could not interpret `launchctl print` output: {detail}"),
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn check_service_agent(_ctx: &Ctx) -> Vec<CheckRow> {
+    vec![row(
+        "service-agent",
+        Status::Skipped,
+        "not applicable on this platform — vard service is supported on macOS and Linux only",
+    )]
+}
+
 // --- rendering ------------------------------------------------------------
 
 /// Renders the checks in the resolved format: glyph lines on a terminal (the
@@ -1574,5 +1961,269 @@ mod tests {
         assert_eq!(Status::Skipped.exit_code(), 0);
         assert_eq!(Status::Warn.exit_code(), 1);
         assert_eq!(Status::Fail.exit_code(), 1);
+    }
+
+    // --- linger ---------------------------------------------------------
+
+    #[test]
+    fn linger_not_installed_is_ok_and_flag_only() {
+        let r = evaluate_linger(&LingerState::NotInstalled);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("not installed"), "got: {}", r.detail);
+        // Flag-only: never advises running an install command from this row.
+        assert!(
+            !r.detail.contains('`'),
+            "must not carry command advice: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn linger_enabled_is_ok() {
+        let r = evaluate_linger(&LingerState::Installed(LoginctlProbe::Enabled));
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("enabled"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn linger_disabled_warns_with_advice() {
+        let r = evaluate_linger(&LingerState::Installed(LoginctlProbe::Disabled));
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("enable-linger"), "got: {}", r.detail);
+        assert!(r.detail.contains("--linger"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn linger_loginctl_unavailable_is_skipped_with_detail() {
+        let r = evaluate_linger(&LingerState::Installed(LoginctlProbe::Unavailable(
+            "command not found".to_string(),
+        )));
+        assert_eq!(r.status, Status::Skipped);
+        assert_eq!(r.detail, "command not found");
+    }
+
+    // --- ssh-remote classification ---------------------------------------
+
+    #[test]
+    fn ssh_remote_classification() {
+        assert!(is_ssh_remote("git@github.com:acme/vault.git"));
+        assert!(is_ssh_remote("ssh://git@example.com/acme/vault.git"));
+        assert!(is_ssh_remote("/local/bare/repo.git"));
+        assert!(!is_ssh_remote("https://github.com/acme/vault.git"));
+        assert!(!is_ssh_remote("http://example.com/acme/vault.git"));
+    }
+
+    // --- service-agent (Linux) --------------------------------------------
+
+    #[test]
+    fn service_agent_linux_no_ssh_remotes_is_ok() {
+        let r = evaluate_service_agent_linux(
+            false,
+            true,
+            &SystemctlEnv::Read {
+                has_ssh_auth_sock: false,
+            },
+        );
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("no ssh remotes"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_linux_not_installed_is_ok() {
+        let r = evaluate_service_agent_linux(
+            true,
+            false,
+            &SystemctlEnv::Read {
+                has_ssh_auth_sock: false,
+            },
+        );
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("not installed"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_linux_systemctl_unavailable_is_skipped() {
+        let r = evaluate_service_agent_linux(
+            true,
+            true,
+            &SystemctlEnv::Unavailable("Failed to connect to bus".to_string()),
+        );
+        assert_eq!(r.status, Status::Skipped);
+        assert_eq!(r.detail, "Failed to connect to bus");
+    }
+
+    #[test]
+    fn service_agent_linux_socket_present_is_ok() {
+        let r = evaluate_service_agent_linux(
+            true,
+            true,
+            &SystemctlEnv::Read {
+                has_ssh_auth_sock: true,
+            },
+        );
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("SSH_AUTH_SOCK"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_linux_socket_missing_warns_with_advice() {
+        let r = evaluate_service_agent_linux(
+            true,
+            true,
+            &SystemctlEnv::Read {
+                has_ssh_auth_sock: false,
+            },
+        );
+        assert_eq!(r.status, Status::Warn);
+        assert!(
+            r.detail.contains("import-environment SSH_AUTH_SOCK"),
+            "got: {}",
+            r.detail
+        );
+    }
+
+    // --- launchctl print parser (macOS) ------------------------------------
+
+    /// A successful, zero-exit run with the given captured stdout — the shape
+    /// [`crate::service::run_bounded`] returns for a clean `launchctl print`.
+    fn run_ok(stdout: &str) -> crate::service::RunOutput {
+        crate::service::RunOutput {
+            spawned: true,
+            code: Some(0),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn launchctl_print_running_from_pid_line() {
+        let out =
+            run_ok("com.dbtlr.vard = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n");
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Running
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_nonzero_last_exit_without_pid() {
+        let out = run_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n");
+        match parse_launchctl_print(&out) {
+            LaunchctlPrint::Exited { code } => assert_eq!(code, 2),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launchctl_print_not_loaded_on_command_failure() {
+        // launchctl ran and exited nonzero — the ordinary "label not loaded"
+        // shape.
+        let out = crate::service::RunOutput {
+            spawned: true,
+            code: Some(113),
+            stdout: String::new(),
+            stderr: "Could not find service \"com.dbtlr.vard\" in domain for port".to_string(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::NotLoaded
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_missing_binary_is_unparsed_not_not_loaded() {
+        // launchctl itself failed to spawn — a probe failure, not evidence the
+        // service is unloaded, so this must not be misread as "not loaded"
+        // (which would wrongly advise `vard service start`).
+        let out = crate::service::RunOutput {
+            spawned: false,
+            code: None,
+            stdout: String::new(),
+            stderr: "No such file or directory (os error 2)".to_string(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_timeout_is_unparsed_not_not_loaded() {
+        let out = crate::service::RunOutput {
+            spawned: true,
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_clean_last_exit_with_no_pid_is_unparsed() {
+        // Loaded, no pid line, and a *zero* last exit code is an ambiguous
+        // quiescent shape doctor does not claim to interpret — skipped, not
+        // guessed at.
+        let out = run_ok("com.dbtlr.vard = {\n\tlast exit code = 0\n\tstate = not running\n}\n");
+        assert!(matches!(
+            parse_launchctl_print(&out),
+            LaunchctlPrint::Unparsed(_)
+        ));
+    }
+
+    #[test]
+    fn launchctl_print_unrecognized_shape_is_unparsed_with_detail() {
+        let out = run_ok("something unexpected\n");
+        match parse_launchctl_print(&out) {
+            LaunchctlPrint::Unparsed(detail) => assert_eq!(detail, "something unexpected"),
+            other => panic!("expected Unparsed, got {other:?}"),
+        }
+    }
+
+    // --- service-agent (macOS) ----------------------------------------------
+
+    #[test]
+    fn service_agent_macos_plist_absent_is_ok() {
+        let r = evaluate_service_agent_macos(false, &LaunchctlPrint::Running);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("not installed"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_macos_running_is_ok() {
+        let r = evaluate_service_agent_macos(true, &LaunchctlPrint::Running);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("running"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_macos_exited_warns_and_names_the_code() {
+        let r = evaluate_service_agent_macos(true, &LaunchctlPrint::Exited { code: 78 });
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("78"), "got: {}", r.detail);
+        assert!(r.detail.contains("vard run"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_macos_not_loaded_warns_with_start_advice() {
+        let r = evaluate_service_agent_macos(true, &LaunchctlPrint::NotLoaded);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("vard service start"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn service_agent_macos_unparsed_is_skipped_with_detail() {
+        let r = evaluate_service_agent_macos(
+            true,
+            &LaunchctlPrint::Unparsed("garbled output".to_string()),
+        );
+        assert_eq!(r.status, Status::Skipped);
+        assert!(r.detail.contains("garbled output"), "got: {}", r.detail);
     }
 }

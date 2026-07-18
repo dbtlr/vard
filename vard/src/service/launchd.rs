@@ -95,7 +95,11 @@ fn domain(uid: u32) -> String {
     format!("gui/{uid}")
 }
 
-fn service_target(uid: u32) -> String {
+/// `gui/<uid>/<label>` — the launchd service target `launchctl print`,
+/// `bootout`, and `kickstart` all address the LaunchAgent by. Shared with
+/// doctor's `service-agent` check, which prints the same target to read the
+/// service's actual loaded/running state.
+pub(crate) fn service_target(uid: u32) -> String {
     format!("gui/{uid}/{LABEL}")
 }
 

@@ -389,7 +389,8 @@ nothing.")]
     Logs(LogsArgs),
 
     /// Diagnose the local vard environment read-only: git, inotify limits,
-    /// health-file freshness, request-queue hygiene, and a per-watch secret audit.
+    /// health-file freshness, request-queue hygiene, a per-watch secret audit,
+    /// systemd linger, and service-context agent reachability.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
 Diagnose the local vard environment, read-only.
@@ -434,18 +435,33 @@ probe, which `--offline` skips):
                 watch that does not sync, or has no remote defined, is `skipped`;
                 a repository that cannot be opened `warn`s. This is the one
                 network check — `--offline` skips it, rendering `skipped`
+  linger        (Linux only) whether the systemd user unit survives logout —
+                `loginctl show-user --property=Linger`. No unit installed is
+                `ok` (nothing to do yet); installed with lingering enabled is
+                `ok`; installed with lingering disabled `warn`s with the fix
+                (`loginctl enable-linger`, or `vard service install` with
+                `--linger`). On macOS this is `skipped` — launchd has no
+                linger concept
+  service-agent whether the service context can reach an ssh-agent for any
+                ssh-remote watch. On Linux: no ssh remotes is `ok`; no service
+                installed is `ok`; otherwise probes `systemctl --user
+                show-environment` for `SSH_AUTH_SOCK` — present is `ok`,
+                missing `warn`s with the fix (`systemctl --user
+                import-environment SSH_AUTH_SOCK`). On macOS the LaunchAgent
+                always runs inside the user's own GUI login session, so the
+                keychain and ssh-agent are reachable there by construction;
+                instead this reports the service's own loaded/running state
+                via `launchctl print` — running is `ok`, crash-looping or not
+                loaded `warn`s
 
-`--offline` skips every network check (today: remote-auth), so doctor runs the \
-local checks only.
+`--offline` skips every network check (today: remote-auth); `linger` and
+`service-agent` are local probes and always run, `--offline` or not.
 
 Exit codes: 0 when every check is `ok` or `skipped`; 1 when any check `warn`s \
 or `fail`s (attention); 2 when doctor itself could not run (an unresolvable \
 state directory, an invalid config). Output follows the global `--format`: \
 human glyph lines by default, or a stable JSON/JSONL array when piped (a \
-per-watch row carries its own `watch` field).
-
-Agent/keychain and service-linger checks are deferred to the service-install \
-command (VRD-24).")]
+per-watch row carries its own `watch` field).")]
     Doctor(DoctorArgs),
 
     /// Read and edit vard's configuration: get, set, unset, edit, path.

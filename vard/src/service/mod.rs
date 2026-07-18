@@ -194,6 +194,12 @@ pub(crate) struct RunOutput {
     pub(crate) spawned: bool,
     /// The process exit code, or `None` when it was killed or never launched.
     pub(crate) code: Option<i32>,
+    /// Captured stdout. The service verbs themselves never need it (their
+    /// commands are actioned by exit code alone), but doctor's service-context
+    /// probes (`loginctl show-user --value`, `systemctl --user
+    /// show-environment`, `launchctl print`) parse it, so [`run_bounded`]
+    /// captures it unconditionally rather than growing a second variant.
+    pub(crate) stdout: String,
     /// Captured stderr (used to summarize a failure).
     pub(crate) stderr: String,
     /// Whether the process was killed for exceeding [`RUN_TIMEOUT`].
@@ -287,8 +293,10 @@ impl Prompt for StdinPrompt {
 
 /// Runs `program args` with a wall-clock bound, draining both pipes concurrently
 /// and killing the child's process group on the deadline so a wedged transport
-/// cannot outlive it.
-fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> RunOutput {
+/// cannot outlive it. Shared by the service verbs (launchctl/systemctl/loginctl)
+/// and doctor's own service-context probes — the single bounded-subprocess seam
+/// for every login-session tool vard shells out to.
+pub(crate) fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> RunOutput {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -306,6 +314,7 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> RunOutput {
             return RunOutput {
                 spawned: false,
                 code: None,
+                stdout: String::new(),
                 stderr: e.to_string(),
                 timed_out: false,
             };
@@ -313,12 +322,11 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> RunOutput {
     };
 
     let mut child_stderr = child.stderr.take().expect("stderr was piped");
-    // Drain stdout to a discard sink so a chatty child cannot wedge on a full
-    // pipe buffer while we poll for its exit.
     let mut child_stdout = child.stdout.take().expect("stdout was piped");
     let stdout_reader = std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = child_stdout.read_to_end(&mut sink);
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        buf
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -342,11 +350,12 @@ fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> RunOutput {
         }
     };
 
-    let _ = stdout_reader.join();
+    let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
     RunOutput {
         spawned: true,
         code,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
     }
@@ -497,6 +506,7 @@ mod tests {
         RunOutput {
             spawned: true,
             code: Some(0),
+            stdout: String::new(),
             stderr: String::new(),
             timed_out: false,
         }
@@ -506,6 +516,7 @@ mod tests {
         RunOutput {
             spawned: true,
             code: Some(1),
+            stdout: String::new(),
             stderr: stderr.to_string(),
             timed_out: false,
         }
@@ -515,6 +526,7 @@ mod tests {
         RunOutput {
             spawned: false,
             code: None,
+            stdout: String::new(),
             stderr: "No such file or directory (os error 2)".to_string(),
             timed_out: false,
         }
