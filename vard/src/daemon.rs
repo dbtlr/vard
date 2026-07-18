@@ -370,44 +370,103 @@ fn holder_desc(holder: Option<u32>) -> String {
     holder.map_or_else(|| "PID unknown".to_string(), |pid| format!("PID {pid}"))
 }
 
-/// Loads and validates the config for startup, mapping every failure to a clear
-/// stderr message and exit code 2. A missing file and a config that *defines*
-/// no watches are both "nothing to do" errors that point at `vard watch add`.
+/// Why `vard run`'s startup config validation would refuse to start the daemon.
+/// Produced by [`check_startup_config`] — the single load-and-validate decision
+/// shared by `vard run` and the `service` pre-flight (VRD-58), so the two can
+/// never drift on what "the daemon cannot start" means.
+#[derive(Debug)]
+pub(crate) enum StartupConfigError {
+    /// No config file exists yet — there is nothing to watch.
+    MissingConfig(PathBuf),
+    /// The config loaded and validated but defines no watches.
+    NoWatches(PathBuf),
+    /// The config could not be loaded or resolved (invalid TOML, a bad watch).
+    Invalid(String),
+}
+
+impl StartupConfigError {
+    /// The stderr message `vard run` prints (after the shared `vard: ` prefix)
+    /// when it refuses to start — byte-for-byte the wording run has always used.
+    pub(crate) fn run_message(&self) -> String {
+        match self {
+            StartupConfigError::MissingConfig(path) => format!(
+                "no config file at {}; there is nothing to watch yet. Add a watch with \
+                 `vard watch add`.",
+                path.display()
+            ),
+            StartupConfigError::NoWatches(path) => format!(
+                "config at {} defines no watches; add one with `vard watch add`.",
+                path.display()
+            ),
+            StartupConfigError::Invalid(message) => message.clone(),
+        }
+    }
+
+    /// The `service` pre-flight refusal message (VRD-58): the underlying reason
+    /// plus direct advice to fix it and re-run the verb. Surfaced as an exit-2
+    /// error, the same classification the daemon itself uses for a startup
+    /// config failure.
+    pub(crate) fn service_message(&self) -> String {
+        match self {
+            StartupConfigError::MissingConfig(path) => format!(
+                "the vard daemon has nothing to watch yet: no config file at {}. Add a watch with \
+                 `vard watch add`, then re-run.",
+                path.display()
+            ),
+            StartupConfigError::NoWatches(path) => format!(
+                "the vard daemon has nothing to watch yet: the config at {} defines no watches. \
+                 Add one with `vard watch add`, then re-run.",
+                path.display()
+            ),
+            StartupConfigError::Invalid(message) => {
+                format!(
+                    "the vard daemon would refuse to start: {message}. Fix the config, then re-run."
+                )
+            }
+        }
+    }
+}
+
+/// Loads and validates the config exactly as `vard run` does at startup, so the
+/// `service` pre-flight (VRD-58) reuses this one decision rather than a parallel
+/// one that could drift. Returns the loaded [`Config`] when `vard run` would
+/// start, or a [`StartupConfigError`] describing why it would refuse.
 ///
-/// A config that defines watches but has them *all paused* is not an error: the
-/// daemon starts idle (supervising nothing) and a `vard watch resume`
-/// hot-reloads it back to work. The zero-defined check therefore keys off
-/// [`Config::resolve_all`] (every defined watch, paused or not), not
-/// [`Config::resolve`] (active watches only). `resolve_all` also validates, so a
-/// genuinely invalid config still exits 2.
-fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
-    let config = match Config::load(&paths.config_file) {
+/// A missing file and a config that *defines* no watches are both "nothing to
+/// do" refusals that point at `vard watch add`. A config that defines watches
+/// but has them *all paused* is NOT a refusal: the daemon starts idle
+/// (supervising nothing) and a `vard watch resume` hot-reloads it back to work.
+/// The zero-defined check therefore keys off [`Config::resolve_all`] (every
+/// defined watch, paused or not), not [`Config::resolve`] (active watches only).
+/// `resolve_all` also validates, so a genuinely invalid config still refuses.
+/// Refusal is exactly the set of conditions `vard run` fails on, nothing
+/// stricter.
+pub(crate) fn check_startup_config(config_file: &Path) -> Result<Config, StartupConfigError> {
+    let config = match Config::load(config_file) {
         Ok(config) => config,
         Err(ConfigError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "vard: no config file at {}; there is nothing to watch yet. \
-                 Add a watch with `vard watch add`.",
-                paths.config_file.display()
-            );
-            return Err(ExitCode::from(2));
+            return Err(StartupConfigError::MissingConfig(config_file.to_path_buf()));
         }
-        Err(err) => {
-            eprintln!("vard: {err}");
-            return Err(ExitCode::from(2));
-        }
+        Err(err) => return Err(StartupConfigError::Invalid(err.to_string())),
     };
 
     match config.resolve_all() {
         Ok(defined) if defined.is_empty() => {
-            eprintln!(
-                "vard: config at {} defines no watches; add one with `vard watch add`.",
-                paths.config_file.display()
-            );
-            Err(ExitCode::from(2))
+            Err(StartupConfigError::NoWatches(config_file.to_path_buf()))
         }
         Ok(_) => Ok(config),
+        Err(err) => Err(StartupConfigError::Invalid(err.to_string())),
+    }
+}
+
+/// Loads and validates the config for `vard run` startup, mapping every failure
+/// to its stderr message and exit code 2 through the shared
+/// [`check_startup_config`] decision.
+fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
+    match check_startup_config(&paths.config_file) {
+        Ok(config) => Ok(config),
         Err(err) => {
-            eprintln!("vard: {err}");
+            eprintln!("vard: {}", err.run_message());
             Err(ExitCode::from(2))
         }
     }
@@ -1942,6 +2001,80 @@ impl SourceDiedBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- startup config check (shared with the service pre-flight, VRD-58) -----
+
+    /// Writes `body` to a fresh `config.toml` in a tempdir, returning both so the
+    /// dir outlives the path.
+    fn config_with(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn check_startup_config_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml"); // never written
+        match check_startup_config(&path) {
+            Err(StartupConfigError::MissingConfig(p)) => assert_eq!(p, path),
+            other => panic!("expected MissingConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_startup_config_defines_no_watches() {
+        let (_dir, path) = config_with("version = 1\n");
+        match check_startup_config(&path) {
+            Err(StartupConfigError::NoWatches(p)) => assert_eq!(p, path),
+            other => panic!("expected NoWatches, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_startup_config_invalid_is_reported() {
+        // Missing the required `version` key: a load/parse-level refusal.
+        let (_dir, path) = config_with("not = \"valid\"\n");
+        assert!(matches!(
+            check_startup_config(&path),
+            Err(StartupConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn check_startup_config_with_a_watch_is_startable() {
+        let (_dir, path) = config_with(
+            "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/tmp/vard-preflight-watch\"\n",
+        );
+        assert!(check_startup_config(&path).is_ok());
+    }
+
+    #[test]
+    fn check_startup_config_all_paused_is_startable() {
+        // Defined-but-paused watches are a legitimate idle daemon, not a refusal.
+        let (_dir, path) = config_with(
+            "version = 1\n\n[[watch]]\nname = \"w\"\npath = \"/tmp/vard-preflight-paused\"\npaused = true\n",
+        );
+        assert!(check_startup_config(&path).is_ok());
+    }
+
+    #[test]
+    fn startup_config_error_messages_carry_advice() {
+        let missing = StartupConfigError::MissingConfig(PathBuf::from("/x/config.toml"));
+        assert!(missing.run_message().contains("nothing to watch"));
+        assert!(missing.service_message().contains("vard watch add"));
+        assert!(missing.service_message().contains("re-run"));
+
+        let none = StartupConfigError::NoWatches(PathBuf::from("/x/config.toml"));
+        assert!(none.run_message().contains("defines no watches"));
+        assert!(none.service_message().contains("vard watch add"));
+
+        let bad = StartupConfigError::Invalid("boom".to_string());
+        assert_eq!(bad.run_message(), "boom");
+        assert!(bad.service_message().contains("boom"));
+        assert!(bad.service_message().contains("Fix the config"));
+    }
 
     // --- GitSyncSettler (crash-recovery settlement) ---------------------------
 

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use crate::atomic;
 use crate::command::CmdError;
 
-use super::OpEnv;
+use super::{OpEnv, PreflightOutcome};
 
 /// The LaunchAgent label and plist basename stem.
 const LABEL: &str = "com.dbtlr.vard";
@@ -132,6 +132,7 @@ pub(crate) fn install(
     plist: &Path,
     bin: &Path,
     dry_run: bool,
+    preflight: &PreflightOutcome,
 ) -> Result<Vec<String>, CmdError> {
     let content = render_plist(&bin.to_string_lossy());
 
@@ -149,8 +150,16 @@ pub(crate) fn install(
             "Would write the plist, bootstrap it into {}, and verify the daemon came up.",
             domain(uid)
         ));
+        if let Some(warning) = preflight.dry_run_warning() {
+            lines.push(String::new());
+            lines.push(warning);
+        }
         return Ok(lines);
     }
+
+    // Refuse before writing the plist or touching launchd if `vard run` itself
+    // could not start (VRD-58).
+    preflight.require_startable()?;
 
     atomic::write(plist, content.as_bytes())
         .map_err(|e| CmdError::err(format!("writing {}: {e}", plist.display())))?;
@@ -221,9 +230,19 @@ pub(crate) fn uninstall(env: &OpEnv, uid: u32, plist: &Path) -> Result<Vec<Strin
 }
 
 /// `vard service start`: load the service, or kick an already-loaded one, then
-/// verify. A missing plist advises `vard service install`.
+/// verify. A missing plist advises `vard service install`. Pre-flights the
+/// daemon config first (VRD-58): a config `vard run` could not start refuses
+/// before any launchctl call.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn start(env: &OpEnv, uid: u32, plist: &Path) -> Result<Vec<String>, CmdError> {
+pub(crate) fn start(
+    env: &OpEnv,
+    uid: u32,
+    plist: &Path,
+    preflight: &PreflightOutcome,
+) -> Result<Vec<String>, CmdError> {
+    // Refuse before touching launchd if `vard run` itself could not start.
+    preflight.require_startable()?;
+
     if !plist.exists() {
         return Err(CmdError::err(
             "no vard service is installed — run `vard service install` first",
@@ -275,9 +294,19 @@ pub(crate) fn stop(env: &OpEnv, uid: u32) -> Result<Vec<String>, CmdError> {
 
 /// `vard service restart`: kickstart with `-k` (kill and restart), loading the
 /// service first if it is not yet loaded, then verify. This is how macOS
-/// re-execs the daemon — launchd has no reload signal.
+/// re-execs the daemon — launchd has no reload signal. Pre-flights the daemon
+/// config first (VRD-58): a config `vard run` could not start refuses before any
+/// launchctl call.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn restart(env: &OpEnv, uid: u32, plist: &Path) -> Result<Vec<String>, CmdError> {
+pub(crate) fn restart(
+    env: &OpEnv,
+    uid: u32,
+    plist: &Path,
+    preflight: &PreflightOutcome,
+) -> Result<Vec<String>, CmdError> {
+    // Refuse before touching launchd if `vard run` itself could not start.
+    preflight.require_startable()?;
+
     let target = service_target(uid);
     let out = env
         .runner
@@ -322,6 +351,19 @@ mod tests {
             liveness: live,
             prompt,
         }
+    }
+
+    /// A pre-flight that lets the verb proceed — the default for flows that are
+    /// not exercising the VRD-58 refusal.
+    fn startable() -> PreflightOutcome {
+        PreflightOutcome::Startable
+    }
+
+    /// A pre-flight that refuses, carrying a recognizable advice message.
+    fn refused() -> PreflightOutcome {
+        PreflightOutcome::Refused(
+            "nothing to watch — add a watch with `vard watch add`".to_string(),
+        )
     }
 
     #[test]
@@ -371,7 +413,15 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let lines = install(&e, 501, &plist, Path::new("/opt/homebrew/bin/vard"), false).unwrap();
+        let lines = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/opt/homebrew/bin/vard"),
+            false,
+            &startable(),
+        )
+        .unwrap();
         assert!(plist.exists(), "plist should be written");
         assert_eq!(
             runner.calls(),
@@ -390,7 +440,15 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        install(&e, 501, &plist, Path::new("/usr/local/bin/vard"), false).unwrap();
+        install(
+            &e,
+            501,
+            &plist,
+            Path::new("/usr/local/bin/vard"),
+            false,
+            &startable(),
+        )
+        .unwrap();
         let calls = runner.calls();
         assert_eq!(calls.len(), 3);
         assert!(calls[1].starts_with("launchctl bootout gui/501/com.dbtlr.vard"));
@@ -406,7 +464,15 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let err = install(&e, 501, &plist, Path::new("/usr/local/bin/vard"), false).unwrap_err();
+        let err = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/usr/local/bin/vard"),
+            false,
+            &startable(),
+        )
+        .unwrap_err();
         assert!(err.message().contains("did not come up"));
     }
 
@@ -419,7 +485,15 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let err = install(&e, 501, &plist, Path::new("/usr/local/bin/vard"), false).unwrap_err();
+        let err = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/usr/local/bin/vard"),
+            false,
+            &startable(),
+        )
+        .unwrap_err();
         assert!(err.message().contains("bootstrap failed"));
     }
 
@@ -432,7 +506,15 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let lines = install(&e, 501, &plist, Path::new("/opt/homebrew/bin/vard"), true).unwrap();
+        let lines = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/opt/homebrew/bin/vard"),
+            true,
+            &startable(),
+        )
+        .unwrap();
         assert!(!plist.exists(), "dry run must not write the plist");
         assert!(runner.calls().is_empty(), "dry run must not shell out");
         let text = lines.join("\n");
@@ -440,6 +522,60 @@ mod tests {
         assert!(text.contains("/opt/homebrew/bin/vard"));
         assert!(text.contains("gui/501"));
         assert!(text.contains("<key>Label</key>"));
+    }
+
+    #[test]
+    fn install_refuses_when_preflight_fails_before_touching_launchd() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/opt/homebrew/bin/vard"),
+            false,
+            &refused(),
+        )
+        .unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(!plist.exists(), "refusal must not write the plist");
+        assert!(
+            runner.calls().is_empty(),
+            "refusal must not shell out to launchctl"
+        );
+    }
+
+    #[test]
+    fn dry_run_warns_when_preflight_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        let runner = FakeRunner::new(vec![]); // dry run never shells out
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = install(
+            &e,
+            501,
+            &plist,
+            Path::new("/opt/homebrew/bin/vard"),
+            true,
+            &refused(),
+        )
+        .unwrap();
+        assert!(!plist.exists(), "dry run must not write the plist");
+        let text = lines.join("\n");
+        assert!(text.contains("Dry run"));
+        assert!(
+            text.contains("WARNING: install would refuse"),
+            "dry run must surface the pre-flight warning, got: {text}"
+        );
+        assert!(text.contains("vard watch add"));
     }
 
     #[test]
@@ -480,8 +616,26 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let err = start(&e, 501, &plist).unwrap_err();
+        let err = start(&e, 501, &plist, &startable()).unwrap_err();
         assert!(err.message().contains("vard service install"));
+    }
+
+    #[test]
+    fn start_refuses_when_preflight_fails_before_any_launchctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = start(&e, 501, &plist, &refused()).unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(
+            runner.calls().is_empty(),
+            "refusal must precede every launchctl call, even the state probe"
+        );
     }
 
     #[test]
@@ -494,7 +648,7 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        start(&e, 501, &plist).unwrap();
+        start(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
         assert!(calls[1].starts_with("launchctl kickstart gui/501/com.dbtlr.vard"));
     }
@@ -531,7 +685,7 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        restart(&e, 501, &plist).unwrap();
+        restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
         assert_eq!(calls[0], "launchctl kickstart -k gui/501/com.dbtlr.vard");
     }
@@ -546,8 +700,23 @@ mod tests {
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        restart(&e, 501, &plist).unwrap();
+        restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
         assert!(calls[1].starts_with("launchctl bootstrap gui/501"));
+    }
+
+    #[test]
+    fn restart_refuses_when_preflight_fails_before_any_launchctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = restart(&e, 501, &plist, &refused()).unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(runner.calls().is_empty());
     }
 }

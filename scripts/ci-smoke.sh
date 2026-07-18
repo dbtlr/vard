@@ -126,6 +126,28 @@ mkdir -p "$HOME"
 git config --file "$GIT_CONFIG_GLOBAL" user.email smoke@example.com
 git config --file "$GIT_CONFIG_GLOBAL" user.name "Vard Smoke"
 
+# vard service pre-flight (VRD-58): with no config yet in this fresh sandbox,
+# the daemon-(re)starting verbs must refuse BEFORE touching any unit or service
+# manager. This runs here, before the first `vard watch add` creates a config.
+# `install` (real, not dry-run) must exit 2 with add-a-watch advice and write
+# nothing — the refusal precedes even the platform reachability probe, so it is
+# the same on macOS and a systemd-less Linux CI box.
+if preflight_out="$("$VARD" service install 2>&1)"; then
+  fail "vard service install with no config must exit non-zero, not 0"
+else
+  test "$?" -eq 2 || fail "vard service install with no config must exit 2 (pre-flight refusal)"
+fi
+printf '%s\n' "$preflight_out" | grep -q 'vard watch add' \
+  || fail "vard service install pre-flight refusal did not advise 'vard watch add'"
+test ! -e "$XDG_CONFIG_HOME/vard/config.toml" \
+  || fail "vard service install pre-flight refusal must not create a config"
+# The dry-run never refuses (exits 0) but must surface the clearly-marked
+# warning while the config is still absent.
+service_preflight_dry="$("$VARD" service install --dry-run)" \
+  || fail "vard service install --dry-run must exit 0 even when the pre-flight would refuse"
+printf '%s\n' "$service_preflight_dry" | grep -q 'WARNING: install would refuse' \
+  || fail "vard service install --dry-run did not surface the pre-flight WARNING with no config"
+
 WDIR="$SMOKE_TMP/repo"
 mkdir -p "$WDIR"
 "$VARD" watch add "$WDIR" --name smoke --init </dev/null >/dev/null || fail "vard watch add --init failed"

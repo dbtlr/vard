@@ -109,6 +109,59 @@ fn emit_lines(lines: &[String]) -> CmdResult {
     command::finish_write(res)
 }
 
+// --- daemon-startup pre-flight (VRD-58) ------------------------------------
+
+/// Whether `vard run` could start right now — the pre-flight the daemon-
+/// (re)starting service verbs (`install`, `start`, `restart`) run before they
+/// touch any unit or service-manager state. Computed once from the *same*
+/// load-and-validate path `vard run` performs at startup
+/// ([`crate::daemon::check_startup_config`]), so a verb refuses exactly when the
+/// daemon it would start could not start — never a parallel check that can
+/// drift. `stop` and `uninstall` never pre-flight.
+pub(crate) enum PreflightOutcome {
+    /// `vard run` would start — proceed.
+    Startable,
+    /// `vard run` would refuse; carries the exit-2 refusal message (advice
+    /// included), for the verb to surface verbatim.
+    Refused(String),
+}
+
+impl PreflightOutcome {
+    /// The gate each (re)starting verb applies before touching service-manager
+    /// state: `Ok(())` when startable, else the refusal as an exit-2
+    /// [`CmdError`].
+    pub(crate) fn require_startable(&self) -> Result<(), CmdError> {
+        match self {
+            PreflightOutcome::Startable => Ok(()),
+            PreflightOutcome::Refused(message) => Err(CmdError::err(message.clone())),
+        }
+    }
+
+    /// The clearly-marked warning line `install --dry-run` appends when the
+    /// pre-flight would refuse (dry-run itself always exits 0), or `None`.
+    pub(crate) fn dry_run_warning(&self) -> Option<String> {
+        match self {
+            PreflightOutcome::Startable => None,
+            PreflightOutcome::Refused(message) => {
+                Some(format!("WARNING: install would refuse — {message}"))
+            }
+        }
+    }
+}
+
+/// Runs the daemon-startup pre-flight against the real config path, reusing
+/// `vard run`'s own [`check_startup_config`](crate::daemon::check_startup_config)
+/// decision.
+fn preflight_config() -> PreflightOutcome {
+    match paths::config_file() {
+        Ok(config_file) => match crate::daemon::check_startup_config(&config_file) {
+            Ok(_) => PreflightOutcome::Startable,
+            Err(err) => PreflightOutcome::Refused(err.service_message()),
+        },
+        Err(err) => PreflightOutcome::Refused(format!("cannot locate the vard config: {err}")),
+    }
+}
+
 // --- backend selection ----------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -118,12 +171,12 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, _is_tty: bool) -> Result<Vec<Strin
     match cmd {
         ServiceCommand::Install(args) => {
             let bin = resolve_service_binary()?;
-            launchd::install(env, uid, &plist, &bin, args.dry_run)
+            launchd::install(env, uid, &plist, &bin, args.dry_run, &preflight_config())
         }
         ServiceCommand::Uninstall => launchd::uninstall(env, uid, &plist),
-        ServiceCommand::Start => launchd::start(env, uid, &plist),
+        ServiceCommand::Start => launchd::start(env, uid, &plist, &preflight_config()),
         ServiceCommand::Stop => launchd::stop(env, uid),
-        ServiceCommand::Restart => launchd::restart(env, uid, &plist),
+        ServiceCommand::Restart => launchd::restart(env, uid, &plist, &preflight_config()),
     }
 }
 
@@ -133,6 +186,7 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, is_tty: bool) -> Result<Vec<String
     match cmd {
         ServiceCommand::Install(args) => {
             let bin = resolve_service_binary()?;
+            let preflight = preflight_config();
             if args.dry_run {
                 // Dry run touches nothing and needs no reachable session.
                 return systemd::install(
@@ -143,26 +197,43 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, is_tty: bool) -> Result<Vec<String
                     args.linger,
                     args.no_linger,
                     is_tty,
+                    &preflight,
                 );
             }
+            // Refuse before touching the service manager — the reachability
+            // probe included.
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::install(env, &unit, &bin, false, args.linger, args.no_linger, is_tty)
+            systemd::install(
+                env,
+                &unit,
+                &bin,
+                false,
+                args.linger,
+                args.no_linger,
+                is_tty,
+                &preflight,
+            )
         }
         ServiceCommand::Uninstall => {
             systemd::ensure_reachable(env)?;
             systemd::uninstall(env, &unit)
         }
         ServiceCommand::Start => {
+            let preflight = preflight_config();
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::start(env, &unit)
+            systemd::start(env, &unit, &preflight)
         }
         ServiceCommand::Stop => {
             systemd::ensure_reachable(env)?;
             systemd::stop(env)
         }
         ServiceCommand::Restart => {
+            let preflight = preflight_config();
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::restart(env)
+            systemd::restart(env, &preflight)
         }
     }
 }
