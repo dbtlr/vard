@@ -915,11 +915,11 @@ fn quarantine_is_byte_exact_under_a_non_utf8_directory() {
         .filter(|s| !s.is_empty())
         .collect();
     assert!(
-        committed.iter().any(|p| *p == b"keep.txt"),
+        committed.contains(&b"keep.txt".as_slice()),
         "keep.txt must be committed"
     );
     assert!(
-        !committed.iter().any(|p| *p == expected.as_slice()),
+        !committed.contains(&expected.as_slice()),
         "the non-UTF-8 secret path must NOT be in the commit"
     );
     // Still on disk, untracked.
