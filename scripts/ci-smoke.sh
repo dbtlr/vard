@@ -50,14 +50,18 @@ for f in \
   "$TARGET_DIR"/man/vard.1 \
   "$TARGET_DIR"/man/vard-run.1 \
   "$TARGET_DIR"/man/vard-watch.1 \
-  "$TARGET_DIR"/man/vard-watch-add.1; do
+  "$TARGET_DIR"/man/vard-watch-add.1 \
+  "$TARGET_DIR"/man/vard-service.1 \
+  "$TARGET_DIR"/man/vard-service-install.1; do
   test -s "$f" || fail "$f is missing or empty — stale artifact?"
 done
 # The root vard.1 must name its subcommands, not merely be non-empty.
 grep -q 'run' "$TARGET_DIR"/man/vard.1 || fail "vard.1 does not name the 'run' subcommand — stale artifact?"
 grep -q 'watch' "$TARGET_DIR"/man/vard.1 || fail "vard.1 does not name the 'watch' subcommand — stale artifact?"
+grep -q 'service' "$TARGET_DIR"/man/vard.1 || fail "vard.1 does not name the 'service' subcommand — stale artifact?"
 grep -q 'run' "$TARGET_DIR"/man/vard-run.1 || fail "vard-run.1 does not name the 'run' subcommand — stale artifact?"
 grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name the 'add' subcommand — stale artifact?"
+grep -q 'install' "$TARGET_DIR"/man/vard-service.1 || fail "vard-service.1 does not name the 'install' subcommand — stale artifact?"
 
 # Help for the watch command tree must render through the custom v2 path.
 "$VARD" watch -h | grep -q 'For full help, run' || fail "vard watch -h missing the v2 short-help footer"
@@ -90,6 +94,16 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 # the same v2 path; the functional run is asserted below once a watch exists.
 "$VARD" doctor -h | grep -q 'For full help, run' || fail "vard doctor -h missing the v2 short-help footer"
 "$VARD" doctor --help | grep -q 'read-only' || fail "vard doctor --help missing its prose"
+
+# vard service (VRD-24): the login-session service command group. Help renders
+# through the same v2 path; the group's five subcommands must all be named.
+# The functional dry-run assertion is below, once the sandboxed HOME/XDG env
+# is in place.
+"$VARD" service -h | grep -q 'For full help, run' || fail "vard service -h missing the v2 short-help footer"
+for sub in install uninstall start stop restart; do
+  "$VARD" service --help | grep -q "$sub" \
+    || fail "vard service --help does not mention the $sub subcommand"
+done
 
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
@@ -173,10 +187,61 @@ printf '%s\n' "$doctor_json" | grep -q '"check":"secret-audit"' \
   || fail "vard doctor --format json did not emit the per-watch secret-audit row"
 printf '%s\n' "$doctor_json" | grep -q '"check":"remote-auth"' \
   || fail "vard doctor --format json did not emit the remote-auth check row"
+# linger and service-agent (VRD-24): local service-context probes. Unlike
+# remote-auth, --offline has no effect on them — they always run. Status is
+# platform- and environment-dependent (linger is skipped on macOS; on a Linux
+# CI container without loginctl/systemctl reachable it is also skipped), so
+# only assert the row exists with a status from the documented vocabulary,
+# without pinning which one.
+for check in linger service-agent; do
+  printf '%s\n' "$doctor_json" \
+    | grep -Eq "\"check\":\"$check\",\"status\":\"(ok|warn|fail|skipped)\"" \
+    || fail "vard doctor --format json $check row is missing or has an unrecognized status"
+done
 # --offline skips the network check and still exits 0 on this all-clear env.
 "$VARD" doctor --offline >/dev/null || fail "vard doctor --offline must exit 0 when all checks pass"
 "$VARD" doctor --help | grep -q -- '--offline' \
   || fail "vard doctor --help missing the --offline flag"
+
+# vard service install --dry-run (VRD-24): safe preview — renders the platform
+# unit and resolved paths but writes nothing and spawns nothing. Runs inside
+# the sandboxed HOME/XDG env set up above, so the unit-path assertion below
+# also proves no real-home file would be touched.
+service_dry_run_out="$("$VARD" service install --dry-run)" \
+  || fail "vard service install --dry-run failed"
+case "$(uname)" in
+  Darwin)
+    printf '%s\n' "$service_dry_run_out" | grep -q '<key>Label</key>' \
+      || fail "vard service install --dry-run missing the plist Label key"
+    printf '%s\n' "$service_dry_run_out" | grep -q '<string>com.dbtlr.vard</string>' \
+      || fail "vard service install --dry-run missing the com.dbtlr.vard label value"
+    printf '%s\n' "$service_dry_run_out" | grep -q '<key>ProgramArguments</key>' \
+      || fail "vard service install --dry-run missing ProgramArguments"
+    printf '%s\n' "$service_dry_run_out" | grep -q '<string>run</string>' \
+      || fail "vard service install --dry-run missing the run argument"
+    printf '%s\n' "$service_dry_run_out" | grep -q '<key>KeepAlive</key>' \
+      || fail "vard service install --dry-run missing KeepAlive"
+    printf '%s\n' "$service_dry_run_out" | grep -q '<key>SuccessfulExit</key>' \
+      || fail "vard service install --dry-run missing KeepAlive SuccessfulExit"
+    printf '%s\n' "$service_dry_run_out" \
+      | grep -qF "$HOME/Library/LaunchAgents/com.dbtlr.vard.plist" \
+      || fail "vard service install --dry-run did not resolve the unit path under the sandbox HOME"
+    ;;
+  Linux)
+    printf '%s\n' "$service_dry_run_out" | grep -Eq 'ExecStart=.* run$' \
+      || fail "vard service install --dry-run missing ExecStart ... run"
+    printf '%s\n' "$service_dry_run_out" | grep -q 'Restart=on-failure' \
+      || fail "vard service install --dry-run missing Restart=on-failure"
+    printf '%s\n' "$service_dry_run_out" | grep -q 'ExecReload=/bin/kill -HUP $MAINPID' \
+      || fail "vard service install --dry-run missing the SIGHUP ExecReload"
+    printf '%s\n' "$service_dry_run_out" \
+      | grep -qF "$XDG_CONFIG_HOME/systemd/user/vard.service" \
+      || fail "vard service install --dry-run did not resolve the unit path under the sandbox XDG config"
+    ;;
+  *)
+    : # vard service supports macOS and Linux only; nothing platform-specific to assert here
+    ;;
+esac
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit
