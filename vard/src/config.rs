@@ -113,6 +113,7 @@ pub(crate) const WATCH_HOOK_EVENTS: &[&str] = &[
     "snapshot_completed",
     "snapshot_failed",
     "snapshot_skipped",
+    "snapshot_quarantined",
     "sync_pushed",
     "sync_pulled",
     "sync_conflict",
@@ -1834,6 +1835,10 @@ update_available = "echo nope"
                 watch: "w".to_string(),
                 trigger: Trigger::Manual,
                 reason: SkipReason::Clean,
+            },
+            Event::SnapshotQuarantined {
+                watch: "w".to_string(),
+                count: 1,
             },
             Event::SyncPushed {
                 watch: "w".to_string(),

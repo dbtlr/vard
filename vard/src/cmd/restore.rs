@@ -185,6 +185,9 @@ fn real_restore(
         trigger: Trigger::PreRestore,
         user_text: Some(format!("pre-restore snapshot before restoring to {rev}")),
         extra_trailers: Vec::new(),
+        // The protective pre-restore snapshot does not scan for secrets; it
+        // captures the current tree verbatim before the checkout.
+        scanner: None,
     };
     let target = RestoreTarget {
         rev: rev.clone(),
@@ -196,7 +199,7 @@ fn real_restore(
     // no nested bracket that would clobber the outer `restore` one.
     let flow = || -> Result<Option<SnapshotOutcome>, CmdError> {
         let protective = match backend.snapshot(&req) {
-            Ok(outcome) => outcome,
+            Ok(report) => report.committed,
             Err(VcsError::UnsafeState(reason)) => {
                 return Err(CmdError::attention(format!(
                     "cannot restore {name:?}: repository became unsafe ({reason}); \

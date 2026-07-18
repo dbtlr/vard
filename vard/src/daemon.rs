@@ -1508,6 +1508,9 @@ fn log_event(event: &Event) {
                 info!(event = name, %watch, %from, %to, reason, "watch state changed");
             }
         }
+        Event::SnapshotQuarantined { watch, count } => {
+            warn!(event = name, %watch, count, "snapshot withheld likely secrets");
+        }
         Event::SyncPushed {
             watch,
             new_ref,

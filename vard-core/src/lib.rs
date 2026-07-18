@@ -47,8 +47,8 @@ pub use secret_scan::{MAX_SCAN_BYTES, SecretMatch, SecretReason, SecretScanError
 pub use vcs::git::GitBackend;
 pub use vcs::{
     AdvanceOutcome, ChangeSummary, CommitMessage, LogFilter, PushOutcome, ReconcileOutcome,
-    RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotRequest,
-    UnsafeReason, VcsBackend, VcsError, VcsRef,
+    RemoteState, RestoreTarget, SafeState, Snapshot, SnapshotId, SnapshotOutcome, SnapshotReport,
+    SnapshotRequest, UnsafeReason, VcsBackend, VcsError, VcsRef,
 };
 pub use watcher::{
     ArmMode, DEFAULT_POLL_INTERVAL, MuteGuard, WatchHandle, Watcher, WatcherError, WatcherRx,

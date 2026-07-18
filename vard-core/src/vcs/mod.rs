@@ -29,9 +29,11 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::event::Trigger;
+use crate::secret_scan::{SecretMatch, SecretScanner};
 
 pub mod git;
 
@@ -68,9 +70,9 @@ pub trait VcsBackend {
     /// the pre-sync snapshot commits it before it can be pushed.
     fn is_dirty(&self) -> Result<bool, VcsError>;
 
-    /// Sweeps the whole work tree and commits it as one snapshot, returning
-    /// the new snapshot's id and a summary of what it contains — or `None`
-    /// when nothing changed.
+    /// Sweeps the whole work tree and commits it as one snapshot, returning a
+    /// [`SnapshotReport`]: the commit it produced (if any) and the paths it
+    /// withheld from staging as likely secrets (if any).
     ///
     /// The sweep is intentionally total (`git add -A`): vard snapshots the
     /// directory as a whole, not a curated index. **Any index state a user
@@ -79,15 +81,28 @@ pub trait VcsBackend {
     /// to, so a curated index has no meaning here. The summary in the returned
     /// [`SnapshotOutcome`] is computed from the staged diff *after* the sweep,
     /// so it describes exactly what the commit contains. When the sweep leaves
-    /// no staged difference, no commit is made and `None` is returned; an
-    /// empty commit is never forced.
+    /// no staged difference, no commit is made ([`committed`](SnapshotReport::committed)
+    /// is `None`); an empty commit is never forced.
+    ///
+    /// # Secret quarantine (VRD-22)
+    ///
+    /// When [`SnapshotRequest::scanner`] carries an enabled
+    /// [`SecretScanner`], the backend scans every
+    /// newly-added (untracked, non-ignored) path *before* the sweep and
+    /// excludes matches from staging via `:(exclude)` pathspecs, reporting them
+    /// in [`SnapshotReport::quarantined`]. Modified tracked files are never
+    /// scanned. A pass whose *only* changes are quarantined stages nothing and
+    /// commits nothing (`committed` is `None`) yet still reports what it
+    /// withheld — "nothing committed" and "something withheld" are separate
+    /// facts. With no scanner (or a disabled one) the sweep is byte-identical to
+    /// a plain `git add -A` and `quarantined` is empty.
     ///
     /// The backend re-checks [`is_safe_state`](Self::is_safe_state) before
     /// committing and returns [`VcsError::UnsafeState`] if the repository is
     /// no longer safe. A window between that check and the commit remains
     /// (another process can start an operation in it); the engine's
     /// serialization of operations per watch narrows but cannot close it.
-    fn snapshot(&self, req: &SnapshotRequest) -> Result<Option<SnapshotOutcome>, VcsError>;
+    fn snapshot(&self, req: &SnapshotRequest) -> Result<SnapshotReport, VcsError>;
 
     /// Lists snapshots most-recent-first, filtered by [`LogFilter`].
     ///
@@ -293,11 +308,15 @@ pub trait VcsBackend {
 }
 
 /// What [`VcsBackend::snapshot`] should commit: why, with what optional user
-/// text, and with which extra trailers.
+/// text, with which extra trailers, and (optionally) the secret scanner that
+/// gates staging.
 ///
 /// The backend computes the change summary itself from what it actually
 /// stages, so the request carries only the caller's intent.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `PartialEq`/`Eq`: the injected [`scanner`](Self::scanner) is a compiled
+/// matcher with no value equality, and nothing compares requests.
+#[derive(Clone, Debug)]
 pub struct SnapshotRequest {
     /// Why the snapshot is being taken; rendered as the `Vard-Trigger` trailer.
     pub trigger: Trigger,
@@ -306,21 +325,52 @@ pub struct SnapshotRequest {
     /// Additional `Key: value` trailers rendered after `Vard-Trigger` (for
     /// example a `Vard-Host` trailer identifying the machine).
     pub extra_trailers: Vec<(String, String)>,
+    /// The secret scanner injected at the staging seam (VRD-22), or `None` to
+    /// stage with a plain total sweep.
+    ///
+    /// When present and [enabled](crate::SecretScanner::is_enabled),
+    /// [`snapshot`](VcsBackend::snapshot) scans each newly-added path and
+    /// withholds matches from the commit. It rides the *request* — not the
+    /// backend — so the VCS layer stays policy-free: the daemon re-derives one
+    /// scanner per watch and injects it every pass, the same injection
+    /// philosophy the vetted-backend seam uses. An [`Arc`] because the same
+    /// per-watch scanner is shared across every pass's request.
+    pub scanner: Option<Arc<SecretScanner>>,
 }
 
 impl SnapshotRequest {
-    /// A request with the given trigger and no user text or extra trailers.
+    /// A request with the given trigger and no user text, extra trailers, or
+    /// scanner.
     pub fn new(trigger: Trigger) -> Self {
         Self {
             trigger,
             user_text: None,
             extra_trailers: Vec::new(),
+            scanner: None,
         }
     }
 }
 
-/// What [`VcsBackend::snapshot`] produced: the new snapshot's id and a summary
-/// of exactly what was committed.
+/// What one [`VcsBackend::snapshot`] pass produced: the commit it made (if any)
+/// and the paths it withheld from staging as likely secrets (if any).
+///
+/// The two are independent facts. A pass can commit legitimate changes while
+/// quarantining others; commit nothing while quarantining everything; commit a
+/// normal snapshot with nothing quarantined; or find a clean tree with neither.
+/// Encoding "nothing committed" as the absence of the whole report would lose
+/// the quarantine fact for the only-secrets case, so both travel here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotReport {
+    /// The commit this pass produced, or `None` when nothing was committed —
+    /// a clean tree, or a tree whose only newly-added changes were quarantined.
+    pub committed: Option<SnapshotOutcome>,
+    /// Newly-added paths withheld from this pass's staging as likely secrets
+    /// (VRD-22), empty when the pass scanned nothing or found nothing.
+    pub quarantined: Vec<SecretMatch>,
+}
+
+/// The commit a [`VcsBackend::snapshot`] pass created: its id and a summary of
+/// exactly what it contains (see [`SnapshotReport::committed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotOutcome {
     /// The id of the commit that was created.

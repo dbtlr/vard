@@ -138,6 +138,9 @@ fn snapshot_one(paths: &CmdPaths, rw: &ResolvedWatch, message: Option<&str>) -> 
         trigger: Trigger::Manual,
         user_text: message.map(str::to_string),
         extra_trailers: Vec::new(),
+        // The in-process CLI snapshot does not scan for secrets (the daemon's
+        // watch passes do); a plain total sweep, unchanged from before VRD-22.
+        scanner: None,
     };
 
     match journaled_snapshot(&paths.journal_dir, spec.path(), name, &backend, &req) {

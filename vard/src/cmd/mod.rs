@@ -223,6 +223,8 @@ fn journaled_snapshot(
         watch_name,
         "snapshot",
         OpGateActor::Sole,
-        || backend.snapshot(req),
+        // The CLI path builds a request with no scanner, so the report's
+        // `quarantined` is always empty here; the caller only needs the commit.
+        || backend.snapshot(req).map(|report| report.committed),
     )
 }
