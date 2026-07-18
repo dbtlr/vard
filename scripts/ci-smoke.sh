@@ -80,6 +80,12 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" config -h | grep -q 'For full help, run' || fail "vard config -h missing the v2 short-help footer"
 "$VARD" config set --help | grep -q 'inferred' || fail "vard config set --help missing its prose"
 
+# vard logs (VRD-23): the daemon logfile reader. Help renders through the same
+# v2 path. No daemon has run in this throwaway state dir, so there is no logfile
+# yet: `vard logs` must report that cleanly and exit 1 (not 0, not a crash).
+"$VARD" logs -h | grep -q 'For full help, run' || fail "vard logs -h missing the v2 short-help footer"
+"$VARD" logs --help | grep -q 'daily-rolling' || fail "vard logs --help missing its prose"
+
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
 # Requires git on PATH (the release-artifact job has it).
@@ -172,6 +178,20 @@ test "$("$VARD" config get defaults.interval)" = "30m" \
 "$VARD" config unset defaults.interval >/dev/null || fail "vard config unset failed"
 if "$VARD" config get defaults.interval >/dev/null; then
   fail "vard config get of an unset key must exit non-zero"
+fi
+
+# vard logs (VRD-23), no daemon: nothing has written a logfile in this throwaway
+# state dir, so logs reports the missing log and exits 1 (attention), never 0.
+if logs_out="$("$VARD" logs 2>&1)"; then
+  fail "vard logs with no logfile must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard logs with no logfile must exit 1"
+fi
+printf '%s\n' "$logs_out" | grep -q 'no daemon logfile yet' \
+  || fail "vard logs did not report the missing logfile"
+# logs is text-only like diff: an explicit --format json must be rejected (exit 2).
+if "$VARD" --format json logs >/dev/null 2>&1; then
+  fail "vard --format json logs must be rejected as text-only"
 fi
 
 # Snapshot/log round-trip (VRD-16), no daemon: an in-process snapshot must land

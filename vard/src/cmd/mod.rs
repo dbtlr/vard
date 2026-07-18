@@ -28,6 +28,7 @@
 
 pub(crate) mod diff;
 pub(crate) mod history;
+pub(crate) mod logs;
 pub(crate) mod restore;
 pub(crate) mod snapshot;
 pub(crate) mod sync;

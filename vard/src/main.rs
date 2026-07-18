@@ -59,6 +59,7 @@ fn main() -> ExitCode {
         Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
         Some(Command::Notify) => notify::run(cli.color, cli.format),
         Some(Command::Status(args)) => status::run(args, cli.color, cli.format),
+        Some(Command::Logs(args)) => cmd::logs::run(args, cli.color, cli.format),
         // A bare `vard config` (no subcommand) prints config's short help, like
         // a bare `vard watch`.
         Some(Command::Config { command: None }) => {

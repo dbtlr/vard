@@ -179,6 +179,21 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "show just the notes watch".to_string(),
             ),
         ]
+    } else if cmd_path == format!("{BIN_NAME} logs") {
+        vec![
+            (
+                format!("{BIN_NAME} logs"),
+                "show the last 50 lines of the daemon's log".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} logs -n 200"),
+                "show the last 200 lines, spanning rotated files".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} logs -f"),
+                "follow the daemon's log live".to_string(),
+            ),
+        ]
     } else if cmd_path == format!("{BIN_NAME} config") {
         vec![
             (

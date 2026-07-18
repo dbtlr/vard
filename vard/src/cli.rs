@@ -359,6 +359,35 @@ null watch name and a `daemon: true` flag, each configured watch its own object)
 when piped.")]
     Status(StatusArgs),
 
+    /// Show the vard daemon's own log: the rolling logfile it writes while
+    /// running. `-f` follows it live; `-n` sets how many lines to show.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Show the vard daemon's own log output.
+
+While the daemon runs (`vard run`) it writes its log to a daily-rolling file set \
+under the state directory (`<state_dir>/logs/vard.log.YYYY-MM-DD`), in addition \
+to the stderr it always logged to. `vard logs` reads that file set — there is no \
+watch argument, because one daemon writes one log covering every watch it \
+supervises.
+
+`-n <N>` shows the last N lines (default 50) and spans rotation boundaries: if \
+the newest day's file holds fewer than N lines, the previous day's file is read \
+to make up the difference. `-f` follows the live log, printing new lines as the \
+daemon writes them and switching to the next day's file when the log rotates; it \
+runs until interrupted.
+
+The output is the daemon's raw log text and nothing else: on a terminal it is \
+paged (unless following, which streams straight through), and piped it passes \
+through untouched so it feeds `grep`, `less`, or a file. Because a logfile is \
+inherently a text artifact, `logs` is text-only: an explicit `--format json` or \
+`--format jsonl` is rejected.
+
+If no logfile exists yet — the daemon has not run since file logging landed, or \
+has never run — `vard logs` reports that and exits 1 rather than printing \
+nothing.")]
+    Logs(LogsArgs),
+
     /// Read and edit vard's configuration: get, set, unset, edit, path.
     #[command(disable_help_flag = true)]
     #[command(disable_help_subcommand = true)]
@@ -472,6 +501,19 @@ pub struct StatusArgs {
     /// The watch to report, by name or by path. Omit to report every watch.
     #[arg(value_name = "NAME|PATH")]
     pub target: Option<String>,
+}
+
+/// Arguments to `vard logs`.
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Follow the live log, printing new lines as the daemon writes them and
+    /// surviving log rotation. Runs until interrupted.
+    #[arg(short = 'f', long = "follow")]
+    pub follow: bool,
+
+    /// Show the last N lines, spanning rotated logfiles as needed.
+    #[arg(short = 'n', long = "lines", value_name = "N", default_value = "50")]
+    pub lines: usize,
 }
 
 /// The `vard config` subcommands.

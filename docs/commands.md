@@ -47,6 +47,7 @@ vard commands share a three-value exit convention:
 | Command | Summary |
 |---|---|
 | [`run`](commands/run.md) | Run the vard daemon in the foreground: watch every active configured directory and snapshot changes until stopped. |
+| [`logs`](commands/logs.md) | Show the vard daemon's own log — the rolling logfile it writes while running. |
 
 ## Watch and snapshot
 
