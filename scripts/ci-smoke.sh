@@ -171,6 +171,12 @@ printf '%s\n' "$doctor_json" | grep -q '"check":"health-file"' \
   || fail "vard doctor --format json did not emit the health-file check row"
 printf '%s\n' "$doctor_json" | grep -q '"check":"secret-audit"' \
   || fail "vard doctor --format json did not emit the per-watch secret-audit row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"remote-auth"' \
+  || fail "vard doctor --format json did not emit the remote-auth check row"
+# --offline skips the network check and still exits 0 on this all-clear env.
+"$VARD" doctor --offline >/dev/null || fail "vard doctor --offline must exit 0 when all checks pass"
+"$VARD" doctor --help | grep -q -- '--offline' \
+  || fail "vard doctor --help missing the --offline flag"
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit
