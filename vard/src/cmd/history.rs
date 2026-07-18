@@ -1,4 +1,4 @@
-//! `vard log <name|path> [--since "2h"]` — show a watch's snapshot history.
+//! `vard history <name|path> [--since "2h"]` — show a watch's snapshot history.
 //!
 //! Read-only: reads the backend log directly, takes no lock, and mutates
 //! nothing, so it is safe against a watch the daemon is actively snapshotting.
@@ -12,15 +12,15 @@ use super::timefmt;
 use super::{
     CmdError, CmdPaths, CmdResult, OutCtx, emit_records, load_config, open_backend, select_one,
 };
-use crate::cli::{ColorWhen, LogArgs, OutputFormat};
+use crate::cli::{ColorWhen, HistoryArgs, OutputFormat};
 use crate::output::record::{Record, RecordField};
 
-/// Entry point for `vard log`.
-pub(crate) fn run(args: LogArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
+/// Entry point for `vard history`.
+pub(crate) fn run(args: HistoryArgs, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     super::finish(run_inner(args, color, format))
 }
 
-fn run_inner(args: LogArgs, color: ColorWhen, format: Option<OutputFormat>) -> CmdResult {
+fn run_inner(args: HistoryArgs, color: ColorWhen, format: Option<OutputFormat>) -> CmdResult {
     let paths = CmdPaths::from_xdg().map_err(|e| CmdError::err(e.to_string()))?;
     let out = OutCtx::resolve(color, format);
 

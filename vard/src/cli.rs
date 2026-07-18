@@ -233,7 +233,7 @@ and JSON or JSONL when piped.
 
 `--since` keeps only snapshots at or after a point in the past, given as a \
 humane duration counted back from now — `2h`, `3d`, `1h30m`.")]
-    Log(LogArgs),
+    History(HistoryArgs),
 
     /// Show a raw unified diff for a watch: working tree against a snapshot.
     #[command(disable_help_flag = true)]
@@ -413,9 +413,9 @@ pub struct SyncArgs {
     pub target: Option<String>,
 }
 
-/// Arguments to `vard log`.
+/// Arguments to `vard history`.
 #[derive(Debug, Args)]
-pub struct LogArgs {
+pub struct HistoryArgs {
     /// The watch whose history to show, by name or by path.
     #[arg(value_name = "NAME|PATH")]
     pub target: String,

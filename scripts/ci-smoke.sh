@@ -190,7 +190,7 @@ test "${#journals[@]}" -gt 0 || fail "no operation journal was written for the i
 for j in "${journals[@]}"; do
   test ! -s "$j" || fail "operation journal $j holds a dangling begin after a clean snapshot"
 done
-"$VARD" --format json log smoke | grep -q '"trigger":"manual"' || fail "vard log did not show the manual snapshot"
+"$VARD" --format json history smoke | grep -q '"trigger":"manual"' || fail "vard history did not show the manual snapshot"
 "$VARD" --format json snapshot smoke | grep -q '"status":"no changes"' || fail "second snapshot was not a clean no-op"
 # diff is text-only: an explicit --format json must be rejected (exit 2).
 if "$VARD" --format json diff smoke >/dev/null 2>&1; then

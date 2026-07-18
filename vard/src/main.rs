@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         }) => watch::run(watch_cmd, cli.color, cli.format),
         Some(Command::Snapshot(args)) => cmd::snapshot::run(args, cli.color, cli.format),
         Some(Command::Sync(args)) => cmd::sync::run(args, cli.color, cli.format),
-        Some(Command::Log(args)) => cmd::log::run(args, cli.color, cli.format),
+        Some(Command::History(args)) => cmd::history::run(args, cli.color, cli.format),
         Some(Command::Diff(args)) => cmd::diff::run(args, cli.color, cli.format),
         Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
         Some(Command::Notify) => notify::run(cli.color, cli.format),

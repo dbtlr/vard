@@ -1,4 +1,4 @@
-//! The top-level snapshot/history commands: `snapshot`, `log`, `diff`,
+//! The top-level snapshot/history commands: `snapshot`, `history`, `diff`,
 //! `restore` (spec §11).
 //!
 //! These operate on a watch's version-control repository directly, on demand —
@@ -27,7 +27,7 @@
 //! case too. See [`restore`].
 
 pub(crate) mod diff;
-pub(crate) mod log;
+pub(crate) mod history;
 pub(crate) mod restore;
 pub(crate) mod snapshot;
 pub(crate) mod sync;

@@ -5,7 +5,7 @@ description: Show a raw unified diff for a watch — working tree against a snap
 
 # vard diff
 
-Show a raw unified diff for a watch. Read-only. With no reference the diff is the watched directory's working tree against its last snapshot (`HEAD`) — the uncommitted changes a [`snapshot`](snapshot.md) would capture. Given a `<ref>`, the diff runs from that reference to the current working tree, showing everything that changed since it. Where [`log`](log.md) lists *when* snapshots happened, `diff` shows *what* is different.
+Show a raw unified diff for a watch. Read-only. With no reference the diff is the watched directory's working tree against its last snapshot (`HEAD`) — the uncommitted changes a [`snapshot`](snapshot.md) would capture. Given a `<ref>`, the diff runs from that reference to the current working tree, showing everything that changed since it. Where [`history`](history.md) lists *when* snapshots happened, `diff` shows *what* is different.
 
 ## Examples
 
@@ -49,7 +49,7 @@ Because a unified diff is inherently a text artifact, `diff` is **text-only**: u
 
 ## See also
 
-- [`log`](log.md) — the snapshot history whose ids you diff against.
+- [`history`](history.md) — the snapshot history whose ids you diff against.
 - [`restore`](restore.md) — apply a prior state instead of just viewing it; `restore --dry-run` shows this same diff.
 - [`snapshot`](snapshot.md) — commit the changes this diff shows.
 - Run `vard diff --help` for the full reference.
