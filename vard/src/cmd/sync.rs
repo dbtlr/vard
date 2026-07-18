@@ -703,6 +703,9 @@ mod tests {
         let rw = ResolvedWatch {
             spec,
             paused: false,
+            hooks: std::collections::HashMap::new(),
+            hook_timeout: crate::config::DEFAULT_HOOK_TIMEOUT,
+            hook_rate_limit: crate::config::DEFAULT_HOOK_RATE_LIMIT,
         };
         let disposition = RepoDisposition::ProbeFailed {
             backend,
@@ -749,6 +752,9 @@ mod tests {
         let rw = ResolvedWatch {
             spec,
             paused: false,
+            hooks: std::collections::HashMap::new(),
+            hook_timeout: crate::config::DEFAULT_HOOK_TIMEOUT,
+            hook_rate_limit: crate::config::DEFAULT_HOOK_RATE_LIMIT,
         };
 
         // The repository vanishes AFTER the vetting open.

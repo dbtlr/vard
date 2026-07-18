@@ -151,7 +151,7 @@ fn daemon_lifecycle_drives_notify_from_healthy_to_problem_to_stopped() {
     std::fs::write(
         &health,
         format!(
-            "version = 1\nwritten_at = {now}\n\n[[problem]]\nwatch = \"vault\"\nstate = \"conflicted\"\nsummary = \"a sync conflict is blocking progress\"\nsince = {}\n",
+            "version = 2\nwritten_at = {now}\n\n[[problem]]\nwatch = \"vault\"\nstate = \"conflicted\"\nsummary = \"a sync conflict is blocking progress\"\nsince = {}\n",
             now - 7200
         ),
     )

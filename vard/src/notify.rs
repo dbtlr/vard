@@ -132,6 +132,12 @@ fn collect(
         HealthReport::Starting => Ok(vec![NotifyProblem::Starting]),
         HealthReport::Running {
             problems,
+            // Suppression telemetry is deliberately dropped here: notify reports
+            // only problems, so a watch that has *only* coalesced hooks (no
+            // problem) contributes nothing and notify stays silent — the
+            // silent-when-healthy invariant. `vard status` is where suppression
+            // counts are shown.
+            suppressions: _,
             written_at,
         } => {
             // A document the daemon stopped refreshing is not trustworthy: report
@@ -209,11 +215,18 @@ fn human_line(problem: &NotifyProblem, palette: &Palette, now: u64, ascii: bool)
             since,
             ..
         } => {
-            let watch = clean_line(watch);
             let state = clean_line(state);
             let summary = clean_line(summary);
             let elapsed = format_duration(Duration::from_secs(now.saturating_sub(*since)));
-            format!("{glyph} vard: '{watch}' {state} (for {elapsed}) — {summary}")
+            // An empty watch name marks a daemon-global (`[hooks]`) hook failure
+            // (VRD-21): a real watch name is never empty, so render it as a
+            // daemon-scoped hook line rather than an empty-quoted watch.
+            if watch.is_empty() {
+                format!("{glyph} vard: daemon hook {state} (for {elapsed}) — {summary}")
+            } else {
+                let watch = clean_line(watch);
+                format!("{glyph} vard: '{watch}' {state} (for {elapsed}) — {summary}")
+            }
         }
         NotifyProblem::DaemonNotRunning { last_write } => {
             let staleness = last_write
@@ -256,7 +269,9 @@ fn record_for(problem: &NotifyProblem, now: u64) -> Record {
             summary,
             since,
         } => (
-            Some(watch.clone()),
+            // An empty watch marks a daemon-global hook (VRD-21); carry it as a
+            // null watch in the machine shape rather than an empty string.
+            (!watch.is_empty()).then(|| watch.clone()),
             state.clone(),
             kind.clone(),
             summary.clone(),
@@ -434,5 +449,59 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains(r#""watch":null"#), "got: {s}");
         assert!(s.contains(r#""state":"daemon-not-running""#), "got: {s}");
+    }
+
+    #[test]
+    fn suppression_alone_keeps_notify_silent() {
+        // The silent-when-healthy invariant (VRD-21): a running daemon with no
+        // problems but nonzero hook suppression must produce zero notify lines.
+        // `collect` reads only `problems` from the running report, so suppression
+        // telemetry can never make notify speak.
+        let report = HealthReport::Running {
+            problems: vec![],
+            suppressions: vec![health::HookSuppression {
+                watch: "notes".to_string(),
+                count: 42,
+            }],
+            written_at: health::now_secs(),
+        };
+        let problems = match report {
+            HealthReport::Running {
+                problems,
+                suppressions: _,
+                written_at: _,
+            } => problems
+                .into_iter()
+                .map(NotifyProblem::from_health)
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+        assert!(
+            problems.is_empty(),
+            "suppression telemetry must not surface as a notify problem"
+        );
+    }
+
+    #[test]
+    fn a_global_hook_failure_renders_as_a_daemon_hook_line() {
+        // An empty watch marks a daemon-global hook; notify must not print an
+        // empty-quoted watch name.
+        let p = NotifyProblem::Watch {
+            watch: String::new(),
+            state: "attention".to_string(),
+            kind: "hook-failing".to_string(),
+            summary: "hook for daemon.started has failed 3 times".to_string(),
+            since: 0,
+        };
+        let line = human_line(&p, &Palette::off(), 60, false);
+        assert!(line.contains("daemon hook attention"), "got: {line}");
+        assert!(!line.contains("''"), "no empty-quoted watch: {line}");
+        // JSON carries a null watch, not an empty string.
+        let recs = records(std::slice::from_ref(&p), 60);
+        let mut out = Vec::new();
+        record::render_json(&mut out, &recs).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(r#""watch":null"#), "got: {s}");
+        assert!(s.contains(r#""kind":"hook-failing""#), "got: {s}");
     }
 }

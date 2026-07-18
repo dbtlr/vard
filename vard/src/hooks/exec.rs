@@ -1,0 +1,616 @@
+//! Hook process execution: spawn `$SHELL -c <command>`, enforce the timeout with
+//! a process-group kill discipline, capture output into the log, and reap.
+//!
+//! [`exec_hook`] is synchronous and blocking by design — the runner drives it on
+//! a blocking task ([`tokio::task::JoinSet::spawn_blocking`]) so the bus loop
+//! never waits on a hook, while the blocking closure still runs to completion (and
+//! reaps its child) even if the runner task is aborted on a re-arm. This mirrors
+//! the git backend's timed-command discipline in `vard-core` (own process group,
+//! thread-drained pipes, poll-and-kill), so kill/zombie handling stays uniform.
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use tracing::{debug, warn};
+
+/// How often a running hook is polled for completion while waiting out its
+/// timeout (and the post-SIGTERM grace).
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How long a timed-out hook's process group is given to exit after SIGTERM
+/// before it is SIGKILLed.
+#[cfg(unix)]
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-stream cap on retained hook output. Each reader still drains its pipe to
+/// EOF — a chatty hook must never block on a full pipe — but only the trailing
+/// `OUTPUT_TAIL_CAP` bytes are kept for the log; earlier bytes are dropped and
+/// the capture is marked truncated so the log cannot imply the full output was
+/// seen.
+const OUTPUT_TAIL_CAP: usize = 8 * 1024;
+
+/// After the shell leader is gone, how long the pipe readers are given to reach
+/// EOF before (on unix) the process group is SIGKILLed to release a backgrounded
+/// descendant that inherited the pipes. Applied once before the group kill and
+/// once after, so `exec_hook`'s wall clock is bounded by roughly the hook timeout
+/// plus two of these graces even when a `some-daemon &`-style child outlives its
+/// parent.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// One hook cleared to run: the shell command, its working directory, the
+/// wall-clock timeout, and the `VARD_*` environment (minus `VARD_SUPPRESSED`,
+/// which the runner supplies per fire from the coalescing count).
+#[derive(Clone)]
+pub(super) struct HookInvocation {
+    /// The shell command line, run via `$SHELL -c`.
+    pub command: String,
+    /// Working directory: the watch's path, or the daemon's cwd for a global hook.
+    pub cwd: PathBuf,
+    /// Wall-clock timeout before the hook's process group is killed.
+    pub timeout: Duration,
+    /// The `VARD_*` variables to set, excluding `VARD_SUPPRESSED`.
+    pub env: Vec<(String, String)>,
+}
+
+/// The terminal result of one hook run, consumed by the runner's per-key
+/// consecutive-failure tracking.
+pub(super) enum HookOutcome {
+    /// The hook exited zero.
+    Success,
+    /// The hook exited non-zero, timed out, or could not be run — with a short
+    /// human-readable reason kept as the key's last error.
+    Failure(String),
+}
+
+/// The shell used to run hook commands: `$SHELL`, falling back to `/bin/sh` when
+/// it is unset or empty.
+fn hook_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// Runs one hook synchronously to completion. Spawns `$SHELL -c <command>` in its
+/// own process group with the invocation's cwd and environment (plus
+/// `VARD_SUPPRESSED`), enforces `timeout` with a SIGTERM -> grace -> SIGKILL kill
+/// of the whole group (so shell children die too), captures stdout/stderr into
+/// the log, and reaps the child before returning. `event` and `scope` (the watch
+/// name, or `daemon` for a global hook) are log context only.
+pub(super) fn exec_hook(
+    event: &str,
+    scope: &str,
+    inv: &HookInvocation,
+    suppressed: u64,
+) -> HookOutcome {
+    let mut cmd = Command::new(hook_shell());
+    cmd.arg("-c")
+        .arg(&inv.command)
+        .current_dir(&inv.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &inv.env {
+        cmd.env(key, value);
+    }
+    cmd.env("VARD_SUPPRESSED", suppressed.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group led by the shell, so the group-directed kill on
+        // timeout reaches every child the hook spawned and nothing else.
+        cmd.process_group(0);
+    }
+
+    debug!(event, scope, command = inv.command.as_str(), "running hook");
+
+    let start = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            warn!(event, scope, error = %err, "hook failed to spawn");
+            return HookOutcome::Failure(format!("failed to spawn hook: {err}"));
+        }
+    };
+
+    // Drain both pipes on background threads so a chatty hook that fills a pipe
+    // buffer cannot deadlock against our completion poll. Each thread keeps only a
+    // bounded tail (see [`drain_tail`]) and reports its result over a channel, so
+    // the collection below can be time-bounded rather than joining a thread that a
+    // pipe-holding descendant could wedge indefinitely.
+    let mut child_stdout = child.stdout.take().expect("stdout piped");
+    let mut child_stderr = child.stderr.take().expect("stderr piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let (buf, truncated) = drain_tail(&mut child_stdout);
+        let _ = tx_out.send(StreamMsg::Stdout(buf, truncated));
+    });
+    std::thread::spawn(move || {
+        let (buf, truncated) = drain_tail(&mut child_stderr);
+        let _ = tx.send(StreamMsg::Stderr(buf, truncated));
+    });
+
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= inv.timeout {
+                    timed_out = true;
+                    kill_timed_out(&mut child);
+                    // Reap so no zombie is left; the readers see EOF as the pipes
+                    // close.
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(KILL_POLL_INTERVAL);
+            }
+            Err(err) => {
+                warn!(event, scope, error = %err, "waiting on hook failed");
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    // Collect both streams, bounded so a backgrounded descendant that inherited
+    // the pipes cannot wedge this thread past the timeout (and escalating to a
+    // group SIGKILL when it does — which also covers a descendant that survived
+    // the timeout SIGTERM).
+    let captured = collect_output(&child, &rx);
+    let stdout = render_stream(
+        &captured.stdout,
+        captured.stdout_truncated || captured.detached,
+    );
+    let stderr = render_stream(
+        &captured.stderr,
+        captured.stderr_truncated || captured.detached,
+    );
+
+    if timed_out {
+        let secs = inv.timeout.as_secs_f64();
+        warn!(
+            event,
+            scope,
+            timeout_secs = secs,
+            stdout = %stdout,
+            stderr = %stderr,
+            "hook timed out; killed its process group"
+        );
+        return HookOutcome::Failure(format!("timed out after {secs:.0}s"));
+    }
+
+    match status {
+        Some(status) if status.success() => {
+            debug!(
+                event,
+                scope,
+                stdout = %stdout,
+                stderr = %stderr,
+                "hook succeeded"
+            );
+            HookOutcome::Success
+        }
+        Some(status) => {
+            let code = status.code();
+            warn!(
+                event,
+                scope,
+                code,
+                stdout = %stdout,
+                stderr = %stderr,
+                "hook exited non-zero"
+            );
+            HookOutcome::Failure(match code {
+                Some(code) => format!("exited with status {code}"),
+                None => "killed by signal".to_string(),
+            })
+        }
+        None => HookOutcome::Failure("hook did not run to completion".to_string()),
+    }
+}
+
+/// Kills a timed-out hook: on unix, SIGTERM the process group, wait out a short
+/// grace, then SIGKILL the group if anything survives. On non-unix (not a
+/// supported target, kept only so the crate still compiles there) only the child
+/// itself is killed.
+fn kill_timed_out(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        signal_group(child, rustix::process::Signal::TERM);
+        if !exited_within(child, TERM_GRACE) {
+            signal_group(child, rustix::process::Signal::KILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+/// Signals the process group led by `child` (its pgid equals its pid, set via
+/// `process_group(0)`). Best-effort: a group already gone is not an error.
+#[cfg(unix)]
+fn signal_group(child: &std::process::Child, signal: rustix::process::Signal) {
+    let _ = rustix::process::kill_process_group(rustix::process::Pid::from_child(child), signal);
+}
+
+/// Polls `child` for up to `grace`, returning whether it exited in that window.
+#[cfg(unix)]
+fn exited_within(child: &mut std::process::Child, grace: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if start.elapsed() >= grace {
+                    return false;
+                }
+                std::thread::sleep(KILL_POLL_INTERVAL);
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// One reader thread's result: the captured tail of a stream and whether earlier
+/// output was dropped to stay under [`OUTPUT_TAIL_CAP`].
+enum StreamMsg {
+    Stdout(Vec<u8>, bool),
+    Stderr(Vec<u8>, bool),
+}
+
+/// Reads `reader` to EOF, retaining only the trailing [`OUTPUT_TAIL_CAP`] bytes.
+/// Returns the retained tail and whether anything earlier was discarded. The
+/// pipe is always drained fully so a chatty hook can never block on a full pipe
+/// buffer; only what is *kept* is bounded.
+fn drain_tail(reader: &mut impl std::io::Read) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > OUTPUT_TAIL_CAP {
+                    let excess = buf.len() - OUTPUT_TAIL_CAP;
+                    buf.drain(..excess);
+                    truncated = true;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (buf, truncated)
+}
+
+/// The captured output of one hook run: the bounded tail of each stream, whether
+/// each was truncated to its cap, and whether the readers had to be detached
+/// (a descendant held the pipes past the drain bound, so what we have is partial).
+#[derive(Default)]
+struct Captured {
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr: Vec<u8>,
+    stderr_truncated: bool,
+    detached: bool,
+}
+
+/// Collects both reader threads' output within a bounded wall clock. The readers
+/// normally reach EOF the instant the leader's pipes close; when a backgrounded
+/// descendant inherited them and holds them open, this SIGKILLs the whole process
+/// group (releasing the pipes — and covering a descendant that survived the
+/// timeout SIGTERM) and drains what then closes. If the pipes *still* have not
+/// closed within the second grace, the readers are detached (they exit when the
+/// fds finally close) and the capture is flagged so nothing implies we saw it all.
+fn collect_output(child: &std::process::Child, rx: &Receiver<StreamMsg>) -> Captured {
+    let mut cap = Captured::default();
+    let mut remaining = 2u8;
+
+    // Phase 1: wait a bounded grace for the ordinary EOF-on-leader-exit case.
+    remaining -= recv_until(rx, &mut cap, remaining, READER_DRAIN_GRACE);
+    if remaining == 0 {
+        return cap;
+    }
+
+    // Phase 2: a descendant is holding the pipes. On unix, kill the whole group
+    // to release them; then drain what closes within a second bounded grace.
+    #[cfg(unix)]
+    signal_group(child, rustix::process::Signal::KILL);
+    #[cfg(not(unix))]
+    let _ = child;
+    remaining -= recv_until(rx, &mut cap, remaining, READER_DRAIN_GRACE);
+    if remaining > 0 {
+        // The pipes never closed within the bound: stop waiting. The reader
+        // threads die when the fds finally close; mark the capture partial.
+        cap.detached = true;
+    }
+    cap
+}
+
+/// Receives up to `want` [`StreamMsg`]s into `cap`, blocking no longer than
+/// `grace` in total. Returns how many were received (fewer than `want` when the
+/// grace elapsed with readers still pending, or the channel disconnected).
+fn recv_until(rx: &Receiver<StreamMsg>, cap: &mut Captured, want: u8, grace: Duration) -> u8 {
+    let deadline = Instant::now() + grace;
+    let mut got = 0;
+    while got < want {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(StreamMsg::Stdout(buf, truncated)) => {
+                cap.stdout = buf;
+                cap.stdout_truncated = truncated;
+                got += 1;
+            }
+            Ok(StreamMsg::Stderr(buf, truncated)) => {
+                cap.stderr = buf;
+                cap.stderr_truncated = truncated;
+                got += 1;
+            }
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    got
+}
+
+/// Renders a captured stream for the log: lossy UTF-8, trimmed, with an explicit
+/// marker appended when the capture was truncated (either to its byte cap or by a
+/// detached reader) so the log never implies it holds the hook's full output.
+fn render_stream(bytes: &[u8], truncated: bool) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if truncated {
+        if text.is_empty() {
+            "[output truncated]".to_string()
+        } else {
+            format!("{text} [output truncated]")
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inv(
+        command: &str,
+        cwd: PathBuf,
+        timeout: Duration,
+        env: Vec<(&str, &str)>,
+    ) -> HookInvocation {
+        HookInvocation {
+            command: command.to_string(),
+            cwd,
+            timeout,
+            env: env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_zero_exit_is_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                "exit 0",
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+                vec![],
+            ),
+            0,
+        );
+        assert!(matches!(outcome, HookOutcome::Success));
+    }
+
+    #[test]
+    fn a_non_zero_exit_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = exec_hook(
+            "snapshot.failed",
+            "notes",
+            &inv(
+                "exit 3",
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+                vec![],
+            ),
+            0,
+        );
+        match outcome {
+            HookOutcome::Failure(err) => assert!(err.contains('3'), "reason names the code: {err}"),
+            HookOutcome::Success => panic!("a non-zero exit must be a failure"),
+        }
+    }
+
+    #[test]
+    fn the_env_and_cwd_reach_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        // The hook writes its cwd, a VARD_* var, and VARD_SUPPRESSED to a file.
+        let command = format!(
+            "printf '%s\\n%s\\n%s\\n' \"$PWD\" \"$VARD_REF\" \"$VARD_SUPPRESSED\" > {}",
+            out.display()
+        );
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+                vec![("VARD_REF", "abc123")],
+            ),
+            4,
+        );
+        assert!(matches!(outcome, HookOutcome::Success));
+        let body = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        // The cwd may be reported through a symlinked temp root; compare by suffix.
+        assert!(
+            std::path::Path::new(lines[0]).ends_with(dir.path().file_name().unwrap())
+                || lines[0] == dir.path().to_string_lossy(),
+            "cwd was {} , expected {}",
+            lines[0],
+            dir.path().display()
+        );
+        assert_eq!(lines[1], "abc123", "VARD_REF reached the hook");
+        assert_eq!(lines[2], "4", "VARD_SUPPRESSED is the fired count");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_hook_and_its_child_and_reaps() {
+        // The hook backgrounds a grandchild that would write a marker after a
+        // delay, then blocks. A short timeout must SIGTERM the whole group, so
+        // neither the shell nor the grandchild survives to write the marker.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let command = format!("(sleep 10 && touch {m}) & sleep 10", m = marker.display());
+        let start = Instant::now();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                Duration::from_millis(60),
+                vec![],
+            ),
+            0,
+        );
+        let elapsed = start.elapsed();
+        match outcome {
+            HookOutcome::Failure(err) => assert!(err.contains("timed out"), "got: {err}"),
+            HookOutcome::Success => panic!("a timed-out hook must be a failure"),
+        }
+        // A plain `sleep` dies on SIGTERM at once, so the kill returns well inside
+        // the 2s grace — nowhere near the 10s the hook would otherwise run.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "kill should be prompt, took {elapsed:?}"
+        );
+        // Give any surviving grandchild far longer than it would need, then assert
+        // the marker never appeared: proof the whole group was killed.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "the backgrounded grandchild must have been killed with the group"
+        );
+    }
+
+    #[test]
+    fn drain_tail_keeps_only_the_bounded_tail_and_flags_truncation() {
+        // More than the cap: the reader still consumes it all, but keeps only the
+        // trailing OUTPUT_TAIL_CAP bytes and flags truncation.
+        let total = OUTPUT_TAIL_CAP + 5_000;
+        let mut data = vec![b'a'; total - 3];
+        data.extend_from_slice(b"END");
+        let (buf, truncated) = drain_tail(&mut std::io::Cursor::new(data));
+        assert!(truncated, "output past the cap must be flagged truncated");
+        assert_eq!(buf.len(), OUTPUT_TAIL_CAP, "only the cap's worth is kept");
+        assert!(buf.ends_with(b"END"), "the *tail* is what survives");
+
+        // At or under the cap: kept whole, not flagged.
+        let (buf, truncated) = drain_tail(&mut std::io::Cursor::new(vec![b'x'; OUTPUT_TAIL_CAP]));
+        assert!(!truncated);
+        assert_eq!(buf.len(), OUTPUT_TAIL_CAP);
+    }
+
+    #[test]
+    fn render_stream_marks_truncated_output() {
+        assert_eq!(render_stream(b"  hello\n", false), "hello");
+        assert_eq!(render_stream(b"hello", true), "hello [output truncated]");
+        assert_eq!(render_stream(b"", true), "[output truncated]");
+    }
+
+    #[test]
+    fn a_chatty_hook_is_drained_and_still_succeeds() {
+        // Far more than the cap on stdout: the drain must consume it without
+        // deadlocking and the hook exits zero.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = OUTPUT_TAIL_CAP * 8;
+        let command = format!("head -c {bytes} /dev/zero; exit 0");
+        let start = Instant::now();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                Duration::from_secs(5),
+                vec![],
+            ),
+            0,
+        );
+        assert!(
+            matches!(outcome, HookOutcome::Success),
+            "a chatty-but-zero-exit hook is a success"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "draining must not block on the full pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backgrounded_pipe_holder_returns_within_the_timeout_bound() {
+        // The classic wedge: the shell backgrounds a child that inherits the
+        // stdout/stderr pipes and then the leader exits at once. `reader.join()`
+        // on such a child would block for the child's whole lifetime. The bounded
+        // collection must instead give up on the readers, SIGKILL the group, and
+        // return — well inside the (long) timeout — with the pipe-holder killed.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        // A backgrounded subshell holds the pipes for 30s then would write a
+        // marker; the leader exits 0 immediately.
+        let command = format!("(sleep 30 && touch {m}) & exit 0", m = marker.display());
+        let start = Instant::now();
+        let outcome = exec_hook(
+            "snapshot.completed",
+            "notes",
+            &inv(
+                &command,
+                dir.path().to_path_buf(),
+                // A long timeout: the bound under test is the reader-drain grace,
+                // not the timeout — the leader never times out.
+                Duration::from_secs(30),
+                vec![],
+            ),
+            0,
+        );
+        let elapsed = start.elapsed();
+        // The leader exited 0, so the run is a success even though a descendant
+        // had to be killed to release the pipes.
+        assert!(
+            matches!(outcome, HookOutcome::Success),
+            "leader exited zero"
+        );
+        // Bounded by roughly two drain graces (~4s), nowhere near the 30s hold.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must return on the drain bound, took {elapsed:?}"
+        );
+        // The group SIGKILL released the pipes by killing the subshell, so its
+        // delayed marker never lands.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "the pipe-holding descendant must have been killed with the group"
+        );
+    }
+}
