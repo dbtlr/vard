@@ -337,7 +337,11 @@ impl GitBackend {
     /// A file created *between* this enumeration and the `git add -A` that
     /// follows is not seen here and is committed unscanned. The engine's
     /// per-watch operation serialization narrows this window but cannot close it;
-    /// the next pass re-derives quarantine and catches such a file.
+    /// the next pass re-derives quarantine and catches such a file. The same
+    /// window exists between the regular-file check below and the content read:
+    /// a path swapped for a non-regular file in that instant is opened blocking.
+    /// Both races require a process actively rewriting the watched tree mid-pass,
+    /// which is outside the accidental-commit threat model this scan serves.
     fn scan_untracked(&self, scanner: &SecretScanner) -> Result<Vec<SecretMatch>, VcsError> {
         let out = git_output(
             &self.path,

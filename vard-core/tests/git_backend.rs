@@ -817,17 +817,22 @@ fn quarantine_scans_only_regular_files_never_symlinks() {
 #[cfg(unix)]
 #[test]
 fn quarantine_does_not_hang_or_read_a_fifo() {
+    use std::os::unix::fs::symlink;
     use std::sync::mpsc;
     let (tmp, backend) = new_repo();
     write(tmp.path(), "keep.txt", "hi\n");
-    // A FIFO in the tree: a blocking `open()` on it would never return. It is
-    // non-regular, so it must not be a scan candidate — the snapshot returns
-    // promptly without ever opening it.
+    // The real wedge vector: git does not list a bare FIFO as an untracked
+    // candidate, but it DOES list a symlink — and a symlink whose name matches
+    // no filename pattern previously fell through to the content layer, where
+    // a blocking `open()` follows the link into the FIFO and never returns.
+    // Only regular files may be scan candidates; the snapshot must return
+    // promptly without ever opening the link target.
     let status = Command::new("mkfifo")
         .arg(tmp.path().join("pipe"))
         .status()
         .expect("spawn mkfifo");
     assert!(status.success(), "mkfifo failed");
+    symlink("pipe", tmp.path().join("data.bin")).expect("symlink to fifo");
 
     // Run the snapshot on a worker thread and bound it: on regression (a blocking
     // open of the FIFO) this fails after the timeout instead of hanging forever.
@@ -843,10 +848,17 @@ fn quarantine_does_not_hang_or_read_a_fifo() {
 
     assert!(
         report.quarantined.is_empty(),
-        "a FIFO is never a scan candidate"
+        "a non-regular candidate is never scanned or quarantined"
     );
-    // The regular file still commits; git itself does not track a FIFO.
+    // The regular file still commits; the symlink commits as a link string
+    // (mode 120000); git itself does not track a bare FIFO.
     assert!(tracked(tmp.path()).contains(&"keep.txt".to_string()));
+    let ls = git(tmp.path(), &["ls-files", "-s", "data.bin"]);
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).starts_with("120000"),
+        "data.bin must be committed as a symlink, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
 }
 
 // Linux-only: macOS (APFS/HFS+) and the BSDs reject non-UTF-8 filenames at the
