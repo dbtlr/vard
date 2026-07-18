@@ -389,7 +389,8 @@ nothing.")]
     Logs(LogsArgs),
 
     /// Diagnose the local vard environment read-only: git, inotify limits,
-    /// health-file freshness, request-queue hygiene, and a per-watch secret audit.
+    /// health-file freshness, request-queue hygiene, a per-watch secret audit,
+    /// systemd linger, and service-context agent reachability.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
 Diagnose the local vard environment, read-only.
@@ -434,18 +435,33 @@ probe, which `--offline` skips):
                 watch that does not sync, or has no remote defined, is `skipped`;
                 a repository that cannot be opened `warn`s. This is the one
                 network check — `--offline` skips it, rendering `skipped`
+  linger        (Linux only) whether the systemd user unit survives logout —
+                `loginctl show-user --property=Linger`. No unit installed is
+                `ok` (nothing to do yet); installed with lingering enabled is
+                `ok`; installed with lingering disabled `warn`s with the fix
+                (`loginctl enable-linger`, or `vard service install` with
+                `--linger`). On macOS this is `skipped` — launchd has no
+                linger concept
+  service-agent whether the service context can reach an ssh-agent for any
+                ssh-remote watch. On Linux: no ssh remotes is `ok`; no service
+                installed is `ok`; otherwise probes `systemctl --user
+                show-environment` for `SSH_AUTH_SOCK` — present is `ok`,
+                missing `warn`s with the fix (`systemctl --user
+                import-environment SSH_AUTH_SOCK`). On macOS the LaunchAgent
+                always runs inside the user's own GUI login session, so the
+                keychain and ssh-agent are reachable there by construction;
+                instead this reports the service's own loaded/running state
+                via `launchctl print` — running is `ok`, crash-looping or not
+                loaded `warn`s
 
-`--offline` skips every network check (today: remote-auth), so doctor runs the \
-local checks only.
+`--offline` skips every network check (today: remote-auth); `linger` and
+`service-agent` are local probes and always run, `--offline` or not.
 
 Exit codes: 0 when every check is `ok` or `skipped`; 1 when any check `warn`s \
 or `fail`s (attention); 2 when doctor itself could not run (an unresolvable \
 state directory, an invalid config). Output follows the global `--format`: \
 human glyph lines by default, or a stable JSON/JSONL array when piped (a \
-per-watch row carries its own `watch` field).
-
-Agent/keychain and service-linger checks are deferred to the service-install \
-command (VRD-24).")]
+per-watch row carries its own `watch` field).")]
     Doctor(DoctorArgs),
 
     /// Read and edit vard's configuration: get, set, unset, edit, path.
@@ -477,6 +493,41 @@ daemon's reloads (a config already invalid on disk may still be repaired).")]
         /// this command's short help.
         #[command(subcommand)]
         command: Option<ConfigCommand>,
+    },
+
+    /// Run vard as a login-session service: install, uninstall, start, stop,
+    /// restart the daemon under launchd or systemd.
+    #[command(disable_help_flag = true)]
+    #[command(disable_help_subcommand = true)]
+    #[command(long_about = "\
+Run vard as a service in your login session.
+
+`vard run` is the foreground daemon; these commands wrap it in your login \
+session's service manager so it starts at login and respawns on failure — a \
+macOS LaunchAgent (`~/Library/LaunchAgents/com.dbtlr.vard.plist`) or a Linux \
+systemd user unit (`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
+`~/.config/systemd/user/vard.service`). The unit only execs `vard run`, so all \
+watching and snapshotting still happens there.
+
+Running under your own login session — not as a system-wide daemon — is \
+deliberate: vard commits as you and needs your keychain, ssh-agent, and git \
+credentials, which a root-owned system service would not carry.
+
+  install    write the unit, load and start it, and verify the daemon came up
+  uninstall  stop and unload the service, then remove the unit
+  start      load (or kick) the service so the daemon runs
+  stop       unload the service, stopping the daemon
+  restart    restart the service to pick up a new binary or config
+
+The service is text-only: these verbs print human status lines and reject an \
+explicit `--format json`/`jsonl`. Only one daemon may own a state directory at a \
+time, so installing the service while a foreground `vard run` is active will \
+contend for the instance lock.")]
+    Service {
+        /// The chosen service subcommand. Absent (a bare `vard service`) prints
+        /// this command's short help.
+        #[command(subcommand)]
+        command: Option<ServiceCommand>,
     },
 }
 
@@ -676,6 +727,110 @@ pub struct ConfigKeyArgs {
     /// The dotted config key, e.g. `daemon.log_level` or `ai.model`.
     #[arg(value_name = "KEY")]
     pub key: String,
+}
+
+/// The `vard service` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Write the service unit, load and start it, and verify the daemon came up.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Install and start the vard service.
+
+Resolves the running `vard` binary's path, renders the platform unit — a launchd \
+plist on macOS, a systemd user unit on Linux — and writes it atomically \
+(`~/Library/LaunchAgents/com.dbtlr.vard.plist` or \
+`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
+`~/.config/systemd/user/vard.service`). It then loads and starts the service and \
+polls for up to five seconds for the daemon to actually come up; if the unit is \
+in place but the daemon never takes the instance lock, the command exits 1 and \
+points at `vard run` in the foreground to see why. Re-running is idempotent: an \
+already-loaded service is reloaded rather than rejected.
+
+The recorded ExecStart is the path `vard` was invoked through, not a \
+symlink-resolved real path, so a Homebrew install keeps `/opt/homebrew/bin/vard` \
+rather than a versioned Cellar path.
+
+On Linux, systemd user services stop at logout unless lingering is enabled. \
+After starting, `--linger` enables it (`loginctl enable-linger`) and `--no-linger` \
+leaves it off; with neither, an interactive terminal is prompted and a \
+non-interactive run leaves lingering off with a one-line notice.
+
+`--dry-run` prints the resolved binary path, the unit file path, the full \
+rendered unit, and the actions that would run — writing nothing and exiting 0.")]
+    Install(ServiceInstallArgs),
+
+    /// Stop and unload the service, then remove its unit file.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Uninstall the vard service.
+
+Stops and unloads the service, then removes its unit file \
+(`~/Library/LaunchAgents/com.dbtlr.vard.plist` or \
+`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
+`~/.config/systemd/user/vard.service`). Nothing in your repositories or config is \
+touched — only the service registration is removed. Uninstalling when nothing is \
+installed is a success: the command says so and exits 0.")]
+    Uninstall,
+
+    /// Load (or kick) the service so the daemon runs.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Start the vard service.
+
+Loads the installed service (or kicks an already-loaded one) so the daemon runs, \
+then verifies it came up. If no unit is installed, the command exits with an \
+error pointing at `vard service install`. If the service starts but the daemon \
+does not take the instance lock within five seconds, it exits 1 and points at \
+`vard run` in the foreground.")]
+    Start,
+
+    /// Unload the service, stopping the daemon.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Stop the vard service.
+
+Unloads the service, stopping the daemon. Stopping an already-stopped service is \
+a success and says so. On macOS this unloads the LaunchAgent, but the installed \
+plist's RunAtLoad re-arms the service at your next login — to keep it from \
+coming back, run `vard service uninstall`. On Linux the unit stays enabled, so a \
+stopped service still starts again at your next login until you `uninstall` (or \
+`systemctl --user disable`) it.")]
+    Stop,
+
+    /// Restart the service to pick up a new binary or config.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Restart the vard service.
+
+Restarts the running service and verifies the daemon came back up, the way to \
+pick up an upgraded `vard` binary or a changed unit. launchd has no reload \
+signal, so a restart is how macOS re-execs the daemon; on Linux the systemd unit \
+also carries an `ExecReload` that sends SIGHUP for a config-only reload without a \
+full restart. If the service is not loaded, restart loads it. A restart that \
+leaves the daemon down exits 1 and points at `vard run` in the foreground.")]
+    Restart,
+}
+
+/// Arguments to `vard service install`.
+#[derive(Debug, Args)]
+pub struct ServiceInstallArgs {
+    /// Show the resolved binary path, the unit file path, the rendered unit, and
+    /// the actions that would run — writing nothing.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// (Linux) After starting, enable lingering so the service survives logout
+    /// (`loginctl enable-linger`). Conflicts with `--no-linger`.
+    #[cfg(target_os = "linux")]
+    #[arg(long, conflicts_with = "no_linger")]
+    pub linger: bool,
+
+    /// (Linux) After starting, leave lingering off (the service stops at
+    /// logout). Conflicts with `--linger`.
+    #[cfg(target_os = "linux")]
+    #[arg(long = "no-linger")]
+    pub no_linger: bool,
 }
 
 /// The `vard watch` subcommands.

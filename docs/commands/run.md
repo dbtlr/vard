@@ -5,7 +5,7 @@ description: Run the vard daemon in the foreground, watching and snapshotting ev
 
 # vard run
 
-Run the vard daemon in the foreground until stopped. This is the process that does the actual watching: where [`snapshot`](snapshot.md) takes one snapshot on demand, `run` watches every active configured directory continuously and snapshots changes into version control on its own. It stays attached to the terminal and logs each event to stderr, so you run it under a process supervisor (systemd, launchd, a tmux pane) rather than as a one-shot command.
+Run the vard daemon in the foreground until stopped. This is the process that does the actual watching: where [`snapshot`](snapshot.md) takes one snapshot on demand, `run` watches every active configured directory continuously and snapshots changes into version control on its own. It stays attached to the terminal and logs each event to stderr, so it runs under a process supervisor rather than as a one-shot command — [`vard service install`](service.md) is the built-in path (a launchd LaunchAgent on macOS, a systemd user unit on Linux), or you can run it under a supervisor of your own (a tmux pane, a container entrypoint).
 
 ## Examples
 

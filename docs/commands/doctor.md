@@ -1,6 +1,6 @@
 ---
 title: doctor
-description: Diagnose the local vard environment read-only — git, inotify limits, health-file freshness, request-queue hygiene, a per-watch secret audit, and a per-watch remote-auth probe.
+description: Diagnose the local vard environment read-only — git, inotify limits, health-file freshness, request-queue hygiene, a per-watch secret audit, a per-watch remote-auth probe, systemd linger, and service-context agent reachability.
 ---
 
 # vard doctor
@@ -22,7 +22,7 @@ vard doctor --format json
 
 ## Checks
 
-Every check but `remote-auth` is local; `remote-auth` is the one that touches the network, and `--offline` skips it.
+Every check but `remote-auth` is local; `remote-auth` is the one that touches the network, and `--offline` skips it. `linger` and `service-agent` are local probes too — reads of `loginctl`/`systemctl`/`launchctl`, never the network — so `--offline` has no effect on them; they run every time.
 
 | Check | What it verifies |
 |---|---|
@@ -32,6 +32,8 @@ Every check but `remote-auth` is local; `remote-auth` is the one that touches th
 | `request-dir` | Stale entries in the request queue, older than the request staleness window. Three distinct cases, all `warn`, all flag-only (doctor never deletes): **crashed-writer leftovers** — files matching vard's own atomic-write temp scheme (`.<name>.tmp-<pid>`) that an interrupted write stranded, safe to delete; **settled requests piling up unconsumed**, which mean no daemon is draining the queue (a running daemon would discard them as stale anyway); and **unrecognized files** — anything else stale that vard did not write, flagged with "investigate before deleting" rather than called safe to remove. A queue directory that cannot be read (short of simply not existing) also `warn`s, naming the I/O error, so a read failure is never reported `ok`. |
 | `secret-audit` | Per configured watch, whether any already-tracked file has a secret-shaped **name**. See [the secret audit](#the-secret-audit) below. |
 | `remote-auth` | Per sync-enabled watch, whether the configured remote is reachable and authenticated. See [the remote-auth probe](#the-remote-auth-probe) below. |
+| `linger` | **Linux only.** Whether the [`vard service`](service.md) systemd user unit survives logout. See [linger](#linger) below. On macOS this is `skipped` — launchd has no such concept. |
+| `service-agent` | Whether the service context can reach an ssh-agent for any ssh-remote watch. See [service-agent](#service-agent) below. |
 
 ## The secret audit
 
@@ -68,6 +70,43 @@ Per-watch outcomes:
 
 Pass `--offline` to skip this probe entirely (a dead network, or a deliberately local-only run); the remaining local checks still run and the row reads `skipped`.
 
+## Linger
+
+**Linux only.** A [`vard service`](service.md) systemd user unit stops at logout unless **lingering** is enabled for the user — `vard service install` has its own consent flow for this, but a unit installed non-interactively (or with `--no-linger`) can be left lingering off without anyone noticing until the next logout kills the service. This check reads the *current* state with a read-only `loginctl show-user --property=Linger --value`; it never enables or disables anything.
+
+| Outcome | Row |
+|---|---|
+| No `vard service` unit is installed | `ok` — "linger not needed yet". |
+| A unit is installed and lingering is enabled | `ok`. |
+| A unit is installed and lingering is disabled | `warn` — with the fix (`loginctl enable-linger`, or `vard service install` with `--linger`). |
+| `loginctl` is missing, failed, or its output could not be parsed | `skipped` — with the underlying reason. |
+
+On macOS this row is `skipped` — launchd has no linger concept; a LaunchAgent runs whenever its user is logged in.
+
+## Service-agent
+
+Whether the service context can reach an ssh-agent for any watch that syncs over an ssh-style remote (anything other than `http://`/`https://` — an scp-style `git@host:path`, an `ssh://` URL, or a local path). The two platforms need very different things here, so this check reports different facts on each:
+
+**Linux**: a systemd user unit does not always inherit `SSH_AUTH_SOCK` from your login shell's ssh-agent, even with lingering on — the socket has to be imported into the user manager's own environment. This check runs a read-only `systemctl --user show-environment` and looks for an `SSH_AUTH_SOCK=` line.
+
+| Outcome | Row |
+|---|---|
+| No configured watch has an ssh-style remote | `ok` — "no ssh remotes — agent not needed". |
+| No `vard service` unit is installed | `ok` — "nothing to probe". |
+| `systemctl` is unreachable | `skipped` — with the underlying reason. |
+| `SSH_AUTH_SOCK` is set in the user manager environment | `ok`. |
+| `SSH_AUTH_SOCK` is missing | `warn` — with the fix (`systemctl --user import-environment SSH_AUTH_SOCK` from a login shell after your agent starts, or an `environment.d` entry). |
+
+**macOS**: a LaunchAgent always runs inside the user's own GUI login session (`gui/<uid>`), so the keychain and any ssh-agent socket are reachable there by construction — there is nothing to probe for reachability. Instead this check reports the service's actual loaded/running state via a read-only `launchctl print`, since that is the thing that can actually be wrong here.
+
+| Outcome | Row |
+|---|---|
+| No LaunchAgent plist is installed | `ok` — "nothing to probe". |
+| Loaded and running | `ok`. |
+| Loaded but not running, with a nonzero last exit code | `warn` — "crash-looping/exiting"; run `vard run` in the foreground to see why. |
+| Not loaded (the plist may still be present) | `warn` — run `vard service start`. |
+| `launchctl print`'s output does not match a recognized shape | `skipped` — with a short detail. |
+
 ## Output
 
 A list surface (records/json/jsonl). On a terminal each check is a glyph line in the visual register of [`status`](status.md); piped, it is a stable JSON/JSONL array.
@@ -79,6 +118,8 @@ A list surface (records/json/jsonl). On a terminal each check is a glyph line in
 ✓ request-dir: ok — no stale leftovers in the request queue
 ✓ secret-audit: ok — watch "notes": no tracked file has a secret-shaped name
 ✓ remote-auth: ok — watch "notes": remote "origin" is reachable and authenticated
+· linger: skipped — not applicable on this platform — linger is a systemd concept for keeping a user service alive past logout; launchd has no equivalent
+✓ service-agent: ok — service not installed — nothing to probe
 ```
 
 Each row carries a stable machine shape: `check`, `status`, and `detail`, plus a `watch` field on **per-watch** rows (`secret-audit`, `remote-auth`). A global row omits `watch` entirely, so a machine consumer reads the watch name from the field rather than parsing it out of the `detail` prose.
@@ -97,9 +138,9 @@ vard doctor --format json
 | Status | Meaning |
 |---|---|
 | `ok` | The check passed. |
-| `warn` | A soft problem worth a look (an old git, tight inotify headroom, a stale health file, a stranded request leftover, a repository that could not be opened for a per-watch check). |
+| `warn` | A soft problem worth a look (an old git, tight inotify headroom, a stale health file, a stranded request leftover, a repository that could not be opened for a per-watch check, lingering disabled, a missing `SSH_AUTH_SOCK` under the service, or a service that is crash-looping or not loaded). |
 | `fail` | A hard problem (git is missing, or a sync-enabled watch's remote is unreachable or refused authentication). |
-| `skipped` | The check does not apply here (inotify on macOS; a non-syncing watch, or remote-auth under `--offline`). |
+| `skipped` | The check does not apply here (inotify or linger on macOS; a non-syncing watch, or remote-auth under `--offline`; `loginctl`/`systemctl`/`launchctl` unreachable or their output unparseable). |
 
 ## Exit codes
 
@@ -109,12 +150,9 @@ vard doctor --format json
 | `1` | At least one check `warn`ed or `fail`ed — something needs attention. |
 | `2` | doctor itself could not run (an unresolvable state directory, or an invalid config it could not read the watch list from). |
 
-## Not yet covered
-
-`doctor` grows over time. Agent/keychain and service-linger checks are deferred to the service-install command (VRD-24).
-
 ## See also
 
 - [`status`](status.md) — the daemon liveness and per-watch state this shares a visual register with.
 - [`run`](run.md) — start the daemon whose health file this checks.
+- [`service`](service.md) — install and manage the login-session service the `linger` and `service-agent` checks diagnose.
 - Run `vard doctor --help` for the full reference.
