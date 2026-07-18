@@ -771,6 +771,67 @@ fn no_scanner_request_is_byte_identical_and_commits_a_secret() {
     assert_eq!(tracked(tmp.path()), vec![".env".to_string()]);
 }
 
+// --- tracked-file audit (VRD-22) -------------------------------------------
+
+#[test]
+fn tracked_files_lists_committed_paths_and_is_empty_on_an_unborn_repo() {
+    let (tmp, backend) = new_repo();
+    // Nothing committed yet: an unborn HEAD lists no tracked files (not an error).
+    assert!(backend.tracked_files().unwrap().is_empty());
+
+    write(tmp.path(), "main.rs", "fn main() {}\n");
+    write(
+        tmp.path(),
+        "id_rsa",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    );
+    // Commit both directly (no scanner) so they become TRACKED — the audit's
+    // domain, exactly the case quarantine cannot reach (already committed).
+    git_ok(tmp.path(), &["add", "-A"]);
+    git_ok(tmp.path(), &["commit", "-m", "seed", "--no-verify"]);
+
+    let mut tracked = backend.tracked_files().unwrap();
+    tracked.sort();
+    assert_eq!(
+        tracked,
+        vec![PathBuf::from("id_rsa"), PathBuf::from("main.rs")]
+    );
+}
+
+#[test]
+fn audit_reports_a_precommitted_secret_name_and_nothing_on_a_clean_repo() {
+    // A pre-committed `id_rsa` is reported by the audit...
+    let (tmp, backend) = new_repo();
+    write(
+        tmp.path(),
+        "id_rsa",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n",
+    );
+    write(tmp.path(), "main.rs", "fn main() {}\n");
+    git_ok(tmp.path(), &["add", "-A"]);
+    git_ok(tmp.path(), &["commit", "-m", "seed", "--no-verify"]);
+
+    let scanner = SecretScanner::compile(true, &[]).unwrap();
+    let hits = scanner.audit_tracked(&backend.tracked_files().unwrap());
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].path, PathBuf::from("id_rsa"));
+    assert!(matches!(
+        hits[0].reason,
+        SecretReason::FilenamePattern { .. }
+    ));
+
+    // ...and a repo with no secret-shaped names audits clean.
+    let (tmp2, backend2) = new_repo();
+    write(tmp2.path(), "main.rs", "fn main() {}\n");
+    git_ok(tmp2.path(), &["add", "-A"]);
+    git_ok(tmp2.path(), &["commit", "-m", "seed", "--no-verify"]);
+    assert!(
+        scanner
+            .audit_tracked(&backend2.tracked_files().unwrap())
+            .is_empty()
+    );
+}
+
 // --- log -------------------------------------------------------------------
 
 #[test]

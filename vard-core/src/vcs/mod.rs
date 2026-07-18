@@ -113,6 +113,19 @@ pub trait VcsBackend {
     /// vector, not an error.
     fn log(&self, filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError>;
 
+    /// Lists the repository's tracked files as repository-relative paths
+    /// (`git ls-files -z` for the git backend).
+    ///
+    /// This is the input to the secret-quarantine **audit** (VRD-22): quarantine
+    /// only withholds *newly-added* files, so a secret committed before scanning
+    /// was on — or force-added — is already tracked and quarantine can never
+    /// catch it. The audit ([`SecretScanner::audit_tracked`](crate::SecretScanner::audit_tracked))
+    /// checks these tracked names against the secret catalog; the
+    /// [`vard doctor`](crate) command (a later task) is its first consumer. A
+    /// repository with nothing committed yet returns an empty vector, not an
+    /// error.
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError>;
+
     /// Returns the raw unified diff between two references, or between one
     /// reference and the current work tree when `to` is `None`.
     ///

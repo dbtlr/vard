@@ -83,6 +83,31 @@ Print the path to vard's config file. Resolves the same `$XDG_CONFIG_HOME/vard/c
 
 By default the **bare path** prints — the TEXT form — whether on a terminal or piped, so `$(vard config path)` and `$EDITOR "$(vard config path)"` yield the path alone. Pass `--format json` for the `{path}` object.
 
+## Secret scanning (`secret_scan` / `secret_patterns`)
+
+vard scans newly-added files for likely secrets before committing them and withholds any match (see [`snapshot`](snapshot.md#secret-quarantine) and the [`run`](run.md) daemon). Two keys control it, at both the `[defaults]` level and per watch:
+
+- **`secret_scan`** (boolean, default `true`) — whether the watch scans at all. On by default, so vard quarantines credentials unless you explicitly turn it off. As a `[defaults]` scalar it is settable here:
+
+  ```bash
+  vard config set defaults.secret_scan false
+  # turn secret scanning off for every watch that does not override it
+  ```
+
+  A non-boolean value is refused. A per-watch override lives in that watch's `[[watch]]` table (`secret_scan = false`) and is edited by hand (`vard config edit`), not through `vard watch set` — like other per-watch booleans it has no dedicated flag.
+
+- **`secret_patterns`** (list of gitignore-dialect filename patterns) — **additional** secret filename shapes on top of vard's built-in catalog (`.env`, `id_rsa`, `*.pem`, …); the catalog always applies. Because it is a list, it is **config-file-only** — set it in `[defaults]` or a `[[watch]]` table via `vard config edit`, not `vard config set` (which handles scalars). A watch's own `secret_patterns` **replaces** the `[defaults]` list rather than appending to it (the same override rule the duration keys use); a watch that sets none inherits the defaults list.
+
+  ```toml
+  [defaults]
+  secret_patterns = ["*.secret", "credentials.json"]
+
+  [[watch]]
+  name = "notes"
+  path = "~/notes"
+  secret_scan = false          # this watch opts out entirely
+  ```
+
 ## Output classes
 
 `config` spans both of vard's output classes:

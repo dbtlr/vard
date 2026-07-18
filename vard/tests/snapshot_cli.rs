@@ -113,6 +113,57 @@ fn second_snapshot_with_no_changes_is_a_clean_noop() {
 }
 
 #[test]
+fn snapshot_quarantines_a_content_secret_warns_and_still_exits_zero() {
+    let env = Env::new();
+    let repo = add_watch(&env, "notes");
+    // A file whose NAME is innocuous (so `.git/info/exclude`'s default secret
+    // shapes don't ignore it) but whose CONTENT is a credential: the scanner
+    // withholds it from the commit.
+    std::fs::write(repo.join("creds.txt"), "aws_key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+
+    let out = env.vard(&["snapshot", "notes"]);
+    // Quarantine is a warning, not a failure: exit 0.
+    assert!(out.status.success(), "expected exit 0: {}", stderr(&out));
+    // The only change was the secret, so nothing was committed...
+    assert_eq!(commit_count(&env, &repo), 0);
+    // ...but it is never silent: stderr names the withheld path and why.
+    let err = stderr(&out);
+    assert!(err.contains("creds.txt"), "withheld path named: {err}");
+    assert!(err.contains("secret"), "reason surfaced: {err}");
+    // The file stays on disk, untracked.
+    assert!(repo.join("creds.txt").exists());
+    let tracked = git_in(&env, &repo, &["ls-files", "--error-unmatch", "creds.txt"]);
+    assert!(!tracked.status.success(), "creds.txt must stay untracked");
+}
+
+#[test]
+fn snapshot_commits_a_legit_change_beside_a_withheld_secret() {
+    let env = Env::new();
+    let repo = add_watch(&env, "notes");
+    std::fs::write(repo.join("app.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        repo.join("token.txt"),
+        "ghp_0123456789abcdef0123456789abcdef0123\n",
+    )
+    .unwrap();
+
+    let out = env.vard(&["snapshot", "notes"]);
+    assert!(out.status.success(), "expected exit 0: {}", stderr(&out));
+    // The legit change committed; the secret was withheld beside it.
+    assert_eq!(commit_count(&env, &repo), 1);
+    assert!(stderr(&out).contains("token.txt"), "got: {}", stderr(&out));
+    // The commit contains app.rs and NOT token.txt.
+    let tree = git_in(&env, &repo, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    let names = stdout(&tree);
+    assert!(names.contains("app.rs"), "got: {names}");
+    assert!(
+        !names.contains("token.txt"),
+        "secret must be withheld: {names}"
+    );
+    assert!(repo.join("token.txt").exists());
+}
+
+#[test]
 fn snapshot_no_target_covers_every_watch() {
     let env = Env::new();
     let a = add_watch(&env, "alpha");

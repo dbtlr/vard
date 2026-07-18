@@ -176,6 +176,13 @@ queuing work the daemon will drop — resume it, or stop the daemon to snapshot 
 in-process (an in-process manual snapshot of a paused watch is still allowed, \
 as explicit intent).
 
+An in-process snapshot scans newly-added files for likely secrets and WITHHOLDS \
+any it finds from the commit (the same per-watch scanning the daemon does), \
+unless the watch sets `secret_scan = false`. A withheld file stays on disk, \
+uncommitted; the command names it on stderr and still exits 0 (quarantine is a \
+warning, not a failure). Move it out of the watch, or disable scanning for the \
+watch, to include it.
+
 `-m` prepends a message paragraph to the generated snapshot subject.")]
     Snapshot(SnapshotArgs),
 

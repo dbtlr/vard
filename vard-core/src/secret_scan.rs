@@ -341,6 +341,26 @@ impl SecretScanner {
         let content = read_capped(abs_path)?;
         self.scan_content(rel_path, &content)
     }
+
+    /// Audits an already-tracked set of repository-relative paths for
+    /// secret-shaped **filenames** (VRD-22 audit; the function
+    /// [`vard doctor`](crate) will call). Runs the filename layer
+    /// ([`scan_path`](Self::scan_path)) — the built-in catalog plus this watch's
+    /// extras — over each path and returns every hit, in input order.
+    ///
+    /// Deliberately filename-only: the content heuristics (token prefixes,
+    /// entropy) are **not** run over tracked file bytes here. Quarantine already
+    /// keeps newly-added secrets *out* of history; the audit answers the
+    /// complementary question quarantine cannot — "is a secret-shaped filename
+    /// *already committed*?" — for which reading each tracked blob is a heavier,
+    /// separately-scoped job (content-scanning committed history) left for later.
+    /// A disabled scanner audits nothing.
+    pub fn audit_tracked(&self, tracked: &[PathBuf]) -> Vec<SecretMatch> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        tracked.iter().filter_map(|p| self.scan_path(p)).collect()
+    }
 }
 
 /// Reads up to [`MAX_SCAN_BYTES`] + 1 bytes of `path` (the extra byte only
@@ -820,5 +840,48 @@ mod tests {
                 .is_none()
         );
         assert!(!scanner.is_enabled());
+    }
+
+    // --- audit (tracked-filename layer, VRD-22) -----------------------------
+
+    #[test]
+    fn audit_tracked_reports_secret_filenames_by_catalog_and_extra() {
+        let scanner = SecretScanner::compile(true, &["*.secret".to_string()]).unwrap();
+        let tracked = [
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("id_rsa"),             // built-in catalog
+            PathBuf::from("config/.env"),        // built-in catalog, nested
+            PathBuf::from("deploy/prod.secret"), // the extra pattern
+            PathBuf::from("README.md"),
+        ];
+        let hits = scanner.audit_tracked(&tracked);
+        let paths: Vec<_> = hits.iter().map(|m| m.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("id_rsa"),
+                PathBuf::from("config/.env"),
+                PathBuf::from("deploy/prod.secret"),
+            ],
+            "every secret-shaped tracked filename is reported, in input order"
+        );
+    }
+
+    #[test]
+    fn audit_tracked_does_not_scan_content() {
+        // A tracked file whose NAME is innocuous is never flagged by the audit,
+        // even if a caller could read credential-looking content from it — the
+        // audit is filename-only by contract.
+        let scanner = scanner();
+        let hits = scanner.audit_tracked(&[PathBuf::from("creds.txt")]);
+        assert!(hits.is_empty(), "audit must not scan tracked content");
+    }
+
+    #[test]
+    fn audit_tracked_is_empty_when_disabled_or_clean() {
+        let clean = scanner().audit_tracked(&[PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
+        assert!(clean.is_empty());
+        let off = SecretScanner::compile(false, &[]).unwrap();
+        assert!(off.audit_tracked(&[PathBuf::from("id_rsa")]).is_empty());
     }
 }

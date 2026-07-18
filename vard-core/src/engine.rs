@@ -3762,6 +3762,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+            unimplemented!("tracked_files is out of scope for the snapshot engine")
+        }
+
         fn diff(
             &self,
             _from: &crate::vcs::VcsRef,

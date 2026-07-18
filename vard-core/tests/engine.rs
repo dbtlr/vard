@@ -99,6 +99,10 @@ impl VcsBackend for FakeBackend {
         Ok(Vec::new())
     }
 
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        unimplemented!("tracked_files is out of scope for the snapshot engine")
+    }
+
     fn diff(
         &self,
         _from: &VcsRef,
@@ -313,6 +317,10 @@ impl VcsBackend for GatedBackend {
 
     fn log(&self, _filter: &LogFilter) -> Result<Vec<Snapshot>, VcsError> {
         Ok(Vec::new())
+    }
+
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        unimplemented!("tracked_files is out of scope for the snapshot engine")
     }
 
     fn diff(

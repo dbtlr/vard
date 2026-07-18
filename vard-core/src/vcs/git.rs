@@ -598,6 +598,18 @@ impl VcsBackend for GitBackend {
         parse_log(&String::from_utf8_lossy(&out.stdout))
     }
 
+    fn tracked_files(&self) -> Result<Vec<PathBuf>, VcsError> {
+        // `-z` delimits with NUL so unusual filenames arrive unquoted (the same
+        // discipline `scan_untracked` uses). An unborn HEAD (nothing committed
+        // yet) simply lists nothing — success, not an error.
+        let out = self.run(&[], ["ls-files", "-z"])?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect())
+    }
+
     fn diff(
         &self,
         from: &VcsRef,
