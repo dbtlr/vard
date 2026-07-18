@@ -388,6 +388,44 @@ has never run — `vard logs` reports that and exits 1 rather than printing \
 nothing.")]
     Logs(LogsArgs),
 
+    /// Diagnose the local vard environment read-only: git, inotify limits,
+    /// health-file freshness, and request-queue hygiene.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Diagnose the local vard environment, read-only.
+
+`doctor` runs a set of local checks and prints one row per check — it NEVER \
+mutates anything (it reads /proc, the config, the health file, and the request \
+queue, and reports; it does not clean, restore, or write). Each row is `ok`, \
+`warn`, `fail`, or `skipped`.
+
+The checks in this release, all local (no network):
+
+  git          the git executable is on PATH and new enough — vard's snapshot
+               log format needs git 2.22+; older git `warn`s, a missing git
+               `fail`s
+  inotify      (Linux only) the kernel's inotify limits
+               (`max_user_watches`/`max_user_instances`) against how many
+               directories the configured watches would register; `warn`s as
+               the total approaches a limit. On macOS this is `skipped` — vard
+               uses FSEvents, which has no such limit
+  health-file  whether the daemon's health file is fresh; a running daemon whose
+               file has gone stale `warn`s. A daemon that is not running is a
+               legitimate state, reported `ok` with a note
+  request-dir  stale leftovers a crashed request writer stranded in the queue;
+               `warn`s with the file names and a note that they are safe to
+               delete (doctor flags them, it does not delete them)
+
+Exit codes: 0 when every check is `ok` or `skipped`; 1 when any check `warn`s \
+or `fail`s (attention); 2 when doctor itself could not run (an unresolvable \
+state directory, an invalid config). Output follows the global `--format`: \
+human glyph lines by default, or a stable JSON/JSONL array when piped.
+
+A per-watch secret audit and a remote-authentication probe (with an `--offline` \
+flag to skip it) are planned for later releases; agent/keychain and \
+service-linger checks are deferred to the service-install command (VRD-24).")]
+    Doctor,
+
     /// Read and edit vard's configuration: get, set, unset, edit, path.
     #[command(disable_help_flag = true)]
     #[command(disable_help_subcommand = true)]

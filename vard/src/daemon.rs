@@ -1726,16 +1726,6 @@ fn request_is_stale(request: &Request, now: SystemTime) -> bool {
     request.age(now) > request::STALE_AFTER
 }
 
-/// Whether `name` is a *settled* request file the daemon may consume: a plain
-/// `*.toml` name that is not hidden (no leading dot). Writers create requests
-/// by writing to a temp or dot name in the same directory and `rename(2)`-ing
-/// to the final `*.toml` name (atomic on POSIX; see the [module docs](self)),
-/// so a name matching this predicate is always a complete file. Temp suffixes
-/// (`.tmp`, `.partial`, anything else) fail the `*.toml` requirement.
-fn is_settled_request_name(name: &str) -> bool {
-    name.ends_with(".toml") && !name.starts_with('.')
-}
-
 /// Scans `dir` and consumes every *settled* request file: each is parsed,
 /// handed to `on_request` when valid, and then deleted — a consumed request or
 /// a settled poison file alike (poison is logged and removed so it cannot
@@ -1759,7 +1749,7 @@ fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !is_settled_request_name(name) {
+        if !request::is_settled_request_name(name) {
             // A writer mid-flight (temp/dot name) or an unrelated file: not
             // ours to touch.
             continue;
@@ -2024,21 +2014,6 @@ mod tests {
     }
 
     // --- request-file consumption --------------------------------------------
-
-    #[test]
-    fn only_plain_toml_names_are_settled() {
-        assert!(is_settled_request_name("req.toml"));
-        assert!(is_settled_request_name("snapshot-1234.toml"));
-        // Hidden files are a writer's staging name, never consumed.
-        assert!(!is_settled_request_name(".req.toml"));
-        assert!(!is_settled_request_name(".hidden"));
-        // Temp suffixes and non-toml names are not settled.
-        assert!(!is_settled_request_name("req.toml.tmp"));
-        assert!(!is_settled_request_name("req.toml.partial"));
-        assert!(!is_settled_request_name("req.tmp"));
-        assert!(!is_settled_request_name("notes.txt"));
-        assert!(!is_settled_request_name("toml"));
-    }
 
     #[test]
     fn drain_ignores_unsettled_files_and_consumes_settled_ones() {
@@ -2454,7 +2429,11 @@ mod tests {
                 .map(|entries| {
                     entries
                         .flatten()
-                        .filter(|e| e.file_name().to_str().is_some_and(is_settled_request_name))
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(request::is_settled_request_name)
+                        })
                         .count()
                 })
                 .unwrap_or(0)

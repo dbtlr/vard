@@ -241,6 +241,7 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
         Command::Notify => "notify",
         Command::Status(_) => "status",
         Command::Logs(_) => "logs",
+        Command::Doctor => "doctor",
         Command::Config { .. } => "config",
     });
     let (cmd, path) =

@@ -86,6 +86,11 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" logs -h | grep -q 'For full help, run' || fail "vard logs -h missing the v2 short-help footer"
 "$VARD" logs --help | grep -q 'daily-rolling' || fail "vard logs --help missing its prose"
 
+# vard doctor (VRD-23): the read-only environment diagnosis. Help renders through
+# the same v2 path; the functional run is asserted below once a watch exists.
+"$VARD" doctor -h | grep -q 'For full help, run' || fail "vard doctor -h missing the v2 short-help footer"
+"$VARD" doctor --help | grep -q 'read-only' || fail "vard doctor --help missing its prose"
+
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
 # Requires git on PATH (the release-artifact job has it).
@@ -155,6 +160,15 @@ printf '%s\n' "$status_out" | grep -q 'daemon: not running' \
   || fail "vard status did not report the stopped daemon"
 printf '%s\n' "$status_out" | grep -q 'smoke: unknown' \
   || fail "vard status did not project the unmonitored smoke watch as unknown"
+
+# vard doctor (VRD-23), functional: read-only, so it must change nothing. With
+# git present and no daemon, every check is ok/skipped and it exits 0. Its JSON
+# form is a single array carrying the git check row.
+doctor_json="$("$VARD" --format json doctor)" || fail "vard doctor must exit 0 when all checks pass"
+printf '%s\n' "$doctor_json" | grep -q '"check":"git"' \
+  || fail "vard doctor --format json did not emit the git check row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"health-file"' \
+  || fail "vard doctor --format json did not emit the health-file check row"
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit
