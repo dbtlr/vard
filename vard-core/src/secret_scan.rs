@@ -807,6 +807,32 @@ mod tests {
         assert!(scanner().scan_path(Path::new("sub/dir/.env")).is_some());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn valid_utf8_name_under_a_non_utf8_directory_is_matched() {
+        // VRD-22: the git seam hands the scanner byte-exact paths, including ones
+        // whose PARENT has a non-UTF-8 byte (legal on Linux) but whose basename is
+        // clean. The filename layer must still match on the basename — otherwise a
+        // secret nested under such a directory would slip through. This exercises
+        // the matcher directly with a synthetic path, so it needs no filesystem
+        // that can hold the name (macOS/BSD reject one).
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        let mut bytes = b"dir-".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"/.env");
+        let path = PathBuf::from(OsStr::from_bytes(&bytes));
+
+        let hit = scanner()
+            .scan_path(&path)
+            .expect("the nested .env must match on its basename");
+        assert!(matches!(hit.reason, SecretReason::FilenamePattern { .. }));
+        // The reported path is byte-exact, not lossily decoded.
+        assert_eq!(hit.path.as_os_str().as_bytes(), &bytes[..]);
+    }
+
     #[test]
     fn extra_pattern_is_matched() {
         let scanner = SecretScanner::compile(true, &["*.secret".to_string()]).unwrap();

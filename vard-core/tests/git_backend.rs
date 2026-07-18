@@ -771,6 +771,149 @@ fn no_scanner_request_is_byte_identical_and_commits_a_secret() {
     assert_eq!(tracked(tmp.path()), vec![".env".to_string()]);
 }
 
+#[cfg(unix)]
+#[test]
+fn quarantine_scans_only_regular_files_never_symlinks() {
+    use std::os::unix::fs::symlink;
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "real.txt", "just text\n");
+    // A symlink whose NAME matches a secret filename pattern (`id_rsa`), pointing
+    // at a regular file: git commits it as its link string, never the target's
+    // content, so it can never leak — it must be neither scanned nor quarantined.
+    symlink("real.txt", tmp.path().join("id_rsa")).unwrap();
+    // A DANGLING symlink whose name also matches a pattern (`.env`): same
+    // treatment, and it must never be followed (its target does not exist).
+    symlink("nowhere", tmp.path().join(".env")).unwrap();
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    assert!(
+        report.quarantined.is_empty(),
+        "symlinks must never be quarantined: {:?}",
+        report.quarantined
+    );
+    let names = tracked(tmp.path());
+    assert!(
+        names.contains(&"id_rsa".to_string()),
+        "the symlink commits as a link: {names:?}"
+    );
+    assert!(
+        names.contains(&".env".to_string()),
+        "the dangling symlink commits as a link: {names:?}"
+    );
+    assert!(names.contains(&"real.txt".to_string()));
+    // git stored id_rsa as a symlink (mode 120000) — the link string, not the
+    // target's content — direct proof nothing was read through it.
+    let ls = git(tmp.path(), &["ls-files", "-s", "id_rsa"]);
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).starts_with("120000"),
+        "id_rsa must be committed as a symlink, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn quarantine_does_not_hang_or_read_a_fifo() {
+    use std::sync::mpsc;
+    let (tmp, backend) = new_repo();
+    write(tmp.path(), "keep.txt", "hi\n");
+    // A FIFO in the tree: a blocking `open()` on it would never return. It is
+    // non-regular, so it must not be a scan candidate — the snapshot returns
+    // promptly without ever opening it.
+    let status = Command::new("mkfifo")
+        .arg(tmp.path().join("pipe"))
+        .status()
+        .expect("spawn mkfifo");
+    assert!(status.success(), "mkfifo failed");
+
+    // Run the snapshot on a worker thread and bound it: on regression (a blocking
+    // open of the FIFO) this fails after the timeout instead of hanging forever.
+    let (tx, rx) = mpsc::channel();
+    let backend2 = backend.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(backend2.snapshot(&scanning_req(Trigger::Event, &[])));
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("snapshot hung on a FIFO (did not return within 10s)")
+        .unwrap();
+
+    assert!(
+        report.quarantined.is_empty(),
+        "a FIFO is never a scan candidate"
+    );
+    // The regular file still commits; git itself does not track a FIFO.
+    assert!(tracked(tmp.path()).contains(&"keep.txt".to_string()));
+}
+
+// Linux-only: macOS (APFS/HFS+) and the BSDs reject non-UTF-8 filenames at the
+// filesystem layer (EILSEQ), so the case can only be exercised where the kernel
+// permits such names. The code path itself is unix-wide (`bytes_to_path` uses
+// `OsStrExt` on every unix); this test just needs a filesystem that will hold
+// the name.
+#[cfg(target_os = "linux")]
+#[test]
+fn quarantine_is_byte_exact_under_a_non_utf8_directory() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let (tmp, backend) = new_repo();
+
+    // A directory whose name carries a non-UTF-8 byte (legal on Linux).
+    let mut dir_name = b"dir-".to_vec();
+    dir_name.push(0xFF);
+    let dir = tmp.path().join(OsStr::from_bytes(&dir_name));
+    fs::create_dir(&dir).unwrap();
+    // A valid-UTF-8 secret FILENAME nested under it, with innocuous content, so
+    // only the filename layer can catch it: a hit proves path-layer matching
+    // works even under a non-UTF-8 parent.
+    fs::write(dir.join(".env"), "innocuous\n").unwrap();
+    write(tmp.path(), "keep.txt", "hi\n");
+
+    let report = backend
+        .snapshot(&scanning_req(Trigger::Event, &[]))
+        .unwrap();
+
+    // The legit file committed; exactly one secret was withheld, its path
+    // byte-exact (no lossy U+FFFD substitution).
+    assert!(report.committed.is_some());
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the nested .env must be withheld"
+    );
+    let mut expected = b"dir-".to_vec();
+    expected.push(0xFF);
+    expected.extend_from_slice(b"/.env");
+    assert_eq!(
+        report.quarantined[0].path.as_os_str().as_bytes(),
+        &expected[..],
+        "the withheld path must be byte-exact"
+    );
+
+    // Prove the withhold via the COMMITTED TREE, not the report: the exclusion
+    // byte-matched, so the secret is absent from HEAD while keep.txt is present.
+    let tree = git(tmp.path(), &["ls-tree", "-r", "-z", "--name-only", "HEAD"]);
+    assert!(tree.status.success(), "ls-tree failed");
+    let committed: Vec<&[u8]> = tree
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert!(
+        committed.iter().any(|p| *p == b"keep.txt"),
+        "keep.txt must be committed"
+    );
+    assert!(
+        !committed.iter().any(|p| *p == expected.as_slice()),
+        "the non-UTF-8 secret path must NOT be in the commit"
+    );
+    // Still on disk, untracked.
+    assert!(dir.join(".env").exists());
+}
+
 // --- tracked-file audit (VRD-22) -------------------------------------------
 
 #[test]

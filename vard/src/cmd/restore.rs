@@ -210,7 +210,16 @@ fn real_restore(
     // no nested bracket that would clobber the outer `restore` one.
     let flow = || -> Result<Option<SnapshotOutcome>, CmdError> {
         let protective = match backend.snapshot(&req) {
-            Ok(report) => report.committed,
+            Ok(report) => {
+                // Surface any withheld secrets on stderr exactly as `vard
+                // snapshot` does — a pre-restore withhold must never be silent.
+                // The restore then proceeds: the withheld files are untracked, so
+                // the checkout leaves them on disk untouched.
+                if !report.quarantined.is_empty() {
+                    super::snapshot::warn_quarantined(name, &report.quarantined);
+                }
+                report.committed
+            }
             Err(VcsError::UnsafeState(reason)) => {
                 return Err(CmdError::attention(format!(
                     "cannot restore {name:?}: repository became unsafe ({reason}); \

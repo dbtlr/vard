@@ -285,7 +285,11 @@ fn snapshot_result(name: &str, report: SnapshotReport) -> (Record, u8) {
 /// the stdout result stream): the count, then each withheld path and its reason
 /// family, then how to include one anyway. It names paths and reason families
 /// only — never any file content (a [`SecretMatch`] carries none).
-fn warn_quarantined(name: &str, withheld: &[SecretMatch]) {
+///
+/// Shared with `restore`'s protective snapshot ([`super::restore`]) so a
+/// withhold during a pre-restore snapshot is surfaced identically, never
+/// silently dropped.
+pub(super) fn warn_quarantined(name: &str, withheld: &[SecretMatch]) {
     eprintln!(
         "vard: {name}: {} — each stays on disk, uncommitted:",
         withheld_detail(withheld.len())

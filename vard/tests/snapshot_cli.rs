@@ -324,6 +324,52 @@ fn restore_takes_protective_snapshot_then_restores_file() {
 }
 
 #[test]
+fn restore_protective_snapshot_warns_on_a_withheld_secret_and_proceeds() {
+    // VRD-22: the pre-restore protective snapshot scans like any pass. A
+    // newly-added secret present at restore time is withheld — and, exactly like
+    // `vard snapshot`, that withhold is surfaced on stderr, never silently. The
+    // restore then proceeds; the untracked secret stays on disk untouched.
+    let env = Env::new();
+    let repo = add_watch(&env, "notes");
+    std::fs::write(repo.join("a.txt"), "original\n").unwrap();
+    assert!(env.vard(&["snapshot", "notes"]).status.success());
+    let first = stdout(&git_in(&env, &repo, &["rev-parse", "HEAD"]))
+        .trim()
+        .to_string();
+
+    // Change the tracked file (so the protective snapshot has real work) and drop
+    // in a newly-added secret beside it. The name is innocuous (a secret-shaped
+    // name would be hidden by `.git/info/exclude` before the scanner ran); the
+    // CONTENT is a credential the content layer catches — the same shape the
+    // `vard snapshot` quarantine test uses.
+    std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+    std::fs::write(repo.join("creds.txt"), "aws_key = AKIAIOSFODNN7EXAMPLE\n").unwrap();
+
+    let out = env.vard(&["restore", "notes", "--ref", &first, "--file", "a.txt"]);
+    assert!(out.status.success(), "restore failed: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("creds.txt"),
+        "withheld path named on stderr: {err}"
+    );
+    assert!(err.contains("secret"), "reason surfaced on stderr: {err}");
+
+    // The restore proceeded: a.txt is back to its first-snapshot content.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+        "original\n"
+    );
+    // The secret is untouched on disk and never committed.
+    assert!(
+        repo.join("creds.txt").exists(),
+        "creds.txt must remain on disk"
+    );
+    let tracked = git_in(&env, &repo, &["ls-files", "--error-unmatch", "creds.txt"]);
+    assert!(!tracked.status.success(), "creds.txt must stay untracked");
+    assert_journals_clean(&env);
+}
+
+#[test]
 fn restore_dry_run_previews_without_touching_tree() {
     let env = Env::new();
     let repo = add_watch(&env, "notes");

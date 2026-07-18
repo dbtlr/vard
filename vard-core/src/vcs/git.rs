@@ -47,7 +47,11 @@
 //! is injected: [`snapshot`] excludes matched newly-added paths from staging
 //! when a [`SecretScanner`] rides the [`SnapshotRequest`], so the exclusion is
 //! decided by the caller's scanner, not by the VCS layer itself (VRD-22).
-//! Absent a scanner the sweep is a plain total `git add -A`.
+//! Absent a scanner the sweep is a plain total `git add -A`. The scan enumerates
+//! and excludes by byte-exact path and only ever reads regular files; a file
+//! created in the window between enumeration and the `git add -A` is committed
+//! unscanned, a TOCTOU the engine's per-watch serialization narrows but cannot
+//! close (the next pass re-derives quarantine).
 //!
 //! [`snapshot`]: VcsBackend::snapshot
 
@@ -302,17 +306,61 @@ impl GitBackend {
     /// untracked directory rather than collapsing it (as `status --porcelain`
     /// would to `dir/`), so a dropped-in `.aws/` is scanned member by member and
     /// only its secret files are excluded — the non-secret ones still commit.
-    /// `-z` delimits with NUL so unusual filenames arrive unquoted. Each path is
-    /// scanned filename-first, then by a capped content read of its working-tree
-    /// file ([`SecretScanner::scan_file`]). Modified tracked files are never in
-    /// this set and so are never scanned.
+    ///
+    /// # Byte-exact paths
+    ///
+    /// The `-z` output is read as **raw bytes** and split on NUL, and each path
+    /// is turned into a [`PathBuf`] without lossy UTF-8 decoding (on unix via
+    /// `OsStrExt::from_bytes`). This is load-bearing: the resulting
+    /// [`SecretMatch::path`] becomes an `:(exclude,literal)` pathspec for the
+    /// stage step, so it must byte-match the real path exactly — a lossy `U+FFFD`
+    /// substitution would fail to exclude the real file and stage the secret
+    /// while the report claimed it was withheld. On a platform that cannot
+    /// round-trip a non-UTF-8 path (non-unix without `OsStrExt`), the pass fails
+    /// with [`VcsError::Parse`] rather than lossy-excluding — the invariant
+    /// "reported quarantined ⟺ actually withheld" holds by construction.
+    ///
+    /// # Only regular files are candidates
+    ///
+    /// Each candidate is `symlink_metadata`-checked and only **regular files**
+    /// are scanned. A symlink is committed by git as its link-target *string*,
+    /// never the target's content, so it can never leak content into the
+    /// repository — reading through it would also be wrong (its target may lie
+    /// outside the watch) and, for a FIFO, a blocking `open` would never return
+    /// and wedge the worker. FIFOs, sockets, and devices are non-regular for the
+    /// same reason. Non-regular files are simply not scan candidates (neither the
+    /// filename nor the content layer applies), so they stage normally. Modified
+    /// tracked files are never in this set and so are never scanned.
+    ///
+    /// # TOCTOU
+    ///
+    /// A file created *between* this enumeration and the `git add -A` that
+    /// follows is not seen here and is committed unscanned. The engine's
+    /// per-watch operation serialization narrows this window but cannot close it;
+    /// the next pass re-derives quarantine and catches such a file.
     fn scan_untracked(&self, scanner: &SecretScanner) -> Result<Vec<SecretMatch>, VcsError> {
-        let out = self.run(&[], ["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let out = git_output(
+            &self.path,
+            &[],
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            false,
+        )?;
+        if !out.status.success() {
+            return Err(classify_failure("ls-files", &out));
+        }
         let mut matches = Vec::new();
-        for rel in out.split('\0').filter(|s| !s.is_empty()) {
-            let rel_path = Path::new(rel);
-            let abs = self.path.join(rel_path);
-            if let Some(m) = scanner.scan_file(rel_path, &abs) {
+        for raw in out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let rel_path = bytes_to_path(raw)?;
+            let abs = self.path.join(&rel_path);
+            // Only regular files are scan candidates (see the doc above): a
+            // symlink/FIFO/socket/device is never read or quarantined. A path
+            // that vanished between enumeration and this stat is likewise not a
+            // candidate.
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_file() => {}
+                _ => continue,
+            }
+            if let Some(m) = scanner.scan_file(&rel_path, &abs) {
                 matches.push(m);
             }
         }
@@ -1032,11 +1080,35 @@ fn literal_pathspec(path: &Path) -> OsString {
 /// subtracts `path` from a sweep and matches it verbatim (no glob) — the
 /// combined `exclude`+`literal` magic mirrors [`literal_pathspec`]'s use of
 /// `literal` alone. Used to withhold quarantined secrets from `git add`
-/// (VRD-22). Non-UTF-8 path bytes are preserved.
+/// (VRD-22). Non-UTF-8 path bytes are preserved (the path's `OsStr` is appended
+/// verbatim), so the pathspec byte-matches the enumerated path exactly.
 fn exclude_pathspec(path: &Path) -> OsString {
     let mut spec = OsString::from(":(exclude,literal)");
     spec.push(path.as_os_str());
     spec
+}
+
+/// Turns a raw NUL-delimited `ls-files -z` path field into a [`PathBuf`] with no
+/// lossy decoding (VRD-22). On unix the bytes become an `OsStr` verbatim, so a
+/// non-UTF-8 path round-trips exactly into the exclude pathspec. On a platform
+/// without `OsStrExt`, a non-UTF-8 path cannot be reconstructed byte-exact, so
+/// rather than risk staging a secret the exclude would miss, the pass fails.
+#[cfg(unix)]
+fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(OsStr::from_bytes(raw)))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(raw: &[u8]) -> Result<PathBuf, VcsError> {
+    match std::str::from_utf8(raw) {
+        Ok(s) => Ok(PathBuf::from(s)),
+        Err(_) => Err(VcsError::Parse(format!(
+            "untracked path is not valid UTF-8 and cannot be handled byte-exact on \
+             this platform, so it cannot be safely quarantined: {:?}",
+            String::from_utf8_lossy(raw)
+        ))),
+    }
 }
 
 /// Whether two paths refer to the same directory, resolving symlinks (macOS

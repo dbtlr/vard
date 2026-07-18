@@ -2326,6 +2326,14 @@ async fn run_locked_window(
         // tree can be moved by advance. A no-op on a clean tree. The commit
         // carries a `Vard-Host` trailer so multi-machine history stays legible,
         // and the scanner so a secret is never swept in right before a push.
+        // The report's `quarantined` is intentionally discarded here: the
+        // exclusion itself is what matters (a secret is never swept into the
+        // pushed commit), and the watch's ordinary snapshot pass is what reflects
+        // quarantine into state and emits `snapshot.quarantined`. The one edge is
+        // an interval-only watch whose secret is first seen by this pre-sync pass
+        // (before any ordinary pass runs): the file is still correctly withheld
+        // from the commit, but its Attention state surfaces only on the next
+        // ordinary pass, not from here.
         let presync_committed = match backend.snapshot(&pre_sync_request(scanner)) {
             Ok(report) => report.committed.is_some(),
             Err(err) => {
