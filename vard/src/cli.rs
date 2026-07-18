@@ -505,8 +505,9 @@ Run vard as a service in your login session.
 `vard run` is the foreground daemon; these commands wrap it in your login \
 session's service manager so it starts at login and respawns on failure — a \
 macOS LaunchAgent (`~/Library/LaunchAgents/com.dbtlr.vard.plist`) or a Linux \
-systemd user unit (`~/.config/systemd/user/vard.service`). The unit only execs \
-`vard run`, so all watching and snapshotting still happens there.
+systemd user unit (`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
+`~/.config/systemd/user/vard.service`). The unit only execs `vard run`, so all \
+watching and snapshotting still happens there.
 
 Running under your own login session — not as a system-wide daemon — is \
 deliberate: vard commits as you and needs your keychain, ssh-agent, and git \
@@ -518,10 +519,10 @@ credentials, which a root-owned system service would not carry.
   stop       unload the service, stopping the daemon
   restart    restart the service to pick up a new binary or config
 
-The service is text-only: these verbs print human status lines and ignore the \
-global `--format`. Only one daemon may own a state directory at a time, so \
-installing the service while a foreground `vard run` is active will contend for \
-the instance lock.")]
+The service is text-only: these verbs print human status lines and reject an \
+explicit `--format json`/`jsonl`. Only one daemon may own a state directory at a \
+time, so installing the service while a foreground `vard run` is active will \
+contend for the instance lock.")]
     Service {
         /// The chosen service subcommand. Absent (a bare `vard service`) prints
         /// this command's short help.
@@ -739,6 +740,7 @@ Install and start the vard service.
 Resolves the running `vard` binary's path, renders the platform unit — a launchd \
 plist on macOS, a systemd user unit on Linux — and writes it atomically \
 (`~/Library/LaunchAgents/com.dbtlr.vard.plist` or \
+`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
 `~/.config/systemd/user/vard.service`). It then loads and starts the service and \
 polls for up to five seconds for the daemon to actually come up; if the unit is \
 in place but the daemon never takes the instance lock, the command exits 1 and \
@@ -765,6 +767,7 @@ Uninstall the vard service.
 
 Stops and unloads the service, then removes its unit file \
 (`~/Library/LaunchAgents/com.dbtlr.vard.plist` or \
+`$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
 `~/.config/systemd/user/vard.service`). Nothing in your repositories or config is \
 touched — only the service registration is removed. Uninstalling when nothing is \
 installed is a success: the command says so and exits 0.")]

@@ -335,6 +335,7 @@ pub(crate) fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Ru
     });
 
     let start = Instant::now();
+    let mut wait_error = None;
     let (code, timed_out) = loop {
         match child.try_wait() {
             Ok(Some(status)) => break (status.code(), false),
@@ -346,17 +347,34 @@ pub(crate) fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Ru
                 }
                 std::thread::sleep(KILL_POLL);
             }
-            Err(_) => break (None, false),
+            Err(e) => {
+                // try_wait itself failed (e.g. a wait()-family syscall error).
+                // The child may still be alive: kill and reap it the same way
+                // the timeout branch does, so the pipe-reader threads below —
+                // which block until the child's stdout/stderr fds close — are
+                // not left waiting on a still-running process.
+                wait_error = Some(e.to_string());
+                kill_group(&mut child);
+                let _ = child.wait();
+                break (None, false);
+            }
         }
     };
 
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+    if let Some(err) = wait_error {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!("waiting on the process failed: {err}"));
+    }
     RunOutput {
         spawned: true,
         code,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stderr,
         timed_out,
     }
 }
@@ -607,6 +625,26 @@ mod tests {
     fn bare_name_with_no_path_var_is_none() {
         let got = resolve_from_argv0(OsStr::new("vard"), None, Path::new("/cwd"), |_| true);
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn run_bounded_captures_a_clean_exit() {
+        let out = run_bounded("sh", &["-c", "exit 0"], Duration::from_secs(5));
+        assert!(out.spawned);
+        assert!(out.success());
+        assert!(!out.timed_out);
+    }
+
+    #[test]
+    fn run_bounded_kills_and_reaps_on_timeout() {
+        // Regression coverage for the try_wait loop: a process that outlives
+        // its budget is killed, reaped, and the pipe readers still join —
+        // exactly the sequence the try_wait-Err branch now also follows.
+        let out = run_bounded("sh", &["-c", "sleep 5"], Duration::from_millis(50));
+        assert!(out.spawned);
+        assert!(out.timed_out);
+        assert!(!out.success());
+        assert!(out.detail().starts_with("timed out after"));
     }
 
     #[test]

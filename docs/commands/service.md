@@ -9,9 +9,9 @@ Run the vard daemon as a service in your login session. [`vard run`](run.md) is 
 
 ```bash
 vard service install     # write the unit, load and start it, verify the daemon came up
-vard service status      # (use `vard status` — the service verbs do not report state)
 vard service restart     # pick up an upgraded binary or a changed unit
 vard service uninstall   # stop, unload, and remove the unit
+vard status              # daemon/watch state — the service verbs don't report it
 ```
 
 `service` is a grouped command: a bare `vard service` prints this short help, and each subcommand has its own `--help`.
@@ -133,7 +133,7 @@ This release supports **systemd user services only** on Linux. If `systemctl` is
 
 ## Output
 
-Service verbs print human status lines to stdout and are **text-only** — they ignore the global `--format` and reject an explicit `--format json`/`jsonl` (the same class as [`logs`](logs.md)). To observe the running service's state as records or JSON, use [`status`](status.md).
+Service verbs print human status lines to stdout and are **text-only** — an explicit `--format json`/`jsonl` is rejected (the same class as [`logs`](logs.md)). To observe the running service's state as records or JSON, use [`status`](status.md).
 
 ## Exit codes
 
