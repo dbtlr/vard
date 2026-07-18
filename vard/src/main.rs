@@ -17,6 +17,7 @@ mod notify;
 mod output;
 mod paths;
 mod request;
+mod service;
 mod status;
 mod watch;
 
@@ -68,6 +69,12 @@ fn main() -> ExitCode {
             ExitCode::from(help::print_command_short(&["config"], cli.color) as u8)
         }
         Some(Command::Config { command: Some(sub) }) => config_cmd::run(sub, cli.color, cli.format),
+        // A bare `vard service` (no subcommand) prints service's short help, like
+        // a bare `vard config`.
+        Some(Command::Service { command: None }) => {
+            ExitCode::from(help::print_command_short(&["service"], cli.color) as u8)
+        }
+        Some(Command::Service { command: Some(sub) }) => service::run(sub, cli.color, cli.format),
         None => ExitCode::from(help::print_root_short(cli.color) as u8),
     }
 }

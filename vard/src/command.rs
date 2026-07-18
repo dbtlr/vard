@@ -19,6 +19,7 @@ use crate::output::record::{self, Record};
 /// A command failure carrying the message to print and the process exit code
 /// (2 for an error, 1 for "attention needed" such as an unsafe repository or a
 /// declined `git init`).
+#[derive(Debug)]
 pub(crate) struct CmdError {
     message: String,
     code: u8,
