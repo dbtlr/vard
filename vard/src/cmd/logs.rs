@@ -25,10 +25,16 @@ use super::{CmdError, CmdResult, OutCtx, emit_raw_paged};
 use crate::cli::{ColorWhen, LogsArgs, OutputFormat};
 use crate::paths;
 
-/// Filename prefix the daemon's rolling appender writes (kept in sync with
-/// `daemon::LOG_FILE_PREFIX`): each file is `vard.log.YYYY-MM-DD`. The trailing
-/// dot is included so the match never picks up an unrelated `vard.logsomething`.
-const LOG_FILE_PREFIX: &str = "vard.log.";
+/// Whether `name` is one of the daemon's rotated logfiles: the shared
+/// [`daemon::LOG_FILE_PREFIX`](crate::daemon::LOG_FILE_PREFIX) base followed by a
+/// `.` — the dotted form the DAILY appender writes (`vard.log.YYYY-MM-DD`).
+/// Deriving the dot here (rather than repeating a `"vard.log."` literal) keeps
+/// the writer and reader on one source of truth, and requiring the dot means the
+/// match never picks up an unrelated `vard.logsomething`.
+fn is_logfile_name(name: &str) -> bool {
+    name.strip_prefix(crate::daemon::LOG_FILE_PREFIX)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
 
 /// How often `--follow` polls the live logfile for appended bytes and rotation.
 const FOLLOW_POLL: Duration = Duration::from_millis(400);
@@ -92,11 +98,7 @@ fn list_logfiles(dir: &Path) -> io::Result<Vec<PathBuf>> {
         if !entry.file_type()?.is_file() {
             continue;
         }
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(LOG_FILE_PREFIX)
-        {
+        if is_logfile_name(&entry.file_name().to_string_lossy()) {
             files.push(entry.path());
         }
     }

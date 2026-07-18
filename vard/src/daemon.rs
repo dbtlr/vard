@@ -416,7 +416,12 @@ fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
 /// The daemon's rotated-logfile prefix. tracing-appender's DAILY rotation names
 /// each file `<prefix>.YYYY-MM-DD`, so the on-disk set is `vard.log.2026-07-18`,
 /// `vard.log.2026-07-17`, … — the exact names `vard logs` must glob and order.
-const LOG_FILE_PREFIX: &str = "vard.log";
+///
+/// This is the single source of truth for that prefix: `vard logs`
+/// ([`crate::cmd::logs`]) derives its dotted glob form (`vard.log.`) from this
+/// base rather than repeating the literal, so the writer and reader can never
+/// drift apart.
+pub(crate) const LOG_FILE_PREFIX: &str = "vard.log";
 
 /// How many rotated daily logfiles to keep. tracing-appender prunes the oldest
 /// files beyond this cap on each rotation, bounding the daemon's log footprint to
