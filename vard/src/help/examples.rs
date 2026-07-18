@@ -135,14 +135,14 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
                 "fetch, reconcile, and push just the notes watch".to_string(),
             ),
         ]
-    } else if cmd_path == format!("{BIN_NAME} log") {
+    } else if cmd_path == format!("{BIN_NAME} history") {
         vec![
             (
-                format!("{BIN_NAME} log notes"),
+                format!("{BIN_NAME} history notes"),
                 "show the full snapshot history of notes".to_string(),
             ),
             (
-                format!("{BIN_NAME} log notes --since 2h"),
+                format!("{BIN_NAME} history notes --since 2h"),
                 "show only snapshots from the last two hours".to_string(),
             ),
         ]
@@ -177,6 +177,21 @@ pub fn examples_for(cmd_path: &str) -> Vec<(String, String)> {
             (
                 format!("{BIN_NAME} status notes"),
                 "show just the notes watch".to_string(),
+            ),
+        ]
+    } else if cmd_path == format!("{BIN_NAME} logs") {
+        vec![
+            (
+                format!("{BIN_NAME} logs"),
+                "show the last 50 lines of the daemon's log".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} logs -n 200"),
+                "show the last 200 lines, spanning rotated files".to_string(),
+            ),
+            (
+                format!("{BIN_NAME} logs -f"),
+                "follow the daemon's log live".to_string(),
             ),
         ]
     } else if cmd_path == format!("{BIN_NAME} config") {

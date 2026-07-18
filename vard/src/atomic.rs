@@ -54,6 +54,18 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `name` matches the temporary-file scheme [`write()`](fn@write) uses:
+/// `.{final-name}.tmp-{pid}` — a leading dot, an embedded `.tmp-`, and an
+/// all-digit pid suffix. A crashed atomic write is the only thing that strands
+/// such a name, so a directory scanner (e.g. `vard doctor`) can single these out
+/// as its own safe-to-delete leftovers without touching files vard never wrote.
+pub(crate) fn is_temp_name(name: &str) -> bool {
+    name.starts_with('.')
+        && name.rsplit_once(".tmp-").is_some_and(|(prefix, pid)| {
+            !prefix.is_empty() && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
 /// Writes `bytes` to `path` and `fsync`s the file before returning, so its
 /// contents are on stable storage before the caller renames it into place.
 fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -87,5 +99,19 @@ mod tests {
         write(&path, b"first").unwrap();
         write(&path, b"second").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+    }
+
+    #[test]
+    fn recognizes_only_its_own_temp_scheme() {
+        // Exactly the names `write` produces: `.{final}.tmp-{pid}`.
+        assert!(is_temp_name(".req-99-1700000000.toml.tmp-4242"));
+        assert!(is_temp_name(".config.toml.tmp-1"));
+        // Not our scheme: no leading dot, no `.tmp-`, or a non-numeric pid.
+        assert!(!is_temp_name("req-1.toml"));
+        assert!(!is_temp_name(".req-1.toml"));
+        assert!(!is_temp_name("req.toml.tmp-1")); // missing the leading dot
+        assert!(!is_temp_name(".req.toml.tmp-")); // empty pid
+        assert!(!is_temp_name(".req.toml.tmp-abc")); // non-digit pid
+        assert!(!is_temp_name(".tmp-123")); // no final-name prefix
     }
 }

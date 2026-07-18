@@ -2115,6 +2115,68 @@ fn has_remote_reflects_the_configured_remote() {
     assert!(!other.has_remote().unwrap(), "different remote name absent");
 }
 
+#[test]
+fn probe_remote_succeeds_against_a_reachable_file_remote() {
+    let origin = bare_origin();
+    let (tmp, _backend) = new_repo();
+    git_ok(
+        tmp.path(),
+        &["remote", "add", "origin", origin.path().to_str().unwrap()],
+    );
+    let backend = GitBackend::open(tmp.path(), "main", "origin").unwrap();
+    // A reachable remote — even an empty bare one with no refs — probes Ok.
+    backend.probe_remote(TEST_TIMEOUT).unwrap();
+}
+
+#[test]
+fn probe_remote_fails_against_an_unreachable_remote() {
+    let (tmp, _backend) = new_repo();
+    // A file remote pointing at a path that does not exist: git errors promptly,
+    // classified as a CommandFailed carrying git's stderr for doctor to
+    // summarize — never a hang.
+    let missing = tmp.path().join("nope-does-not-exist");
+    git_ok(
+        tmp.path(),
+        &["remote", "add", "origin", missing.to_str().unwrap()],
+    );
+    let backend = GitBackend::open(tmp.path(), "main", "origin").unwrap();
+    match backend.probe_remote(TEST_TIMEOUT) {
+        Err(VcsError::CommandFailed { op, stderr, .. }) => {
+            assert_eq!(op, "ls-remote");
+            assert!(!stderr.is_empty(), "stderr should carry git's reason");
+        }
+        other => panic!("expected CommandFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn probe_remote_times_out_against_a_silent_endpoint() {
+    // A git:// remote that accepts but never replies makes ls-remote block
+    // reading the banner; the timeout must kill it and return Timeout promptly,
+    // proving the probe cannot hang a doctor run indefinitely.
+    let endpoint = SilentEndpoint::start();
+    let (tmp, _backend) = new_repo();
+    git_ok(tmp.path(), &["remote", "add", "origin", &endpoint.url()]);
+    let backend = GitBackend::open(tmp.path(), "main", "origin").unwrap();
+
+    let started = Instant::now();
+    match backend.probe_remote(Duration::from_millis(750)) {
+        Err(VcsError::Timeout { op, elapsed }) => {
+            assert_eq!(op, "ls-remote");
+            assert!(
+                elapsed >= Duration::from_millis(700),
+                "elapsed under the budget: {elapsed:?}"
+            );
+        }
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "kill was not prompt: {:?}",
+        started.elapsed()
+    );
+}
+
 // --- scratch-worktree pruning (crash recovery) -----------------------------
 
 #[test]

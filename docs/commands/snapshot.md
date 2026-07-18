@@ -100,6 +100,6 @@ vard snapshot notes --format json
 ## See also
 
 - [`run`](run.md) — the daemon that snapshots automatically.
-- [`log`](log.md) — review the snapshots this command created.
+- [`history`](history.md) — review the snapshots this command created.
 - [`diff`](diff.md) — see what a snapshot would capture before taking it.
 - Run `vard snapshot --help` for the full reference.

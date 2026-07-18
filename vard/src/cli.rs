@@ -233,7 +233,7 @@ and JSON or JSONL when piped.
 
 `--since` keeps only snapshots at or after a point in the past, given as a \
 humane duration counted back from now — `2h`, `3d`, `1h30m`.")]
-    Log(LogArgs),
+    History(HistoryArgs),
 
     /// Show a raw unified diff for a watch: working tree against a snapshot.
     #[command(disable_help_flag = true)]
@@ -359,6 +359,95 @@ null watch name and a `daemon: true` flag, each configured watch its own object)
 when piped.")]
     Status(StatusArgs),
 
+    /// Show the vard daemon's own log: the rolling logfile it writes while
+    /// running. `-f` follows it live; `-n` sets how many lines to show.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Show the vard daemon's own log output.
+
+While the daemon runs (`vard run`) it writes its log to a daily-rolling file set \
+under the state directory (`<state_dir>/logs/vard.log.YYYY-MM-DD`), in addition \
+to the stderr it always logged to. `vard logs` reads that file set — there is no \
+watch argument, because one daemon writes one log covering every watch it \
+supervises.
+
+`-n <N>` shows the last N lines (default 50) and spans rotation boundaries: if \
+the newest day's file holds fewer than N lines, the previous day's file is read \
+to make up the difference. `-f` follows the live log, printing new lines as the \
+daemon writes them and switching to the next day's file when the log rotates; it \
+runs until interrupted.
+
+The output is the daemon's raw log text and nothing else: on a terminal it is \
+paged (unless following, which streams straight through), and piped it passes \
+through untouched so it feeds `grep`, `less`, or a file. Because a logfile is \
+inherently a text artifact, `logs` is text-only: an explicit `--format json` or \
+`--format jsonl` is rejected.
+
+If no logfile exists yet — the daemon has not run since file logging landed, or \
+has never run — `vard logs` reports that and exits 1 rather than printing \
+nothing.")]
+    Logs(LogsArgs),
+
+    /// Diagnose the local vard environment read-only: git, inotify limits,
+    /// health-file freshness, request-queue hygiene, and a per-watch secret audit.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Diagnose the local vard environment, read-only.
+
+`doctor` runs a set of local checks and prints one row per check — it NEVER \
+mutates anything (it reads /proc, the config, the health file, the request \
+queue, and each watch's repository, and reports; it does not clean, restore, or \
+write). Each row is `ok`, `warn`, `fail`, or `skipped`.
+
+The checks in this release (all local except `remote-auth`, the one network \
+probe, which `--offline` skips):
+
+  git           the git executable is on PATH and new enough — vard's snapshot
+                log format needs git 2.22+; older git `warn`s, a missing git
+                `fail`s
+  inotify       (Linux only) the kernel's inotify limits
+                (`max_user_watches`/`max_user_instances`) against how many
+                directories the configured watches would register; `warn`s as
+                the total approaches a limit. On macOS this is `skipped` — vard
+                uses FSEvents, which has no such limit
+  health-file   whether the daemon's health file is fresh; a running daemon
+                whose file has gone stale `warn`s. A daemon that is not running
+                is a legitimate state, reported `ok` with a note
+  request-dir   stale files in the request queue; `warn`s with the file names,
+                distinguishing crashed-writer temp files (safe to delete),
+                settled requests piling up unconsumed (usually: no daemon
+                running), and unrecognized files vard did not write
+                (investigate before deleting). Doctor flags, it never deletes
+  secret-audit  per configured watch, whether any already-tracked file has a
+                secret-shaped NAME (`.env`, `id_rsa`, `*.pem`, plus the watch's
+                extra patterns). The complement to snapshot quarantine, which
+                only keeps NEW secrets out — a name already committed is `fail`ed
+                here with example paths. Filename-only by contract (tracked file
+                contents are never scanned). A watch with `secret_scan = false`
+                is `skipped`; a repository that cannot be opened `warn`s without
+                blocking the other watches' rows
+  remote-auth   per sync-enabled watch, whether the configured remote is
+                reachable and authenticated — a read-only `git ls-remote`, with
+                `GIT_TERMINAL_PROMPT=0` and a timeout so a dead VPN or a
+                prompt-wanting remote cannot hang doctor. Reachable is `ok`;
+                unreachable or an auth failure is `fail` with git's reason. A
+                watch that does not sync, or has no remote defined, is `skipped`;
+                a repository that cannot be opened `warn`s. This is the one
+                network check — `--offline` skips it, rendering `skipped`
+
+`--offline` skips every network check (today: remote-auth), so doctor runs the \
+local checks only.
+
+Exit codes: 0 when every check is `ok` or `skipped`; 1 when any check `warn`s \
+or `fail`s (attention); 2 when doctor itself could not run (an unresolvable \
+state directory, an invalid config). Output follows the global `--format`: \
+human glyph lines by default, or a stable JSON/JSONL array when piped (a \
+per-watch row carries its own `watch` field).
+
+Agent/keychain and service-linger checks are deferred to the service-install \
+command (VRD-24).")]
+    Doctor(DoctorArgs),
+
     /// Read and edit vard's configuration: get, set, unset, edit, path.
     #[command(disable_help_flag = true)]
     #[command(disable_help_subcommand = true)]
@@ -413,9 +502,9 @@ pub struct SyncArgs {
     pub target: Option<String>,
 }
 
-/// Arguments to `vard log`.
+/// Arguments to `vard history`.
 #[derive(Debug, Args)]
-pub struct LogArgs {
+pub struct HistoryArgs {
     /// The watch whose history to show, by name or by path.
     #[arg(value_name = "NAME|PATH")]
     pub target: String,
@@ -472,6 +561,29 @@ pub struct StatusArgs {
     /// The watch to report, by name or by path. Omit to report every watch.
     #[arg(value_name = "NAME|PATH")]
     pub target: Option<String>,
+}
+
+/// Arguments to `vard logs`.
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Follow the live log, printing new lines as the daemon writes them and
+    /// surviving log rotation. Runs until interrupted.
+    #[arg(short = 'f', long = "follow")]
+    pub follow: bool,
+
+    /// Show the last N lines, spanning rotated logfiles as needed.
+    #[arg(short = 'n', long = "lines", value_name = "N", default_value = "50")]
+    pub lines: usize,
+}
+
+/// Arguments to `vard doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Skip network checks (today: the remote-auth probe), running the local
+    /// checks only. The skipped checks are reported `skipped` with an
+    /// "offline mode" note.
+    #[arg(long = "offline")]
+    pub offline: bool,
 }
 
 /// The `vard config` subcommands.

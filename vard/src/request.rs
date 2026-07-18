@@ -98,6 +98,22 @@ impl Request {
     }
 }
 
+/// Whether `name` is a *settled* request file the daemon may consume: a plain
+/// `*.toml` name that is not hidden (no leading dot). Writers create requests by
+/// writing to a temp or dot name in the same directory and `rename(2)`-ing to the
+/// final `*.toml` name (atomic on POSIX; see the [module docs](self)), so a name
+/// matching this predicate is always a complete file. Temp suffixes (`.tmp`,
+/// `.partial`, anything else) fail the `*.toml` requirement.
+///
+/// This is the naming policy shared by the two readers of the request dir: the
+/// daemon's drain (which consumes settled files and leaves unsettled ones "not
+/// ours to touch") and `vard doctor` (which conversely flags *unsettled*
+/// leftovers a crashed writer stranded). Keeping the predicate here — one source
+/// of truth — stops the two from disagreeing on what a settled name is.
+pub(crate) fn is_settled_request_name(name: &str) -> bool {
+    name.ends_with(".toml") && !name.starts_with('.')
+}
+
 /// Parses a request file's TOML text, returning a human-readable error string on
 /// any malformation (missing/unknown `kind`, a missing `requested_at`, unknown
 /// fields, or invalid TOML) so a poison file can be logged and dropped.
@@ -133,6 +149,21 @@ fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_toml_names_are_settled() {
+        assert!(is_settled_request_name("req.toml"));
+        assert!(is_settled_request_name("snapshot-1234.toml"));
+        // Hidden files are a writer's staging name, never consumed.
+        assert!(!is_settled_request_name(".req.toml"));
+        assert!(!is_settled_request_name(".hidden"));
+        // Temp suffixes and non-toml names are not settled.
+        assert!(!is_settled_request_name("req.toml.tmp"));
+        assert!(!is_settled_request_name("req.toml.partial"));
+        assert!(!is_settled_request_name("req.tmp"));
+        assert!(!is_settled_request_name("notes.txt"));
+        assert!(!is_settled_request_name("toml"));
+    }
 
     #[test]
     fn round_trips_through_toml() {

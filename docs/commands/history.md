@@ -1,25 +1,25 @@
 ---
-title: log
+title: history
 description: Show a watch's snapshot history, most recent first.
 ---
 
-# vard log
+# vard history
 
-Show a watch's snapshot history, most recent first. Read-only: it reads the watch's version-control log directly and never takes a lock or mutates anything, so it is safe to run against a watch the [daemon](run.md) is actively snapshotting. Where [`diff`](diff.md) shows *what* changed between two points, `log` shows *when* each snapshot happened and why.
+Show a watch's snapshot history, most recent first. Read-only: it reads the watch's version-control log directly and never takes a lock or mutates anything, so it is safe to run against a watch the [daemon](run.md) is actively snapshotting. Where [`diff`](diff.md) shows *what* changed between two points, `history` shows *when* each snapshot happened and why.
 
 ## Examples
 
 ```bash
-vard log notes
+vard history notes
 # every snapshot of "notes", newest first
 
-vard log notes --since 2h
+vard history notes --since 2h
 # only snapshots from the last two hours
 
-vard log notes --since 3d
+vard history notes --since 3d
 # only snapshots from the last three days
 
-vard log notes --format jsonl
+vard history notes --format jsonl
 # one JSON object per snapshot, for a pipeline
 ```
 
@@ -49,7 +49,7 @@ A list surface (records/json/jsonl). Each snapshot reports its id, time, subject
 ```
 
 ```bash
-vard log notes --format json
+vard history notes --format json
 ```
 
 ```json
@@ -63,4 +63,4 @@ An `id` from this log is exactly what [`diff`](diff.md) and [`restore --ref`](re
 - [`diff`](diff.md) — the actual changes between a snapshot and the working tree.
 - [`restore`](restore.md) — roll a watch back to one of these snapshots.
 - [`snapshot`](snapshot.md) — add to this history on demand.
-- Run `vard log --help` for the full reference.
+- Run `vard history --help` for the full reference.

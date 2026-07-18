@@ -973,6 +973,29 @@ impl VcsBackend for GitBackend {
         Err(classify_failure("config", &out))
     }
 
+    fn probe_remote(&self, timeout: Duration) -> Result<(), VcsError> {
+        // Read-only reachability + auth probe. `git ls-remote <remote>` resolves
+        // the remote's URL from config (honoring insteadOf and credential
+        // helpers — the real dial path) and lists its refs, writing nothing to
+        // either repository. A reachable but empty remote exits 0 with no refs,
+        // so no `--exit-code`: the question is reachability, not ref presence.
+        // `GIT_TERMINAL_PROMPT=0` (set by the network command builder) makes a
+        // credential-wanting remote fail fast instead of blocking on a prompt,
+        // and the timeout bounds a hung endpoint exactly as fetch/push do.
+        let out = git_output_timed(
+            &self.path,
+            &[],
+            ["ls-remote", "--quiet", self.remote.as_str()],
+            "ls-remote",
+            timeout,
+        )?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(classify_failure("ls-remote", &out))
+        }
+    }
+
     fn prune_scratch(&self, scratch: &Path) -> Result<(), VcsError> {
         // Force-remove the scratch worktree if it is still registered (this
         // erases any mid-rebase state living under .git/worktrees/<name>)...

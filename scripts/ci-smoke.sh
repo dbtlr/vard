@@ -80,6 +80,17 @@ grep -q 'add' "$TARGET_DIR"/man/vard-watch.1 || fail "vard-watch.1 does not name
 "$VARD" config -h | grep -q 'For full help, run' || fail "vard config -h missing the v2 short-help footer"
 "$VARD" config set --help | grep -q 'inferred' || fail "vard config set --help missing its prose"
 
+# vard logs (VRD-23): the daemon logfile reader. Help renders through the same
+# v2 path. No daemon has run in this throwaway state dir, so there is no logfile
+# yet: `vard logs` must report that cleanly and exit 1 (not 0, not a crash).
+"$VARD" logs -h | grep -q 'For full help, run' || fail "vard logs -h missing the v2 short-help footer"
+"$VARD" logs --help | grep -q 'daily-rolling' || fail "vard logs --help missing its prose"
+
+# vard doctor (VRD-23): the read-only environment diagnosis. Help renders through
+# the same v2 path; the functional run is asserted below once a watch exists.
+"$VARD" doctor -h | grep -q 'For full help, run' || fail "vard doctor -h missing the v2 short-help footer"
+"$VARD" doctor --help | grep -q 'read-only' || fail "vard doctor --help missing its prose"
+
 # Watch command round-trip: add -> list -> pause -> resume -> remove, against a
 # throwaway HOME/XDG/git config so nothing touches the developer's real state.
 # Requires git on PATH (the release-artifact job has it).
@@ -150,6 +161,23 @@ printf '%s\n' "$status_out" | grep -q 'daemon: not running' \
 printf '%s\n' "$status_out" | grep -q 'smoke: unknown' \
   || fail "vard status did not project the unmonitored smoke watch as unknown"
 
+# vard doctor (VRD-23), functional: read-only, so it must change nothing. With
+# git present and no daemon, every check is ok/skipped and it exits 0. Its JSON
+# form is a single array carrying the git check row.
+doctor_json="$("$VARD" --format json doctor)" || fail "vard doctor must exit 0 when all checks pass"
+printf '%s\n' "$doctor_json" | grep -q '"check":"git"' \
+  || fail "vard doctor --format json did not emit the git check row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"health-file"' \
+  || fail "vard doctor --format json did not emit the health-file check row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"secret-audit"' \
+  || fail "vard doctor --format json did not emit the per-watch secret-audit row"
+printf '%s\n' "$doctor_json" | grep -q '"check":"remote-auth"' \
+  || fail "vard doctor --format json did not emit the remote-auth check row"
+# --offline skips the network check and still exits 0 on this all-clear env.
+"$VARD" doctor --offline >/dev/null || fail "vard doctor --offline must exit 0 when all checks pass"
+"$VARD" doctor --help | grep -q -- '--offline' \
+  || fail "vard doctor --help missing the --offline flag"
+
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit
 # the bare value — the TEXT form — not the JSON envelope, so `$(vard config
@@ -174,6 +202,22 @@ if "$VARD" config get defaults.interval >/dev/null; then
   fail "vard config get of an unset key must exit non-zero"
 fi
 
+# vard logs (VRD-23), no daemon: nothing has written a logfile in this throwaway
+# state dir, so logs reports the missing log and exits 1 (attention), never 0.
+if logs_out="$("$VARD" logs 2>&1)"; then
+  fail "vard logs with no logfile must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard logs with no logfile must exit 1"
+fi
+printf '%s\n' "$logs_out" | grep -q 'no daemon logfile yet' \
+  || fail "vard logs did not report the missing logfile"
+# logs is text-only like diff: an explicit --format json must be rejected (exit 2).
+if "$VARD" --format json logs >/dev/null 2>&1; then
+  fail "vard --format json logs must be rejected as text-only"
+else
+  test "$?" -eq 2 || fail "vard --format json logs must exit 2 (text-only rejection)"
+fi
+
 # Snapshot/log round-trip (VRD-16), no daemon: an in-process snapshot must land
 # a real commit, leave the operation journal compacted (no dangling begin), and
 # be visible in the log. A second snapshot with no changes must be a clean no-op.
@@ -190,7 +234,7 @@ test "${#journals[@]}" -gt 0 || fail "no operation journal was written for the i
 for j in "${journals[@]}"; do
   test ! -s "$j" || fail "operation journal $j holds a dangling begin after a clean snapshot"
 done
-"$VARD" --format json log smoke | grep -q '"trigger":"manual"' || fail "vard log did not show the manual snapshot"
+"$VARD" --format json history smoke | grep -q '"trigger":"manual"' || fail "vard history did not show the manual snapshot"
 "$VARD" --format json snapshot smoke | grep -q '"status":"no changes"' || fail "second snapshot was not a clean no-op"
 # diff is text-only: an explicit --format json must be rejected (exit 2).
 if "$VARD" --format json diff smoke >/dev/null 2>&1; then

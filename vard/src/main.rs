@@ -6,6 +6,7 @@ mod config;
 mod config_cmd;
 mod config_edit;
 mod daemon;
+mod doctor;
 mod flock;
 mod health;
 mod help;
@@ -54,11 +55,13 @@ fn main() -> ExitCode {
         }) => watch::run(watch_cmd, cli.color, cli.format),
         Some(Command::Snapshot(args)) => cmd::snapshot::run(args, cli.color, cli.format),
         Some(Command::Sync(args)) => cmd::sync::run(args, cli.color, cli.format),
-        Some(Command::Log(args)) => cmd::log::run(args, cli.color, cli.format),
+        Some(Command::History(args)) => cmd::history::run(args, cli.color, cli.format),
         Some(Command::Diff(args)) => cmd::diff::run(args, cli.color, cli.format),
         Some(Command::Restore(args)) => cmd::restore::run(args, cli.color, cli.format),
         Some(Command::Notify) => notify::run(cli.color, cli.format),
         Some(Command::Status(args)) => status::run(args, cli.color, cli.format),
+        Some(Command::Logs(args)) => cmd::logs::run(args, cli.color, cli.format),
+        Some(Command::Doctor(args)) => doctor::run(cli.color, cli.format, args.offline),
         // A bare `vard config` (no subcommand) prints config's short help, like
         // a bare `vard watch`.
         Some(Command::Config { command: None }) => {

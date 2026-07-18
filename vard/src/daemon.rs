@@ -81,6 +81,9 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Notify;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use vard_core::{
     Engine, EngineError, EngineHandle, Event, EventReceiver, RecvError, TroubleKind, WatchSpec,
@@ -319,7 +322,15 @@ pub(crate) fn run() -> ExitCode {
         Err(code) => return code,
     };
 
-    init_tracing(config.daemon.log_level);
+    // Resolve the logs dir directly from XDG rather than threading it through
+    // `DaemonPaths`: only `run` (never the tested `run_daemon` core) sets up
+    // logging, so this keeps the file sink out of the injected-paths struct. The
+    // guard is bound for the whole of `run`, and `run` blocks on the runtime, so
+    // the non-blocking writer stays alive until the daemon exits. If the logs dir
+    // cannot be resolved (no usable state dir), file logging is skipped and the
+    // daemon still logs to stderr.
+    let log_dir = paths::log_dir().ok();
+    let _log_guard = init_tracing(config.daemon.log_level, log_dir.as_deref());
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -402,16 +413,83 @@ fn load_startup_config(paths: &DaemonPaths) -> Result<Config, ExitCode> {
     }
 }
 
-/// Initializes stderr logging at the config's level. Best-effort: a second call
-/// in one process (e.g. across tests) is a no-op rather than a panic. The level
+/// The daemon's rotated-logfile prefix. tracing-appender's DAILY rotation names
+/// each file `<prefix>.YYYY-MM-DD`, so the on-disk set is `vard.log.2026-07-18`,
+/// `vard.log.2026-07-17`, … — the exact names `vard logs` must glob and order.
+///
+/// This is the single source of truth for that prefix: `vard logs`
+/// ([`crate::cmd::logs`]) derives its dotted glob form (`vard.log.`) from this
+/// base rather than repeating the literal, so the writer and reader can never
+/// drift apart.
+pub(crate) const LOG_FILE_PREFIX: &str = "vard.log";
+
+/// How many rotated daily logfiles to keep. tracing-appender prunes the oldest
+/// files beyond this cap on each rotation, bounding the daemon's log footprint to
+/// roughly a week of history so an always-on daemon never fills the state dir.
+const MAX_LOG_FILES: usize = 7;
+
+/// Initializes the daemon's logging at the config's level, to stderr and — when
+/// `log_dir` is `Some` — a daily-rolling logfile under it (`<state_dir>/logs`).
+/// Returns the non-blocking writer's [`WorkerGuard`], which the caller MUST hold
+/// for the daemon's lifetime — dropping it flushes and stops the background
+/// writer, so a premature drop loses buffered log lines.
+///
+/// Best-effort on two axes: a second call in one process (e.g. across tests) is a
+/// no-op rather than a panic; and if the logs dir is absent or the file appender
+/// cannot be set up, file logging is skipped (a note goes to stderr) and the
+/// daemon still logs to stderr — so a read-only or full state dir never blocks
+/// startup. In that degraded case the returned guard is `None`.
+///
+/// The stderr layer is unchanged from the pre-VRD-23 behavior, so `vard run` in a
+/// terminal looks exactly as before; only the daemon writes logfiles. The level
 /// is fixed for the process lifetime — a `log_level` change in the config takes
 /// effect on the next restart, not on reload, since the daemon does not arm a
 /// reloadable filter layer.
-fn init_tracing(level: LogLevel) {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(log_level_to_tracing(level))
-        .with_writer(std::io::stderr)
+fn init_tracing(level: LogLevel, log_dir: Option<&Path>) -> Option<WorkerGuard> {
+    let filter = tracing_subscriber::filter::LevelFilter::from_level(log_level_to_tracing(level));
+
+    // Stderr layer: identical to the pre-file-sink behavior (ANSI on by default).
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    // File layer: timestamp + level + target, ANSI disabled so the logfile stays
+    // plain text. Absent on setup failure, in which case only stderr is wired.
+    let (file_layer, guard) = match log_dir.map(build_file_writer) {
+        Some(Ok((writer, guard))) => {
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer);
+            (Some(layer), Some(guard))
+        }
+        Some(Err(err)) => {
+            eprintln!("vard: file logging disabled ({err}); logging to stderr only");
+            (None, None)
+        }
+        None => (None, None),
+    };
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr_layer)
+        .with(file_layer)
         .try_init();
+
+    guard
+}
+
+/// Builds the daemon's non-blocking, daily-rolling file writer under `log_dir`,
+/// creating the directory if needed. The rolling appender names files
+/// `<LOG_FILE_PREFIX>.YYYY-MM-DD` and keeps at most [`MAX_LOG_FILES`] of them.
+fn build_file_writer(
+    log_dir: &Path,
+) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard), Box<dyn std::error::Error>>
+{
+    std::fs::create_dir_all(log_dir)?;
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(LOG_FILE_PREFIX)
+        .max_log_files(MAX_LOG_FILES)
+        .build(log_dir)?;
+    Ok(tracing_appender::non_blocking(appender))
 }
 
 /// Maps the config's [`LogLevel`] to a [`tracing::Level`].
@@ -1648,16 +1726,6 @@ fn request_is_stale(request: &Request, now: SystemTime) -> bool {
     request.age(now) > request::STALE_AFTER
 }
 
-/// Whether `name` is a *settled* request file the daemon may consume: a plain
-/// `*.toml` name that is not hidden (no leading dot). Writers create requests
-/// by writing to a temp or dot name in the same directory and `rename(2)`-ing
-/// to the final `*.toml` name (atomic on POSIX; see the [module docs](self)),
-/// so a name matching this predicate is always a complete file. Temp suffixes
-/// (`.tmp`, `.partial`, anything else) fail the `*.toml` requirement.
-fn is_settled_request_name(name: &str) -> bool {
-    name.ends_with(".toml") && !name.starts_with('.')
-}
-
 /// Scans `dir` and consumes every *settled* request file: each is parsed,
 /// handed to `on_request` when valid, and then deleted — a consumed request or
 /// a settled poison file alike (poison is logged and removed so it cannot
@@ -1681,7 +1749,7 @@ fn drain_request_dir(dir: &Path, mut on_request: impl FnMut(Request)) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !is_settled_request_name(name) {
+        if !request::is_settled_request_name(name) {
             // A writer mid-flight (temp/dot name) or an unrelated file: not
             // ours to touch.
             continue;
@@ -1946,21 +2014,6 @@ mod tests {
     }
 
     // --- request-file consumption --------------------------------------------
-
-    #[test]
-    fn only_plain_toml_names_are_settled() {
-        assert!(is_settled_request_name("req.toml"));
-        assert!(is_settled_request_name("snapshot-1234.toml"));
-        // Hidden files are a writer's staging name, never consumed.
-        assert!(!is_settled_request_name(".req.toml"));
-        assert!(!is_settled_request_name(".hidden"));
-        // Temp suffixes and non-toml names are not settled.
-        assert!(!is_settled_request_name("req.toml.tmp"));
-        assert!(!is_settled_request_name("req.toml.partial"));
-        assert!(!is_settled_request_name("req.tmp"));
-        assert!(!is_settled_request_name("notes.txt"));
-        assert!(!is_settled_request_name("toml"));
-    }
 
     #[test]
     fn drain_ignores_unsettled_files_and_consumes_settled_ones() {
@@ -2376,7 +2429,11 @@ mod tests {
                 .map(|entries| {
                     entries
                         .flatten()
-                        .filter(|e| e.file_name().to_str().is_some_and(is_settled_request_name))
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(request::is_settled_request_name)
+                        })
                         .count()
                 })
                 .unwrap_or(0)

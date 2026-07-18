@@ -213,7 +213,7 @@ fn snapshot_refuses_unsafe_repo_with_attention_exit() {
 }
 
 #[test]
-fn log_records_and_since_filter() {
+fn history_records_and_since_filter() {
     let env = Env::new();
     let repo = add_watch(&env, "notes");
     std::fs::write(repo.join("a.txt"), "hello\n").unwrap();
@@ -221,8 +221,8 @@ fn log_records_and_since_filter() {
 
     // Records form (explicit, since a spawned process pipes stdout and would
     // otherwise auto-resolve to JSON): a leading count line then a block.
-    let recs = env.vard(&["--format", "records", "log", "notes"]);
-    assert!(recs.status.success(), "log failed: {}", stderr(&recs));
+    let recs = env.vard(&["--format", "records", "history", "notes"]);
+    assert!(recs.status.success(), "history failed: {}", stderr(&recs));
     assert!(
         stdout(&recs).contains("1 snapshots"),
         "records count line: {}",
@@ -234,7 +234,7 @@ fn log_records_and_since_filter() {
         stdout(&recs)
     );
 
-    let json = env.vard(&["--format", "json", "log", "notes"]);
+    let json = env.vard(&["--format", "json", "history", "notes"]);
     assert!(
         stdout(&json).contains("\"trigger\":\"manual\""),
         "got: {}",
@@ -244,10 +244,10 @@ fn log_records_and_since_filter() {
     // A generous --since window includes the fresh snapshot (the boundary
     // semantics themselves are unit-tested in vard-core; here we only prove the
     // filter is parsed and applied).
-    let since = env.vard(&["--format", "json", "log", "notes", "--since", "100d"]);
+    let since = env.vard(&["--format", "json", "history", "notes", "--since", "100d"]);
     assert!(
         since.status.success(),
-        "log --since failed: {}",
+        "history --since failed: {}",
         stderr(&since)
     );
     assert!(
@@ -316,7 +316,7 @@ fn restore_takes_protective_snapshot_then_restores_file() {
     );
 
     // The uncommitted work is recoverable: a pre-restore snapshot is in the log.
-    let log = stdout(&env.vard(&["--format", "json", "log", "notes"]));
+    let log = stdout(&env.vard(&["--format", "json", "history", "notes"]));
     assert!(
         log.contains("\"trigger\":\"pre-restore\""),
         "pre-restore snapshot missing: {log}"
@@ -486,7 +486,7 @@ fn commands_on_unknown_watch_fail_cleanly() {
     let env = Env::new();
     add_watch(&env, "notes");
     for args in [
-        vec!["log", "ghost"],
+        vec!["history", "ghost"],
         vec!["diff", "ghost"],
         vec!["restore", "ghost", "--ref", "HEAD"],
     ] {

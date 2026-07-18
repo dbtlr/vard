@@ -26,7 +26,7 @@ The config file lives at `$XDG_CONFIG_HOME/vard/config.toml` (`~/.config/vard/co
 
 vard has two output classes. Which one a command belongs to determines how `--format` behaves.
 
-**List surfaces — records / json / jsonl, auto-detected by destination.** Commands that emit a list of records (`watch list`, `status`, `log`, `snapshot`, the `watch add`/`remove`/`pause`/`resume` and `config set`/`unset` result rows) resolve `--format` against the output destination when it is not given explicitly: human-readable `records` on a terminal, machine-readable `json` when piped. `jsonl` (one JSON object per line) is opt-in. An explicit `--format` always wins. `diff` is the one exception in this class: a unified diff is inherently text, so `diff` is text-only and rejects `--format json`/`jsonl`. [`notify`](commands/notify.md) is not in this class either: built for shell hooks, it prints its human line form regardless of destination and emits JSON only on an explicit `--format json`/`jsonl`.
+**List surfaces — records / json / jsonl, auto-detected by destination.** Commands that emit a list of records (`watch list`, `status`, `history`, `snapshot`, the `watch add`/`remove`/`pause`/`resume` and `config set`/`unset` result rows) resolve `--format` against the output destination when it is not given explicitly: human-readable `records` on a terminal, machine-readable `json` when piped. `jsonl` (one JSON object per line) is opt-in. An explicit `--format` always wins. `diff` and `logs` are the exceptions in this class: a unified diff and a raw log stream are inherently text, so both are text-only and reject `--format json`/`jsonl`. [`notify`](commands/notify.md) is not in this class either: built for shell hooks, it prints its human line form regardless of destination and emits JSON only on an explicit `--format json`/`jsonl`.
 
 **Single-value surfaces — the TEXT class.** [`config get`](commands/config.md) and [`config path`](commands/config.md) emit a lone scalar. For these, absent an explicit `--format`, the bare value is printed regardless of destination — on a terminal and when piped alike — so `$(vard config get defaults.interval)` and `$(vard config path)` yield the value alone. The bare line is itself the machine format for this class (a parallel TEXT response type, simpler to consume in automation than JSON), not a human courtesy. Pass `--format json` for the enveloped object (`{key, value}` for `config get`, `{path}` for `config path`).
 
@@ -47,6 +47,7 @@ vard commands share a three-value exit convention:
 | Command | Summary |
 |---|---|
 | [`run`](commands/run.md) | Run the vard daemon in the foreground: watch every active configured directory and snapshot changes until stopped. |
+| [`logs`](commands/logs.md) | Show the vard daemon's own log — the rolling logfile it writes while running. |
 
 ## Watch and snapshot
 
@@ -60,7 +61,7 @@ vard commands share a three-value exit convention:
 
 | Command | Summary |
 |---|---|
-| [`log`](commands/log.md) | Show a watch's snapshot history, most recent first. |
+| [`history`](commands/history.md) | Show a watch's snapshot history, most recent first. |
 | [`diff`](commands/diff.md) | Show a raw unified diff for a watch: working tree against a snapshot. |
 | [`restore`](commands/restore.md) | Restore a watch's tree (or one file) to a prior snapshot, protecting current state first. |
 
@@ -70,6 +71,7 @@ vard commands share a three-value exit convention:
 |---|---|
 | [`status`](commands/status.md) | Show the daemon's liveness and every watch's current state, read-only. |
 | [`notify`](commands/notify.md) | Print one line per watch that needs attention, for a shell prompt or status bar. |
+| [`doctor`](commands/doctor.md) | Diagnose the vard environment read-only: git, inotify limits, health-file freshness, request-queue hygiene, a per-watch secret audit, and a per-watch remote-auth probe (`--offline` skips the network check). |
 
 ## Configuration
 

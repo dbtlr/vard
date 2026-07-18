@@ -90,6 +90,11 @@ impl Env {
         self.state_home.join("vard").join("journal")
     }
 
+    /// `$XDG_STATE_HOME/vard/logs` — the daemon's rolling-logfile directory.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_home.join("vard").join("logs")
+    }
+
     /// Writes `contents` as the config file, creating the config dir.
     pub fn write_config(&self, contents: &str) {
         std::fs::create_dir_all(self.config_dir()).unwrap();

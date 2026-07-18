@@ -32,6 +32,7 @@ terminal_size = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 [dev-dependencies]
 # Tempdir-isolated tests for the instance lock, operation journal, and the

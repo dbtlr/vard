@@ -5,7 +5,7 @@ description: Restore a watch's tree (or one file) to a prior snapshot, protectin
 
 # vard restore
 
-Restore a watch's working tree, or a single file within it, to a prior state. Where [`diff`](diff.md) shows what a prior state differs from and [`log`](log.md) lists the points you can go back to, `restore` actually applies one — and it can never destroy uncommitted work, because **before touching the tree it always takes a protective snapshot of the current state first.** The state you are about to overwrite is committed to history and recoverable from the [log](log.md).
+Restore a watch's working tree, or a single file within it, to a prior state. Where [`diff`](diff.md) shows what a prior state differs from and [`history`](history.md) lists the points you can go back to, `restore` actually applies one — and it can never destroy uncommitted work, because **before touching the tree it always takes a protective snapshot of the current state first.** The state you are about to overwrite is committed to history and recoverable from the [history](history.md).
 
 ## Examples
 
@@ -83,7 +83,7 @@ One more deferral protects a prior crash's recovery evidence: if an earlier oper
 
 ## See also
 
-- [`log`](log.md) — find the snapshot id or time to restore to.
+- [`history`](history.md) — find the snapshot id or time to restore to.
 - [`diff`](diff.md) — the same view `--dry-run` prints, for any two points.
 - [`snapshot`](snapshot.md) — the protective snapshot restore takes is an ordinary snapshot.
 - Run `vard restore --help` for the full reference.
