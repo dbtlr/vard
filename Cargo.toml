@@ -51,8 +51,12 @@ terminal_size = "0.4"
 # API; `tracing-subscriber` renders to stderr via its `fmt` layer. The level is
 # set programmatically from `[daemon].log_level`, so the `env-filter` feature is
 # deliberately omitted — default features (fmt) are all the daemon needs.
+# `tracing-appender` adds the daemon's daily-rolling logfile sink (VRD-23),
+# capped by `max_log_files` retention and fed through a non-blocking writer whose
+# `WorkerGuard` lives for the daemon's lifetime.
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 
 [profile.dist]
 inherits = "release"

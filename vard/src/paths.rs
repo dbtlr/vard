@@ -42,9 +42,9 @@ pub fn data_dir() -> Result<PathBuf, HomeNotFound> {
     xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
-/// `<state_dir>/logs` — vard's own rotated logfile.
-// Consumed when file-based log rotation lands (VRD-23); resolved and tested here now.
-#[allow(dead_code)]
+/// `<state_dir>/logs` — the directory holding the daemon's daily-rolling
+/// logfiles (`vard.log.YYYY-MM-DD`), written by `vard run` and read by `vard
+/// logs`.
 pub fn log_dir() -> Result<PathBuf, HomeNotFound> {
     Ok(state_dir()?.join("logs"))
 }
