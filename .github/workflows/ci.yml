@@ -96,11 +96,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Target triples mirror dist-workspace.toml's `targets` list.
+        # Target triples mirror dist-workspace.toml's `targets` list. The two
+        # Linux legs mirror dist's own release topology: each musl triple builds
+        # on a matching-arch runner with its native musl-gcc — the tree carries
+        # C-compiled deps (lzma-sys, ring), so a cross-arch check would need a
+        # cross C toolchain the runners don't have.
         include:
           - os: ubuntu-latest
-            check-targets: x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+            check-targets: x86_64-unknown-linux-musl
             dist-target: x86_64-unknown-linux-musl
+            musl-cc-env: CC_x86_64_unknown_linux_musl
+          - os: ubuntu-24.04-arm
+            check-targets: aarch64-unknown-linux-musl
+            dist-target: aarch64-unknown-linux-musl
+            musl-cc-env: CC_aarch64_unknown_linux_musl
           - os: macos-latest
             check-targets: x86_64-apple-darwin aarch64-apple-darwin
             dist-target: aarch64-apple-darwin
@@ -122,12 +131,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Harmless while the tree is pure Rust; the moment a *-sys/cc dependency
-      # arrives, the musl dist build needs a C compiler wired or it would fail
-      # here even though release.yml's dist container would succeed.
+      # The tree carries *-sys/cc dependencies (lzma-sys, ring), and cc-rs
+      # errors on musl targets unless CC is wired (it searches for a
+      # `<triple>-gcc` that no runner ships and does not fall back): each Linux
+      # leg wires its native triple's CC to musl-gcc explicitly. NOTE: dist's
+      # release builds run on the same runner arches but do NOT set these vars;
+      # wiring them into release.yml's build jobs is a tracked follow-up.
       - name: wire musl C toolchain
         if: runner.os == 'Linux'
-        run: echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+        run: echo "${{ matrix.musl-cc-env }}=musl-gcc" >> "$GITHUB_ENV"
 
       - name: cargo check --workspace --locked (cross targets)
         run: |
