@@ -127,9 +127,6 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "install musl-tools"
-        if: "runner.os == 'Linux'"
-        run: "sudo apt-get update && sudo apt-get install -y musl-tools"
       - name: "wire musl C toolchain"
         if: "runner.os == 'Linux'"
         run: |

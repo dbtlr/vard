@@ -135,10 +135,12 @@ jobs:
       # errors on musl targets unless CC is wired (it searches for a
       # `<triple>-gcc` that no runner ships and does not fall back): each Linux
       # leg wires its native triple's CC to musl-gcc explicitly. dist's release
-      # builds run on the same runner arches and get the same wiring via the
-      # github-build-setup snippet (.github/build-setup.yml, referenced from
-      # dist-workspace.toml), which dist generate injects into release.yml's
-      # build-local-artifacts job.
+      # builds run on the same runner arches and get the same CC wiring via
+      # the github-build-setup snippet (.github/build-setup.yml, referenced
+      # from dist-workspace.toml), which dist generate injects into
+      # release.yml's build-local-artifacts job; dist's own packages_install
+      # step already installs musl-tools there, so the snippet only needs to
+      # cover the CC vars.
       - name: wire musl C toolchain
         if: runner.os == 'Linux'
         run: echo "${{ matrix.musl-cc-env }}=musl-gcc" >> "$GITHUB_ENV"

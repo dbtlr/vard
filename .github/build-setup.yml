@@ -10,10 +10,15 @@
 # triple on the matching-arch Linux runner, same as ci.yml's cross job, so we
 # wire both triples' CC to musl-gcc here; each build only consults its own
 # triple's CC var, so exporting both on every Linux leg is harmless. The
-# `if` guards keep this a no-op on the macOS legs this snippet also runs on.
-- name: install musl-tools
-  if: runner.os == 'Linux'
-  run: sudo apt-get update && sudo apt-get install -y musl-tools
+# `if` guard keeps this a no-op on the macOS legs this snippet also runs on.
+#
+# musl-tools itself does NOT need installing here: dist already knows the
+# musl targets need it and emits its own "Install dependencies" step (driven
+# by `dist plan`'s packages_install), later in the same job, ahead of the
+# actual build — present in release.yml on main and untouched by this
+# snippet. Verified in CI run 29718114336: that step's apt-get install ran
+# for both musl legs ("musl-tools is already the newest version"), so the
+# only real gap dist couldn't fill on its own was these CC vars.
 - name: wire musl C toolchain
   if: runner.os == 'Linux'
   run: |
