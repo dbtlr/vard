@@ -75,6 +75,18 @@ Renders the platform unit, writes it atomically (creating the LaunchAgents or `s
 
 Re-running `install` is idempotent: an already-loaded service is unloaded and re-bootstrapped (macOS) or re-enabled (Linux) rather than rejected.
 
+### Config pre-flight
+
+Before writing the unit or touching the service manager, `install` (and `start` and `restart`) **pre-flight the daemon's own config** — the exact load-and-validate check [`run`](run.md) performs at startup. If that check would fail, the verb **refuses with exit `2`** and prints the underlying reason plus direct advice, having changed nothing:
+
+- **No config file** → *add a watch with `vard watch add`, then re-run*.
+- **A config that defines no watches** → *add one with `vard watch add`, then re-run*.
+- **An invalid config** → the parse/validation error, plus *fix the config, then re-run*.
+
+This refuses exactly when `vard run` itself would refuse — nothing stricter. A config that validates but has **every watch paused** is *not* a refusal: the daemon starts idle and a later [`watch resume`](watch.md) hot-reloads it. `stop` and `uninstall` never pre-flight — they only tear down.
+
+Under `--dry-run` the pre-flight never refuses (dry-run always exits `0`); instead, when it *would* refuse, the dry run appends a clearly-marked `WARNING: install would refuse — …` line so you can see the problem before committing to a real install.
+
 ### Lingering (Linux only)
 
 A systemd **user** manager normally stops when your last session ends, which would stop vard at logout. After starting the service, `install` handles that consent:
@@ -110,9 +122,9 @@ Stops and unloads the service, then removes its unit file. Nothing in your repos
 
 ## start, stop, restart
 
-- **start** loads (macOS) or starts (Linux) the installed service and verifies the daemon came up. With no unit installed it exits with an error pointing at `vard service install`.
-- **stop** unloads (macOS) or stops (Linux) the service. Stopping an already-stopped service is an idempotent success.
-- **restart** restarts the service and verifies the daemon came back up — the way to pick up an upgraded `vard` binary or a changed unit. If the service is not loaded, restart loads it.
+- **start** brings the installed service up and verifies the daemon came up. It first runs the [config pre-flight](#config-pre-flight) (refusing with exit `2` if `vard run` could not start), then, with no unit installed, exits with an error pointing at `vard service install`. Otherwise it probes the service's real state: an **already-running** service is left untouched (an exit-`0` no-op), while every other state — not loaded, stopped, or **crash-loop-throttled** — is brought up. On macOS the bring-up is an unconditional `bootout`-then-`bootstrap`, which recovers even a bootstrapped-but-throttled agent; a probe that cannot run falls through to that same safe path rather than refusing. On Linux it is `systemctl --user start`.
+- **stop** unloads (macOS) or stops (Linux) the service. Stopping an already-stopped service is an idempotent success. It does **not** pre-flight — stopping never needs a startable config.
+- **restart** restarts the service and verifies the daemon came back up — the way to pick up an upgraded `vard` binary or a changed unit. It runs the same [config pre-flight](#config-pre-flight) first. On macOS it then runs an unconditional `bootout` (result ignored) → `bootstrap` → verify sequence, correct from every state (running, stopped, throttled, not loaded); with no unit installed it points at `vard service install`. On Linux `systemctl --user restart` is itself state-agnostic (it starts a stopped unit and restarts a running one).
 
 ### stop is not uninstall
 
@@ -141,7 +153,7 @@ Service verbs print human status lines to stdout and are **text-only** — an ex
 |---|---|
 | `0` | Success. A stop-when-already-stopped and an uninstall-when-nothing-installed are idempotent successes and say so. |
 | `1` | Attention — the unit was installed and the service started, but the daemon did not come up within five seconds. Run `vard run` in the foreground to see why. |
-| `2` | Operational error — an unsupported platform, a `launchctl`/`systemctl`/`loginctl` failure, an unreachable systemd session, or an unresolvable `HOME`/config path. |
+| `2` | Operational error, or a **pre-flight refusal** by `install`/`start`/`restart` when `vard run` itself could not start (no config, no watches, or an invalid config). Also an unsupported platform, a `launchctl`/`systemctl`/`loginctl` failure, an unreachable systemd session, or an unresolvable `HOME`/config path. |
 
 ## See also
 

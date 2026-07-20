@@ -793,8 +793,15 @@ pub enum ServiceCommand {
     #[command(long_about = "\
 Install and start the vard service.
 
-Resolves the running `vard` binary's path, renders the platform unit — a launchd \
-plist on macOS, a systemd user unit on Linux — and writes it atomically \
+First it pre-flights the daemon's own config the way `vard run` does at startup: \
+if there is no config file, or it defines no watches, or it is invalid, install \
+refuses with exit 2 and advice (e.g. `vard watch add`) BEFORE writing the unit \
+or touching the service manager — so a service is never installed only to \
+crash-loop with nothing to watch. A config that validates but has every watch \
+paused is fine (the daemon runs idle).
+
+It then resolves the running `vard` binary's path, renders the platform unit — a \
+launchd plist on macOS, a systemd user unit on Linux — and writes it atomically \
 (`~/Library/LaunchAgents/com.dbtlr.vard.plist` or \
 `$XDG_CONFIG_HOME/systemd/user/vard.service`, default \
 `~/.config/systemd/user/vard.service`). It then loads and starts the service and \
@@ -813,7 +820,9 @@ leaves it off; with neither, an interactive terminal is prompted and a \
 non-interactive run leaves lingering off with a one-line notice.
 
 `--dry-run` prints the resolved binary path, the unit file path, the full \
-rendered unit, and the actions that would run — writing nothing and exiting 0.")]
+rendered unit, and the actions that would run — writing nothing and exiting 0. \
+When the pre-flight would refuse, the dry run adds a clearly-marked WARNING line \
+(and still exits 0).")]
     Install(ServiceInstallArgs),
 
     /// Stop and unload the service, then remove its unit file.
@@ -834,11 +843,17 @@ installed is a success: the command says so and exits 0.")]
     #[command(long_about = "\
 Start the vard service.
 
-Loads the installed service (or kicks an already-loaded one) so the daemon runs, \
-then verifies it came up. If no unit is installed, the command exits with an \
-error pointing at `vard service install`. If the service starts but the daemon \
-does not take the instance lock within five seconds, it exits 1 and points at \
-`vard run` in the foreground.")]
+Like `install`, it first pre-flights the daemon's config (`vard run`'s own \
+startup check): a missing, watch-less, or invalid config refuses with exit 2 and \
+advice before any service-manager call. If no unit is installed, the command \
+exits with an error pointing at `vard service install`.
+
+Otherwise it probes the service's real state and acts on it: an already-running \
+service is left alone (an exit-0 no-op), and any other state — not loaded, \
+stopped, or crash-loop-throttled — is brought up so `start` is reliable from \
+every state. It then verifies the daemon came up; if it does not take the \
+instance lock within five seconds, it exits 1 and points at `vard run` in the \
+foreground.")]
     Start,
 
     /// Unload the service, stopping the daemon.
@@ -860,11 +875,17 @@ stopped service still starts again at your next login until you `uninstall` (or 
 Restart the vard service.
 
 Restarts the running service and verifies the daemon came back up, the way to \
-pick up an upgraded `vard` binary or a changed unit. launchd has no reload \
-signal, so a restart is how macOS re-execs the daemon; on Linux the systemd unit \
-also carries an `ExecReload` that sends SIGHUP for a config-only reload without a \
-full restart. If the service is not loaded, restart loads it. A restart that \
-leaves the daemon down exits 1 and points at `vard run` in the foreground.")]
+pick up an upgraded `vard` binary or a changed unit. Like `install`, it first \
+pre-flights the daemon's config and refuses with exit 2 and advice if `vard run` \
+itself could not start, before touching the service manager.
+
+launchd has no reload signal, so a restart is how macOS re-execs the daemon; \
+there it runs an unconditional reload-then-start sequence that is reliable from \
+every state (running, stopped, or crash-loop-throttled), and advises \
+`vard service install` if no unit is installed. On Linux the systemd unit also \
+carries an `ExecReload` that sends SIGHUP for a config-only reload without a full \
+restart, and `restart` starts a stopped unit as well. A restart that leaves the \
+daemon down exits 1 and points at `vard run` in the foreground.")]
     Restart,
 }
 

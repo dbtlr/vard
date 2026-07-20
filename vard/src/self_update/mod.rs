@@ -47,9 +47,12 @@ use crate::paths;
 use self::resolve::Action;
 
 /// How long to poll the health file for the restarted daemon's target-version
-/// heartbeat before declaring the post-swap verify unconfirmed. Sized to match
-/// the service module's own daemon-liveness budget (`VERIFY_BUDGET`) so the two
-/// liveness checks agree on how long "came up" is allowed to take.
+/// heartbeat before declaring the post-swap verify unconfirmed. Matches the
+/// service module's own daemon-liveness budget (`VERIFY_BUDGET`) so the two
+/// liveness checks agree on how long "came up" is allowed to take. This is the
+/// verify *after* the restart call returns; the restart itself is separately
+/// bounded (the VRD-59 bootout settle wait, then bootstrap, then the service
+/// module's own liveness verify), so the whole post-swap step stays bounded.
 const HEALTH_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interval between health-file polls while waiting out [`HEALTH_VERIFY_TIMEOUT`].

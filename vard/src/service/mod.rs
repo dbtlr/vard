@@ -63,6 +63,14 @@ const VERIFY_POLL: Duration = Duration::from_millis(100);
 /// Poll interval while waiting for a timed-out subprocess to die.
 const KILL_POLL: Duration = Duration::from_millis(20);
 
+/// Wall-clock cap on the launchd bootout→bootstrap settle wait (VRD-59): how
+/// long to poll for a booted-out label to actually clear before bootstrapping
+/// anyway and letting any real error surface.
+const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Interval between `launchctl print` probes while waiting out [`SETTLE_BUDGET`].
+const SETTLE_POLL: Duration = Duration::from_millis(150);
+
 /// Production entry point for `vard service <subcommand>`.
 pub(crate) fn run(cmd: ServiceCommand, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     command::finish(run_inner(cmd, color, format))
@@ -90,6 +98,7 @@ fn run_inner(cmd: ServiceCommand, color: ColorWhen, format: Option<OutputFormat>
         runner: &SystemRunner,
         liveness: &DaemonLiveness,
         prompt: &StdinPrompt,
+        settle: &SystemSettle::new(),
     };
 
     let lines = dispatch(cmd, &env, is_tty)?;
@@ -109,6 +118,59 @@ fn emit_lines(lines: &[String]) -> CmdResult {
     command::finish_write(res)
 }
 
+// --- daemon-startup pre-flight (VRD-58) ------------------------------------
+
+/// Whether `vard run` could start right now — the pre-flight the daemon-
+/// (re)starting service verbs (`install`, `start`, `restart`) run before they
+/// touch any unit or service-manager state. Computed once from the *same*
+/// load-and-validate path `vard run` performs at startup
+/// ([`crate::daemon::check_startup_config`]), so a verb refuses exactly when the
+/// daemon it would start could not start — never a parallel check that can
+/// drift. `stop` and `uninstall` never pre-flight.
+pub(crate) enum PreflightOutcome {
+    /// `vard run` would start — proceed.
+    Startable,
+    /// `vard run` would refuse; carries the exit-2 refusal message (advice
+    /// included), for the verb to surface verbatim.
+    Refused(String),
+}
+
+impl PreflightOutcome {
+    /// The gate each (re)starting verb applies before touching service-manager
+    /// state: `Ok(())` when startable, else the refusal as an exit-2
+    /// [`CmdError`].
+    pub(crate) fn require_startable(&self) -> Result<(), CmdError> {
+        match self {
+            PreflightOutcome::Startable => Ok(()),
+            PreflightOutcome::Refused(message) => Err(CmdError::err(message.clone())),
+        }
+    }
+
+    /// The clearly-marked warning line `install --dry-run` appends when the
+    /// pre-flight would refuse (dry-run itself always exits 0), or `None`.
+    pub(crate) fn dry_run_warning(&self) -> Option<String> {
+        match self {
+            PreflightOutcome::Startable => None,
+            PreflightOutcome::Refused(message) => {
+                Some(format!("WARNING: install would refuse — {message}"))
+            }
+        }
+    }
+}
+
+/// Runs the daemon-startup pre-flight against the real config path, reusing
+/// `vard run`'s own [`check_startup_config`](crate::daemon::check_startup_config)
+/// decision.
+fn preflight_config() -> PreflightOutcome {
+    match paths::config_file() {
+        Ok(config_file) => match crate::daemon::check_startup_config(&config_file) {
+            Ok(_) => PreflightOutcome::Startable,
+            Err(err) => PreflightOutcome::Refused(err.service_message()),
+        },
+        Err(err) => PreflightOutcome::Refused(format!("cannot locate the vard config: {err}")),
+    }
+}
+
 // --- backend selection ----------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -118,12 +180,12 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, _is_tty: bool) -> Result<Vec<Strin
     match cmd {
         ServiceCommand::Install(args) => {
             let bin = resolve_service_binary()?;
-            launchd::install(env, uid, &plist, &bin, args.dry_run)
+            launchd::install(env, uid, &plist, &bin, args.dry_run, &preflight_config())
         }
         ServiceCommand::Uninstall => launchd::uninstall(env, uid, &plist),
-        ServiceCommand::Start => launchd::start(env, uid, &plist),
+        ServiceCommand::Start => launchd::start(env, uid, &plist, &preflight_config()),
         ServiceCommand::Stop => launchd::stop(env, uid),
-        ServiceCommand::Restart => launchd::restart(env, uid, &plist),
+        ServiceCommand::Restart => launchd::restart(env, uid, &plist, &preflight_config()),
     }
 }
 
@@ -133,6 +195,7 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, is_tty: bool) -> Result<Vec<String
     match cmd {
         ServiceCommand::Install(args) => {
             let bin = resolve_service_binary()?;
+            let preflight = preflight_config();
             if args.dry_run {
                 // Dry run touches nothing and needs no reachable session.
                 return systemd::install(
@@ -143,26 +206,43 @@ fn dispatch(cmd: ServiceCommand, env: &OpEnv, is_tty: bool) -> Result<Vec<String
                     args.linger,
                     args.no_linger,
                     is_tty,
+                    &preflight,
                 );
             }
+            // Refuse before touching the service manager — the reachability
+            // probe included.
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::install(env, &unit, &bin, false, args.linger, args.no_linger, is_tty)
+            systemd::install(
+                env,
+                &unit,
+                &bin,
+                false,
+                args.linger,
+                args.no_linger,
+                is_tty,
+                &preflight,
+            )
         }
         ServiceCommand::Uninstall => {
             systemd::ensure_reachable(env)?;
             systemd::uninstall(env, &unit)
         }
         ServiceCommand::Start => {
+            let preflight = preflight_config();
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::start(env, &unit)
+            systemd::start(env, &unit, &preflight)
         }
         ServiceCommand::Stop => {
             systemd::ensure_reachable(env)?;
             systemd::stop(env)
         }
         ServiceCommand::Restart => {
+            let preflight = preflight_config();
+            preflight.require_startable()?;
             systemd::ensure_reachable(env)?;
-            systemd::restart(env)
+            systemd::restart(env, &preflight)
         }
     }
 }
@@ -210,10 +290,41 @@ pub(crate) fn restart_installed() -> Result<Vec<String>, CmdError> {
         runner: &SystemRunner,
         liveness: &DaemonLiveness,
         prompt: &StdinPrompt,
+        settle: &SystemSettle::new(),
     };
-    // `is_tty` only gates the Linux linger prompt on install; restart never
-    // prompts, so `false` is safe on every platform.
-    dispatch(ServiceCommand::Restart, &env, false)
+    // Restart *below* the user-facing pre-flight gate: `vard self-update`'s
+    // post-swap restart verifies and reports and must never surface the VRD-58
+    // watch-state refusal (ADR 0017). The user-facing `vard service restart`
+    // (through `dispatch`) keeps the pre-flight exactly as-is.
+    restart_unit(&env)
+}
+
+/// Restarts the installed unit through the platform restart mechanics *without*
+/// the VRD-58 daemon-startup pre-flight — the seam [`restart_installed`] reuses
+/// so `vard self-update`'s post-swap restart never judges watch state (ADR 0017).
+/// The user-facing `vard service restart` reaches the same mechanics through
+/// [`dispatch`], which applies the pre-flight refusal first.
+#[cfg(target_os = "macos")]
+fn restart_unit(env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    let uid = rustix::process::getuid().as_raw();
+    let plist = launchd::plist_path()?;
+    launchd::restart_unchecked(env, uid, &plist)
+}
+
+/// See the macOS variant.
+#[cfg(target_os = "linux")]
+fn restart_unit(env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    systemd::ensure_reachable(env)?;
+    systemd::restart_unchecked(env)
+}
+
+/// See the macOS variant. No supported service manager here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn restart_unit(_env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    Err(CmdError::err(
+        "vard service is supported on macOS (launchd) and Linux (systemd) only; run `vard run` \
+         under your platform's own supervisor",
+    ))
 }
 
 // --- injectable seams -----------------------------------------------------
@@ -227,6 +338,9 @@ pub(crate) struct OpEnv<'a> {
     pub(crate) liveness: &'a dyn Liveness,
     /// Asks the user a yes/no question (the Linux linger consent prompt).
     pub(crate) prompt: &'a dyn Prompt,
+    /// Paces the launchd bootout→bootstrap settle poll (VRD-59): sleeps the poll
+    /// interval and reports whether the settle budget still has room.
+    pub(crate) settle: &'a dyn SettleWaiter,
 }
 
 /// The captured result of a service-manager subprocess.
@@ -283,6 +397,19 @@ pub(crate) trait Prompt {
     fn confirm(&self, question: &str) -> bool;
 }
 
+/// Paces the launchd bootout→bootstrap settle loop (VRD-59). `launchctl bootout`
+/// of a live process is asynchronous: an immediate `bootstrap` finds the label
+/// still registered and fails with EIO ("Bootstrap failed: 5"). The settle loop
+/// re-probes until the label clears, sleeping this interval between probes and
+/// stopping when the budget is spent. Injected so the loop is deterministic and
+/// instant under test.
+pub(crate) trait SettleWaiter {
+    /// Called once after each probe that still sees the label. Sleeps the poll
+    /// interval and returns `true` to keep polling, or `false` when the settle
+    /// budget is exhausted (the caller then bootstraps anyway).
+    fn keep_waiting(&self) -> bool;
+}
+
 /// The production [`Runner`]: a timeout-bounded subprocess that drains both
 /// pipes and kills the process group on the deadline (the bounded-probe pattern
 /// vard-core's `git_output_timed` uses).
@@ -314,6 +441,37 @@ impl Liveness for DaemonLiveness {
             }
             std::thread::sleep(VERIFY_POLL);
         }
+    }
+}
+
+/// The production [`SettleWaiter`]: sleeps [`SETTLE_POLL`] between probes and
+/// caps the whole settle at [`SETTLE_BUDGET`]. The deadline is established lazily
+/// on the first call — one `vard service` command runs at most one settle, so a
+/// per-`OpEnv` waiter with a lazily-initialized deadline is correct.
+struct SystemSettle {
+    deadline: std::cell::Cell<Option<Instant>>,
+}
+
+impl SystemSettle {
+    fn new() -> SystemSettle {
+        SystemSettle {
+            deadline: std::cell::Cell::new(None),
+        }
+    }
+}
+
+impl SettleWaiter for SystemSettle {
+    fn keep_waiting(&self) -> bool {
+        let deadline = self.deadline.get().unwrap_or_else(|| {
+            let d = Instant::now() + SETTLE_BUDGET;
+            self.deadline.set(Some(d));
+            d
+        });
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SETTLE_POLL);
+        Instant::now() < deadline
     }
 }
 
@@ -604,6 +762,35 @@ mod tests {
     impl Prompt for FakePrompt {
         fn confirm(&self, _question: &str) -> bool {
             self.0
+        }
+    }
+
+    /// A [`SettleWaiter`] that never runs out of budget — the default for flows
+    /// whose programmed probes reach the cleared state before any real timeout.
+    pub(crate) struct AlwaysWait;
+    impl SettleWaiter for AlwaysWait {
+        fn keep_waiting(&self) -> bool {
+            true
+        }
+    }
+
+    /// A [`SettleWaiter`] that grants `n` waits, then reports the budget spent —
+    /// so a "label never clears" flow deterministically falls through to a
+    /// bootstrap attempt after a known number of probes, with no real sleeping.
+    pub(crate) struct FakeSettle(pub(crate) std::cell::Cell<u32>);
+    impl FakeSettle {
+        pub(crate) fn new(waits: u32) -> FakeSettle {
+            FakeSettle(std::cell::Cell::new(waits))
+        }
+    }
+    impl SettleWaiter for FakeSettle {
+        fn keep_waiting(&self) -> bool {
+            let remaining = self.0.get();
+            if remaining == 0 {
+                return false;
+            }
+            self.0.set(remaining - 1);
+            true
         }
     }
 

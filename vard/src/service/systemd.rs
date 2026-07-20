@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::atomic;
 use crate::command::CmdError;
 
-use super::{OpEnv, RunOutput};
+use super::{OpEnv, PreflightOutcome, RunOutput};
 
 /// The systemd user unit name.
 const UNIT: &str = "vard.service";
@@ -179,6 +179,7 @@ pub(crate) fn install(
     linger: bool,
     no_linger: bool,
     is_tty: bool,
+    preflight: &PreflightOutcome,
 ) -> Result<Vec<String>, CmdError> {
     let content = render_unit(&bin.to_string_lossy());
 
@@ -201,8 +202,17 @@ pub(crate) fn install(
             "Linger: {}",
             linger_dry_summary(linger, no_linger, is_tty)
         ));
+        if let Some(warning) = preflight.dry_run_warning() {
+            lines.push(String::new());
+            lines.push(warning);
+        }
         return Ok(lines);
     }
+
+    // Refuse before writing the unit or touching systemd if `vard run` itself
+    // could not start (VRD-58). On the Linux path dispatch has already gated
+    // this before the reachability probe; this keeps the backend self-contained.
+    preflight.require_startable()?;
 
     atomic::write(unit, content.as_bytes())
         .map_err(|e| CmdError::err(format!("writing {}: {e}", unit.display())))?;
@@ -314,7 +324,12 @@ pub(crate) fn uninstall(env: &OpEnv, unit: &Path) -> Result<Vec<String>, CmdErro
 /// `vard service start`: `start` the unit and verify. A missing unit advises
 /// `vard service install`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn start(env: &OpEnv, unit: &Path) -> Result<Vec<String>, CmdError> {
+pub(crate) fn start(
+    env: &OpEnv,
+    unit: &Path,
+    preflight: &PreflightOutcome,
+) -> Result<Vec<String>, CmdError> {
+    preflight.require_startable()?;
     if !unit.exists() {
         return Err(CmdError::err(
             "no vard service is installed — run `vard service install` first",
@@ -350,9 +365,24 @@ pub(crate) fn stop(env: &OpEnv) -> Result<Vec<String>, CmdError> {
     ])
 }
 
-/// `vard service restart`: `restart` the unit and verify.
+/// `vard service restart`: refuse up front if `vard run` itself could not start
+/// (the VRD-58 pre-flight), then run [`restart_unchecked`].
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn restart(env: &OpEnv) -> Result<Vec<String>, CmdError> {
+pub(crate) fn restart(env: &OpEnv, preflight: &PreflightOutcome) -> Result<Vec<String>, CmdError> {
+    preflight.require_startable()?;
+    restart_unchecked(env)
+}
+
+/// The `restart` + verify mechanics *without* the VRD-58 config pre-flight.
+/// `systemctl --user restart` is state-agnostic (it starts a stopped unit and
+/// restarts a running one), so no state inference is needed here — the VRD-59
+/// launchd fix has no systemd parallel. `vard service restart` calls this behind
+/// its pre-flight gate; `vard self-update`'s post-swap restart
+/// ([`crate::service::restart_installed`]) calls it directly, because per ADR
+/// 0017 the updater verifies and reports and must never surface a watch-state
+/// refusal.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn restart_unchecked(env: &OpEnv) -> Result<Vec<String>, CmdError> {
     let out = systemctl(env, &["restart", UNIT]);
     if !out.success() {
         return Err(CmdError::err(format!(
@@ -367,7 +397,9 @@ pub(crate) fn restart(env: &OpEnv) -> Result<Vec<String>, CmdError> {
 mod tests {
     use super::*;
     use crate::service::OpEnv;
-    use crate::service::tests::{FakeLiveness, FakePrompt, FakeRunner, fail, not_spawned, ok};
+    use crate::service::tests::{
+        AlwaysWait, FakeLiveness, FakePrompt, FakeRunner, fail, not_spawned, ok,
+    };
 
     fn env<'a>(
         runner: &'a FakeRunner,
@@ -378,7 +410,22 @@ mod tests {
             runner,
             liveness: live,
             prompt,
+            // systemd flows never bootout→settle; the waiter is never consulted.
+            settle: &AlwaysWait,
         }
+    }
+
+    /// A pre-flight that lets the verb proceed — the default for flows not
+    /// exercising the VRD-58 refusal.
+    fn startable() -> PreflightOutcome {
+        PreflightOutcome::Startable
+    }
+
+    /// A pre-flight that refuses, carrying a recognizable advice message.
+    fn refused() -> PreflightOutcome {
+        PreflightOutcome::Refused(
+            "nothing to watch — add a watch with `vard watch add`".to_string(),
+        )
     }
 
     #[test]
@@ -469,6 +516,7 @@ WantedBy=default.target
             false,
             true,
             false,
+            &startable(),
         )
         .unwrap();
         assert!(unit.exists());
@@ -496,6 +544,7 @@ WantedBy=default.target
             true,
             false,
             false,
+            &startable(),
         )
         .unwrap();
         let calls = runner.calls();
@@ -520,6 +569,7 @@ WantedBy=default.target
             false,
             false,
             true,
+            &startable(),
         )
         .unwrap();
         assert_eq!(runner.calls()[2], "loginctl enable-linger");
@@ -543,6 +593,7 @@ WantedBy=default.target
             false,
             false,
             false,
+            &startable(),
         )
         .unwrap();
         assert_eq!(runner.calls().len(), 2, "loginctl must not run");
@@ -566,6 +617,7 @@ WantedBy=default.target
             false,
             true,
             false,
+            &startable(),
         )
         .unwrap_err();
         assert!(err.message().contains("enable --now"));
@@ -588,6 +640,7 @@ WantedBy=default.target
             true,
             false,
             false,
+            &startable(),
         )
         .unwrap_err();
         assert!(err.message().contains("did not come up"));
@@ -610,6 +663,7 @@ WantedBy=default.target
             false,
             false,
             true,
+            &startable(),
         )
         .unwrap();
         assert!(!unit.exists());
@@ -658,7 +712,7 @@ WantedBy=default.target
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
-        let err = start(&e, &unit).unwrap_err();
+        let err = start(&e, &unit, &startable()).unwrap_err();
         assert!(err.message().contains("vard service install"));
     }
 
@@ -672,8 +726,23 @@ WantedBy=default.target
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        start(&e, &unit).unwrap();
+        start(&e, &unit, &startable()).unwrap();
         assert_eq!(runner.calls()[0], "systemctl --user start vard.service");
+    }
+
+    #[test]
+    fn start_refuses_when_preflight_fails_before_any_systemctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("vard.service");
+        fs::write(&unit, "x").unwrap();
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = start(&e, &unit, &refused()).unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
@@ -695,7 +764,7 @@ WantedBy=default.target
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        restart(&e).unwrap();
+        restart(&e, &startable()).unwrap();
         assert_eq!(runner.calls()[0], "systemctl --user restart vard.service");
     }
 
@@ -706,7 +775,94 @@ WantedBy=default.target
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
-        let err = restart(&e).unwrap_err();
+        let err = restart(&e, &startable()).unwrap_err();
         assert!(err.message().contains("did not come up"));
+    }
+
+    #[test]
+    fn restart_unchecked_skips_preflight_and_never_judges_watch_state() {
+        // The post-swap reuse seam (`vard self-update` → restart_installed →
+        // restart_unchecked) restarts *below* the VRD-58 pre-flight gate: it
+        // takes no PreflightOutcome, so no config is consulted and no watch-state
+        // refusal can surface (ADR 0017). Just `systemctl --user restart` + verify.
+        let runner = FakeRunner::new(vec![ok()]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = restart_unchecked(&e).unwrap();
+        assert_eq!(runner.calls()[0], "systemctl --user restart vard.service");
+        assert!(lines.iter().any(|l| l.contains("Restarted")));
+        assert!(
+            !lines.iter().any(|l| l.to_lowercase().contains("watch")),
+            "post-swap restart must never judge watch state: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn restart_refuses_when_preflight_fails_before_any_systemctl() {
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = restart(&e, &refused()).unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn install_refuses_when_preflight_fails_before_touching_systemd() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("vard.service");
+        let runner = FakeRunner::new(vec![]); // must never run
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let err = install(
+            &e,
+            &unit,
+            Path::new("/usr/bin/vard"),
+            false,
+            false,
+            true,
+            false,
+            &refused(),
+        )
+        .unwrap_err();
+        assert!(err.message().contains("vard watch add"));
+        assert!(!unit.exists(), "refusal must not write the unit");
+        assert!(runner.calls().is_empty(), "refusal must not shell out");
+    }
+
+    #[test]
+    fn dry_run_warns_when_preflight_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("vard.service");
+        let runner = FakeRunner::new(vec![]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = install(
+            &e,
+            &unit,
+            Path::new("/usr/bin/vard"),
+            true,
+            false,
+            false,
+            true,
+            &refused(),
+        )
+        .unwrap();
+        assert!(!unit.exists());
+        let text = lines.join("\n");
+        assert!(text.contains("Dry run"));
+        assert!(
+            text.contains("WARNING: install would refuse"),
+            "dry run must surface the pre-flight warning, got: {text}"
+        );
+        assert!(text.contains("vard watch add"));
     }
 }
