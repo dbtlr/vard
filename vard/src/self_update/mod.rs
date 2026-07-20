@@ -14,8 +14,9 @@
 //!
 //! # Post-swap restart + verify (phase 2)
 //!
-//! After a real swap, the updater checks whether a `vard` service unit is loaded
-//! (reusing [`crate::service::unit_installed`]). If one is, it restarts the
+//! After a real swap, the updater checks whether a `vard` service unit is
+//! installed — the unit file exists, loaded or not (reusing
+//! [`crate::service::unit_installed`]). If one is, it restarts the
 //! daemon through the `vard service restart` machinery
 //! ([`crate::service::restart_installed`]) and then polls the health file until
 //! it reports the **target version** running, bounded by [`HEALTH_VERIFY_TIMEOUT`].
@@ -24,7 +25,7 @@
 //! pre-existing degradation is never blamed on the update. A restart or a verify
 //! timeout leaves the swapped binary in place and exits non-zero with the exact
 //! recovery gesture (`vard self-update --version <previous>`, or reinstall). With
-//! no unit loaded the swap succeeds and the user is told to restart their own
+//! no unit installed the swap succeeds and the user is told to restart their own
 //! `vard run`.
 
 mod download;
