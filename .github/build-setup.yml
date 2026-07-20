@@ -1,0 +1,26 @@
+# Injected into every dist release-build job via `github-build-setup` (see
+# dist-workspace.toml), right after checkout and before `dist build` runs.
+# This snippet is generated into .github/workflows/release.yml by
+# `dist generate`; hand-editing release.yml directly does not survive that
+# regeneration, so this file is the source of truth.
+#
+# The tree carries *-sys/cc dependencies (lzma-sys, ring), and cc-rs errors on
+# musl targets unless CC is wired (it searches for a `<triple>-gcc` that no
+# runner ships and does not fall back). dist's release builds run each musl
+# triple on the matching-arch Linux runner, same as ci.yml's cross job, so we
+# wire both triples' CC to musl-gcc here; each build only consults its own
+# triple's CC var, so exporting both on every Linux leg is harmless. The
+# `if` guard keeps this a no-op on the macOS legs this snippet also runs on.
+#
+# musl-tools itself does NOT need installing here: dist already knows the
+# musl targets need it and emits its own "Install dependencies" step (driven
+# by `dist plan`'s packages_install), later in the same job, ahead of the
+# actual build — present in release.yml on main and untouched by this
+# snippet. Verified in CI run 29718114336: that step's apt-get install ran
+# for both musl legs ("musl-tools is already the newest version"), so the
+# only real gap dist couldn't fill on its own was these CC vars.
+- name: wire musl C toolchain
+  if: runner.os == 'Linux'
+  run: |
+    echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+    echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
