@@ -55,7 +55,7 @@ vard self-update…
   latest        0.2.0
   target        0.2.0
   triple        aarch64-apple-darwin
-  install path  /opt/homebrew/bin/vard
+  install path  ~/.cargo/bin/vard
   asset url     https://github.com/dbtlr/vard/releases/download/v0.2.0/vard-aarch64-apple-darwin.tar.xz
   asset sha256  9f2b…
 Updated vard 0.1.0 → 0.2.0
@@ -89,7 +89,7 @@ vard self-update --dry-run --format json
     "latest_version": "0.2.0",
     "target_version": "0.2.0",
     "target_triple": "aarch64-apple-darwin",
-    "install_path": "/opt/homebrew/bin/vard",
+    "install_path": "~/.cargo/bin/vard",
     "asset_url": "https://github.com/dbtlr/vard/releases/download/v0.2.0/vard-aarch64-apple-darwin.tar.xz",
     "asset_sha256": "9f2b…",
     "dry_run": true,
