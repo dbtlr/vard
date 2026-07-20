@@ -7,6 +7,10 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Extra steps injected into every generated release-build job (right after
+# checkout, before `dist build`); wires the musl C toolchain the Linux legs
+# need for C-compiled deps (lzma-sys, ring). See .github/build-setup.yml.
+github-build-setup = "../build-setup.yml"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)

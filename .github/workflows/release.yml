@@ -127,6 +127,14 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "install musl-tools"
+        if: "runner.os == 'Linux'"
+        run: "sudo apt-get update && sudo apt-get install -y musl-tools"
+      - name: "wire musl C toolchain"
+        if: "runner.os == 'Linux'"
+        run: |
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

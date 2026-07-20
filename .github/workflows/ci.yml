@@ -134,9 +134,11 @@ jobs:
       # The tree carries *-sys/cc dependencies (lzma-sys, ring), and cc-rs
       # errors on musl targets unless CC is wired (it searches for a
       # `<triple>-gcc` that no runner ships and does not fall back): each Linux
-      # leg wires its native triple's CC to musl-gcc explicitly. NOTE: dist's
-      # release builds run on the same runner arches but do NOT set these vars;
-      # wiring them into release.yml's build jobs is a tracked follow-up.
+      # leg wires its native triple's CC to musl-gcc explicitly. dist's release
+      # builds run on the same runner arches and get the same wiring via the
+      # github-build-setup snippet (.github/build-setup.yml, referenced from
+      # dist-workspace.toml), which dist generate injects into release.yml's
+      # build-local-artifacts job.
       - name: wire musl C toolchain
         if: runner.os == 'Linux'
         run: echo "${{ matrix.musl-cc-env }}=musl-gcc" >> "$GITHUB_ENV"
