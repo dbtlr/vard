@@ -39,7 +39,11 @@ vard self-update --format json
 - **Already current.** If the target version equals the running version, the command reports "up to date" and exits `0` — a success that downloads and changes nothing.
 - **Integrity first.** The tarball's sha256 is checked against the manifest **before** it is unpacked. On a mismatch the command fails and the installed binary is left byte-for-byte untouched — nothing is swapped until a verified binary has been staged.
 - **Atomic swap.** The new binary is staged as a hidden sibling of the install path (same filesystem) and moved over the current one with a single `rename`. The running process keeps executing from the old file until it exits — expected and safe.
-- **The daemon keeps the old binary until restarted.** Replacing the on-disk binary does not restart a running daemon; it keeps executing the version it started with. `self-update` says so and stops there — restart the daemon (`vard service restart`, or your foreground `vard run`) to pick up the new version. This phase does **not** restart the service or verify a post-update heartbeat.
+- **Post-swap restart and verify.** After a successful swap, `self-update` checks whether a `vard` service unit is loaded (the macOS LaunchAgent or the Linux systemd user unit):
+  - **Unit loaded.** It restarts the daemon through the same machinery as `vard service restart`, then polls the health file until it reports the **target version** running, bounded by a timeout. On success it reports the confirmed running version and exits `0`.
+  - **Verify not confirmed.** If the restart fails or the health file does not report the new version within the timeout, the **swap itself still succeeded** — the new binary is in place. The command says so, prints the exact recovery gesture, and exits non-zero. It asserts only on the daemon's heartbeat and version, never on watch state, so a problem that predates the update is never blamed on it. The recovery gesture is to pin the previous version (`vard self-update --version <previous>`) or reinstall via the installer.
+  - **No unit loaded.** The swap succeeds and the command tells you to restart your own foreground `vard run` to pick up the new binary, exiting `0`. (Nothing to restart automatically.)
+- **`--dry-run` states the post-swap plan.** A dry run also prints what the post-swap step would be — restart-and-verify when a unit is loaded, or a manual restart when it is not — without swapping or restarting anything.
 
 ## Output
 
@@ -55,10 +59,22 @@ vard self-update…
   asset url     https://github.com/dbtlr/vard/releases/download/v0.2.0/vard-aarch64-apple-darwin.tar.xz
   asset sha256  9f2b…
 Updated vard 0.1.0 → 0.2.0
-A running daemon keeps the old binary until it is restarted — run `vard service restart` (or restart `vard run`) to pick up 0.2.0.
+Restarted the vard service; 0.2.0 is now running.
 ```
 
-The machine form is a single stable object (a one-element array under `--format json`, one line under `--format jsonl`). The `asset_url` and `asset_sha256` fields are `null` on a no-op.
+If the restart cannot be verified, the swap-succeeded outcome and the recovery gesture are printed instead:
+
+```text
+Updated vard 0.1.0 → 0.2.0
+The binary was swapped, but the restart could not be verified: restarted the service, but the daemon's health file did not report 0.2.0 running within 5s.
+The new binary is in place; the daemon may still be on 0.1.0.
+To go back to 0.1.0:
+    vard self-update --version 0.1.0
+or reinstall via the installer:
+    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dbtlr/vard/releases/latest/download/vard-installer.sh | sh
+```
+
+The machine form is a single stable object (a one-element array under `--format json`, one line under `--format jsonl`). The `asset_url` and `asset_sha256` fields are `null` on a no-op; the post-swap fields (`restart_attempted`, `verify_outcome`, `running_version`) describe the phase-2 outcome and are `false`/`null` when nothing was swapped.
 
 ```bash
 vard self-update --dry-run --format json
@@ -76,7 +92,11 @@ vard self-update --dry-run --format json
     "install_path": "/opt/homebrew/bin/vard",
     "asset_url": "https://github.com/dbtlr/vard/releases/download/v0.2.0/vard-aarch64-apple-darwin.tar.xz",
     "asset_sha256": "9f2b…",
-    "dry_run": true
+    "dry_run": true,
+    "unit_installed": true,
+    "restart_attempted": false,
+    "verify_outcome": null,
+    "running_version": null
   }
 ]
 ```
@@ -92,14 +112,18 @@ vard self-update --dry-run --format json
 | `install_path` | The binary that was (or would be) replaced. |
 | `asset_url`, `asset_sha256` | The resolved artifact and its manifest checksum; `null` on a no-op. |
 | `dry_run` | Whether this was a dry run. |
+| `unit_installed` | Whether a `vard` service unit is loaded (drives the post-swap step and the dry-run plan). |
+| `restart_attempted` | Whether a loaded unit was restarted after the swap. `false` on a dry run, a no-op, or when no unit is loaded. |
+| `verify_outcome` | `verified` (new version confirmed running), `failed` (restart/verify not confirmed), `no_unit` (swapped, nothing to restart), or `null` when nothing was swapped. |
+| `running_version` | The version confirmed running after a verified restart; `null` otherwise. |
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success — updated, already current, or a dry-run plan. |
+| `0` | Success — updated (and, when a service unit is loaded, the new version verified running; when none is loaded, swapped for you to restart), already current, or a dry-run plan. |
 | `1` | The updater will not proceed and you must act elsewhere: no install receipt (re-run the installer, or use your package manager), or no release artifact published for this platform. Nothing was downloaded or changed. |
-| `2` | An operational failure: a pinned version that does not exist on GitHub, or a network, checksum, extraction, or swap error. |
+| `2` | An operational failure: a pinned version that does not exist on GitHub; a network, checksum, extraction, or swap error; or a swap whose post-swap service restart/verify could not be confirmed within the timeout (the binary is swapped, but the running daemon may still be on the old version — use the printed recovery gesture). |
 
 ## See also
 

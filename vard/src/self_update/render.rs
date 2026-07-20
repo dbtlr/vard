@@ -9,8 +9,8 @@ use crate::command::{self, CmdResult, OutCtx};
 use crate::output::palette::Palette;
 use crate::output::primitives::{self, sanitize_controls};
 use crate::output::record::{self, Record, RecordField};
-use crate::self_update::SelfUpdateReport;
 use crate::self_update::resolve::Action;
+use crate::self_update::{PostSwap, SelfUpdateReport};
 
 /// Renders `report` in the resolved format.
 pub(crate) fn render(out: &OutCtx, report: &SelfUpdateReport) -> CmdResult {
@@ -25,7 +25,18 @@ pub(crate) fn render(out: &OutCtx, report: &SelfUpdateReport) -> CmdResult {
 
 /// The machine record: a single fixed-shape object, so the JSON contract carries
 /// stable keys across every action (the asset fields render `null` on a no-op).
+/// The phase-2 outcome fields (`restart_attempted`, `verify_outcome`,
+/// `running_version`) are appended after the phase-1 keys, which stay stable.
 fn records(report: &SelfUpdateReport) -> Vec<Record> {
+    // The post-swap outcome, projected to the JSON contract. `restart_attempted`
+    // is true only when a loaded unit was actually restarted; `verify_outcome` is
+    // a stable token, `null` when nothing was swapped (dry run / no-op).
+    let (restart_attempted, verify_outcome) = match &report.post_swap {
+        Some(PostSwap::Verified) => (true, Some("verified")),
+        Some(PostSwap::Failed { .. }) => (true, Some("failed")),
+        Some(PostSwap::NoUnit) => (false, Some("no_unit")),
+        None => (false, None),
+    };
     vec![Record {
         header: None,
         fields: vec![
@@ -39,6 +50,10 @@ fn records(report: &SelfUpdateReport) -> Vec<Record> {
             RecordField::opt("asset_url", report.asset_url.clone()),
             RecordField::opt("asset_sha256", report.asset_sha256.clone()),
             RecordField::bool("dry_run", report.dry_run),
+            RecordField::bool("unit_installed", report.unit_installed),
+            RecordField::bool("restart_attempted", restart_attempted),
+            RecordField::opt("verify_outcome", verify_outcome.map(str::to_string)),
+            RecordField::opt("running_version", report.running_version.clone()),
         ],
     }]
 }
@@ -63,22 +78,75 @@ fn render_human(out: &mut dyn Write, p: &Palette, report: &SelfUpdateReport) -> 
     let target = sanitize_controls(&report.target_version);
     let current = sanitize_controls(&report.current_version);
     match report.action {
-        Action::WouldUpdate => writeln!(
-            out,
-            "Dry run — would update {current} → {target} (nothing downloaded)"
-        )?,
+        Action::WouldUpdate => {
+            writeln!(
+                out,
+                "Dry run — would update {current} → {target} (nothing downloaded)"
+            )?;
+            // The plan's post-swap step, so a dry run says what a real run would do.
+            if report.unit_installed {
+                writeln!(
+                    out,
+                    "Then it would restart the vard service and verify {target} is running."
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "No vard service is loaded, so you would restart your daemon \
+                     (`vard run`) to pick up {target}."
+                )?;
+            }
+        }
         Action::WouldNoOp => writeln!(out, "Dry run — already on {current}; up to date")?,
         Action::NoOp => writeln!(out, "Already on {current}; up to date")?,
         Action::Updated => {
             writeln!(out, "Updated vard {current} → {target}")?;
-            writeln!(
-                out,
-                "A running daemon keeps the old binary until it is restarted — \
-                 run `vard service restart` (or restart `vard run`) to pick up {target}."
-            )?;
+            render_post_swap(out, report, &current, &target)?;
         }
     }
     Ok(())
+}
+
+/// The post-swap tail on a real update: the confirmed restart, the
+/// no-service-loaded hint, or the failed-verify recovery gesture. Never blames
+/// watch state (ADR 0017): a failed verify asserts only that the restarted
+/// daemon's heartbeat did not confirm the new version, and points at the exact
+/// pinned-downgrade command plus the installer fallback.
+fn render_post_swap(
+    out: &mut dyn Write,
+    report: &SelfUpdateReport,
+    current: &str,
+    target: &str,
+) -> io::Result<()> {
+    match &report.post_swap {
+        Some(PostSwap::Verified) => {
+            writeln!(out, "Restarted the vard service; {target} is now running.")
+        }
+        Some(PostSwap::NoUnit) | None => writeln!(
+            out,
+            "No vard service is loaded — the binary is swapped; restart your daemon \
+             (`vard run`) to pick up {target}."
+        ),
+        Some(PostSwap::Failed { reason }) => {
+            let reason = sanitize_controls(reason);
+            writeln!(
+                out,
+                "The binary was swapped, but the restart could not be verified: {reason}."
+            )?;
+            writeln!(
+                out,
+                "The new binary is in place; the daemon may still be on {current}."
+            )?;
+            writeln!(out, "To go back to {current}:")?;
+            writeln!(out, "    vard self-update --version {current}")?;
+            writeln!(out, "or reinstall via the installer:")?;
+            writeln!(
+                out,
+                "    curl --proto '=https' --tlsv1.2 -LsSf \
+                 https://github.com/dbtlr/vard/releases/latest/download/vard-installer.sh | sh"
+            )
+        }
+    }
 }
 
 /// One aligned `  {label}:  {value}` row, with the value sanitized so a crafted
@@ -105,6 +173,9 @@ mod tests {
             asset_sha256: Some("abc123".to_string()),
             dry_run: true,
             action: Action::WouldUpdate,
+            unit_installed: true,
+            post_swap: None,
+            running_version: None,
         }
     }
 
@@ -148,15 +219,103 @@ mod tests {
     }
 
     #[test]
-    fn human_updated_names_the_restart_caveat() {
+    fn json_carries_the_post_swap_outcome_fields() {
         let mut report = sample();
         report.action = Action::Updated;
         report.dry_run = false;
+        report.post_swap = Some(PostSwap::Verified);
+        report.running_version = Some("0.2.0".to_string());
+        let mut buf = Vec::new();
+        record::render_json(&mut buf, &records(&report)).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains(r#""restart_attempted":true"#), "got: {s}");
+        assert!(s.contains(r#""verify_outcome":"verified""#), "got: {s}");
+        assert!(s.contains(r#""running_version":"0.2.0""#), "got: {s}");
+        assert!(s.contains(r#""unit_installed":true"#), "got: {s}");
+    }
+
+    #[test]
+    fn json_nulls_the_post_swap_fields_on_a_dry_run() {
+        // Nothing was swapped, so there is no restart or verify outcome.
+        let s = {
+            let mut buf = Vec::new();
+            record::render_json(&mut buf, &records(&sample())).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert!(s.contains(r#""restart_attempted":false"#), "got: {s}");
+        assert!(s.contains(r#""verify_outcome":null"#), "got: {s}");
+        assert!(s.contains(r#""running_version":null"#), "got: {s}");
+    }
+
+    #[test]
+    fn human_dry_run_names_the_post_swap_plan() {
+        // Unit loaded → restart+verify plan; no unit → manual restart plan.
+        let mut with_unit = sample();
+        with_unit.unit_installed = true;
+        let mut buf = Vec::new();
+        render_human(&mut buf, &Palette::off(), &with_unit).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("restart the vard service"), "got: {s}");
+
+        let mut no_unit = sample();
+        no_unit.unit_installed = false;
+        let mut buf = Vec::new();
+        render_human(&mut buf, &Palette::off(), &no_unit).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("No vard service is loaded"), "got: {s}");
+    }
+
+    #[test]
+    fn human_verified_names_the_running_version() {
+        let mut report = sample();
+        report.action = Action::Updated;
+        report.dry_run = false;
+        report.post_swap = Some(PostSwap::Verified);
         let mut buf = Vec::new();
         render_human(&mut buf, &Palette::off(), &report).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("Updated vard 0.1.0 → 0.2.0"), "got: {s}");
-        assert!(s.contains("restart"), "restart caveat missing: {s}");
+        assert!(s.contains("0.2.0 is now running"), "got: {s}");
+    }
+
+    #[test]
+    fn human_no_unit_says_swapped_restart_your_daemon() {
+        let mut report = sample();
+        report.action = Action::Updated;
+        report.dry_run = false;
+        report.unit_installed = false;
+        report.post_swap = Some(PostSwap::NoUnit);
+        let mut buf = Vec::new();
+        render_human(&mut buf, &Palette::off(), &report).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("restart your daemon"), "got: {s}");
+    }
+
+    #[test]
+    fn human_failed_verify_prints_the_recovery_gesture_without_blaming_watch_state() {
+        let mut report = sample();
+        report.action = Action::Updated;
+        report.dry_run = false;
+        report.post_swap = Some(PostSwap::Failed {
+            reason: "the daemon's health file did not report 0.2.0 running within 5s".to_string(),
+        });
+        let mut buf = Vec::new();
+        render_human(&mut buf, &Palette::off(), &report).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // (a) the swap itself succeeded.
+        assert!(s.contains("Updated vard 0.1.0 → 0.2.0"), "got: {s}");
+        assert!(s.contains("binary was swapped"), "got: {s}");
+        // (c) the exact recovery gesture: pinned downgrade + installer fallback.
+        assert!(
+            s.contains("vard self-update --version 0.1.0"),
+            "recovery pin missing: {s}"
+        );
+        assert!(
+            s.contains("vard-installer.sh"),
+            "installer fallback missing: {s}"
+        );
+        // (b) it never blames watch state.
+        assert!(!s.contains("watch"), "must not mention watch state: {s}");
     }
 
     #[test]

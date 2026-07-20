@@ -175,6 +175,47 @@ fn dispatch(_cmd: ServiceCommand, _env: &OpEnv, _is_tty: bool) -> Result<Vec<Str
     ))
 }
 
+// --- reuse seams for `vard self-update` (VRD-25 phase 2) -------------------
+
+/// Whether a `vard` service unit is installed for this login session — the
+/// LaunchAgent plist (macOS) or the systemd user unit (Linux) exists on disk.
+/// The single "is a unit loaded" probe, the same one doctor's service checks
+/// read; `vard self-update` reuses it after a swap so it never reimplements the
+/// path detection.
+#[cfg(target_os = "macos")]
+pub(crate) fn unit_installed() -> bool {
+    launchd::plist_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// See the macOS variant.
+#[cfg(target_os = "linux")]
+pub(crate) fn unit_installed() -> bool {
+    systemd::unit_path().map(|p| p.exists()).unwrap_or(false)
+}
+
+/// See the macOS variant. No supported service manager here, so no unit.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn unit_installed() -> bool {
+    false
+}
+
+/// Restarts the installed `vard` service unit through the exact machinery `vard
+/// service restart` uses (VRD-24 / ADR 0016): the production side-effect seams,
+/// the platform [`dispatch`], and its own daemon-liveness verify. `vard
+/// self-update` calls this after a swap so it reuses the restart primitive rather
+/// than shelling out to launchctl/systemctl itself. Returns the restart's status
+/// lines on success.
+pub(crate) fn restart_installed() -> Result<Vec<String>, CmdError> {
+    let env = OpEnv {
+        runner: &SystemRunner,
+        liveness: &DaemonLiveness,
+        prompt: &StdinPrompt,
+    };
+    // `is_tty` only gates the Linux linger prompt on install; restart never
+    // prompts, so `false` is safe on every platform.
+    dispatch(ServiceCommand::Restart, &env, false)
+}
+
 // --- injectable seams -----------------------------------------------------
 
 /// The bundle of side-effect seams the operation flows run through, so the flows

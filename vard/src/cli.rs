@@ -488,15 +488,22 @@ target version is a clean success that changes nothing.
 `--dry-run` resolves the target version, artifact, and install path and prints \
 the plan without downloading or changing anything.
 
-A successful update replaces the on-disk binary, but a running daemon keeps \
-executing the old one until it is restarted — the command says so and stops \
-there; restart the daemon (`vard service restart`, or your `vard run`) to pick \
-up the new version. Output follows the global `--format`: a human plan by \
+After a successful swap, if a `vard` service unit is loaded it restarts the \
+daemon and polls the health file until it confirms the new version is running, \
+reporting the confirmed version; with no unit loaded it reports the swap and \
+tells you to restart your own `vard run`. If the restart or the version check \
+does not confirm within the timeout, the swap still succeeded — the command says \
+so and prints the exact recovery gesture (`vard self-update --version \
+<previous>`, or reinstall via the installer) — and exits non-zero. It verifies \
+only the daemon's heartbeat and version, never watch state, so a pre-existing \
+problem is never blamed on the update. `--dry-run` also states what the \
+post-swap step would be. Output follows the global `--format`: a human plan by \
 default, or a stable JSON/JSONL object when piped. Exit codes: 0 on success \
-(updated, already current, or a dry run); 1 when the updater will not proceed \
-and you must act elsewhere (no install receipt, or no release artifact for this \
-platform); 2 on an operational failure (a pinned version that does not exist, or \
-a network, checksum, or swap error).")]
+(updated and verified, already current, or a dry run); 1 when the updater will \
+not proceed and you must act elsewhere (no install receipt, or no release \
+artifact for this platform); 2 on an operational failure (a pinned version that \
+does not exist; a network, checksum, or swap error; or a swap whose post-swap \
+restart/verify could not be confirmed).")]
     SelfUpdate(SelfUpdateArgs),
 
     /// Read and edit vard's configuration: get, set, unset, edit, path.
