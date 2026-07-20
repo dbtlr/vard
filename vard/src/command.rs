@@ -54,6 +54,14 @@ impl CmdError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+
+    /// The process exit code this error maps to (2 for an error, 1 for
+    /// attention). Used by tests to assert the exit class; the binary reads the
+    /// field directly through [`finish`].
+    #[cfg(test)]
+    pub(crate) fn code(&self) -> u8 {
+        self.code
+    }
 }
 
 pub(crate) type CmdResult = Result<(), CmdError>;

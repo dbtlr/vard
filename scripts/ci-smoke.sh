@@ -95,6 +95,14 @@ grep -q 'install' "$TARGET_DIR"/man/vard-service.1 || fail "vard-service.1 does 
 "$VARD" doctor -h | grep -q 'For full help, run' || fail "vard doctor -h missing the v2 short-help footer"
 "$VARD" doctor --help | grep -q 'read-only' || fail "vard doctor --help missing its prose"
 
+# vard self-update (VRD-25): the in-place binary updater. Help renders through
+# the same v2 path. The functional (receipt-gate) assertion is below, once the
+# sandboxed HOME/XDG env is in place — it must block without touching the network.
+"$VARD" self-update -h | grep -q 'For full help, run' || fail "vard self-update -h missing the v2 short-help footer"
+"$VARD" self-update --help | grep -q 'install receipt' || fail "vard self-update --help missing its prose"
+"$VARD" self-update --help | grep -q -- '--version' || fail "vard self-update --help missing the --version flag"
+"$VARD" self-update --help | grep -q -- '--dry-run' || fail "vard self-update --help missing the --dry-run flag"
+
 # vard service (VRD-24): the login-session service command group. Help renders
 # through the same v2 path; the group's five subcommands must all be named.
 # The functional dry-run assertion is below, once the sandboxed HOME/XDG env
@@ -242,6 +250,24 @@ case "$(uname)" in
     : # vard service supports macOS and Linux only; nothing platform-specific to assert here
     ;;
 esac
+
+# vard self-update (VRD-25), functional: the sandboxed config dir has no
+# cargo-dist install receipt, so the receipt gate must block BEFORE any network
+# access, exit 1 (attention), and point at the installer. This proves the gate
+# without ever contacting GitHub.
+if selfupdate_out="$("$VARD" self-update 2>&1)"; then
+  fail "vard self-update without an install receipt must exit non-zero, not 0"
+else
+  test "$?" -eq 1 || fail "vard self-update without a receipt must exit 1 (attention)"
+fi
+printf '%s\n' "$selfupdate_out" | grep -q 'install receipt' \
+  || fail "vard self-update did not report the missing install receipt"
+# --dry-run hits the same gate first, so it also blocks (never touching the network).
+if "$VARD" self-update --dry-run >/dev/null 2>&1; then
+  fail "vard self-update --dry-run without a receipt must exit non-zero"
+else
+  test "$?" -eq 1 || fail "vard self-update --dry-run without a receipt must exit 1"
+fi
 
 # vard config (VRD-17): round-trip a scalar key and locate the config file.
 # config path/get are single-value surfaces (VRD-36): piped (as here) they emit

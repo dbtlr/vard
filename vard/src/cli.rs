@@ -464,6 +464,48 @@ human glyph lines by default, or a stable JSON/JSONL array when piped (a \
 per-watch row carries its own `watch` field).")]
     Doctor(DoctorArgs),
 
+    /// Update the installed vard binary to the latest release, or a pinned
+    /// version. Requires an install from the official vard installer.
+    #[command(disable_help_flag = true)]
+    #[command(long_about = "\
+Update the installed vard binary in place.
+
+Fetches cargo-dist's `dist-manifest.json` from the GitHub release — the latest, \
+or the `--version` you pin — resolves the artifact for this platform, downloads \
+it, verifies its sha256 from the manifest BEFORE unpacking, stages the new \
+binary next to the current one, and replaces it with a single atomic rename. \
+Integrity is TLS plus that sha256; there is no separate signed manifest.
+
+`vard self-update` only works for installs from the official vard installer: it \
+is gated on the cargo-dist install receipt next to your config, so a `cargo \
+install`, a Homebrew install, or a source build is refused with a pointer back \
+to that tooling rather than having its binary swapped underneath it.
+
+`--version <X.Y.Z>` pins a specific version and allows DOWNGRADES — pinning an \
+older version IS the rollback; there is no separate revert. Already being on the \
+target version is a clean success that changes nothing.
+
+`--dry-run` resolves the target version, artifact, and install path and prints \
+the plan without downloading or changing anything.
+
+After a successful swap, if a `vard` service unit is loaded it restarts the \
+daemon and polls the health file until it confirms the new version is running, \
+reporting the confirmed version; with no unit loaded it reports the swap and \
+tells you to restart your own `vard run`. If the restart or the version check \
+does not confirm within the timeout, the swap still succeeded — the command says \
+so and prints the exact recovery gesture (`vard self-update --version \
+<previous>`, or reinstall via the installer) — and exits non-zero. It verifies \
+only the daemon's heartbeat and version, never watch state, so a pre-existing \
+problem is never blamed on the update. `--dry-run` also states what the \
+post-swap step would be. Output follows the global `--format`: a human plan by \
+default, or a stable JSON/JSONL object when piped. Exit codes: 0 on success \
+(updated and verified, already current, or a dry run); 1 when the updater will \
+not proceed and you must act elsewhere (no install receipt, or no release \
+artifact for this platform); 2 on an operational failure (a pinned version that \
+does not exist; a network, checksum, or swap error; or a swap whose post-swap \
+restart/verify could not be confirmed).")]
+    SelfUpdate(SelfUpdateArgs),
+
     /// Read and edit vard's configuration: get, set, unset, edit, path.
     #[command(disable_help_flag = true)]
     #[command(disable_help_subcommand = true)]
@@ -625,6 +667,20 @@ pub struct LogsArgs {
     /// Show the last N lines, spanning rotated logfiles as needed.
     #[arg(short = 'n', long = "lines", value_name = "N", default_value = "50")]
     pub lines: usize,
+}
+
+/// Arguments to `vard self-update`.
+#[derive(Debug, Args)]
+pub struct SelfUpdateArgs {
+    /// Pin a specific version to install instead of the latest. Downgrades are
+    /// allowed — pinning an older version is the rollback.
+    #[arg(long = "version", value_name = "X.Y.Z")]
+    pub version: Option<String>,
+
+    /// Resolve the target version, artifact, and install path and print the
+    /// plan, without downloading or changing anything.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 /// Arguments to `vard doctor`.

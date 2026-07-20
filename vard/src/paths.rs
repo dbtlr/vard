@@ -28,6 +28,14 @@ pub fn config_file() -> Result<PathBuf, HomeNotFound> {
     Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("config.toml"))
 }
 
+/// `$XDG_CONFIG_HOME/vard/vard-receipt.json`, default
+/// `~/.config/vard/vard-receipt.json` — the cargo-dist install receipt written
+/// by the shell installer, next to `config.toml`. Its presence gates
+/// `vard self-update` (VRD-25).
+pub fn self_update_receipt() -> Result<PathBuf, HomeNotFound> {
+    Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("vard-receipt.json"))
+}
+
 /// `$XDG_STATE_HOME/vard`, default `~/.local/state/vard` — health file,
 /// request queue, locks.
 pub fn state_dir() -> Result<PathBuf, HomeNotFound> {

@@ -21,6 +21,14 @@ allow = [
     # inotify / inotify-sys (notify's Linux backend, compiled only on Linux)
     # are ISC-licensed, a simple permissive license in the MIT family.
     "ISC",
+    # subtle (constant-time crypto primitives, pulled in by the rustls TLS
+    # stack the self-update client uses) is BSD-3-Clause — a permissive license
+    # compatible with an MIT project.
+    "BSD-3-Clause",
+    # webpki-roots (the Mozilla CA bundle rustls trusts for the self-update
+    # client's TLS) ships the certificate data under CDLA-Permissive-2.0, a
+    # permissive data license.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

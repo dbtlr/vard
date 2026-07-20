@@ -21,6 +21,12 @@ serde = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
 rustix = { workspace = true }
+# The `vard self-update` client (VRD-25); see the workspace-deps comment.
+ureq = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+xz2 = { workspace = true }
+serde_json = { workspace = true }
 # CLI output + help contract: `anstyle` backs the color palette; `terminal_size`
 # feeds terminal-width wrapping and the pager gate. See `src/output`.
 anstyle = { workspace = true }
@@ -38,6 +44,9 @@ tracing-appender = { workspace = true }
 # Tempdir-isolated tests for the instance lock, operation journal, and the
 # daemon smoke test; mirrors vard-core's dev-dependency.
 tempfile = "3"
+# A local mock HTTP server backing the self-update client's tests (VRD-25), so
+# the manifest/download flow is exercised without touching the real network.
+mockito = "1"
 
 [build-dependencies]
 clap = { workspace = true }

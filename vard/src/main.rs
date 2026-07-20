@@ -17,6 +17,7 @@ mod notify;
 mod output;
 mod paths;
 mod request;
+mod self_update;
 mod service;
 mod status;
 mod watch;
@@ -63,6 +64,7 @@ fn main() -> ExitCode {
         Some(Command::Status(args)) => status::run(args, cli.color, cli.format),
         Some(Command::Logs(args)) => cmd::logs::run(args, cli.color, cli.format),
         Some(Command::Doctor(args)) => doctor::run(cli.color, cli.format, args.offline),
+        Some(Command::SelfUpdate(args)) => self_update::run(args, cli.color, cli.format),
         // A bare `vard config` (no subcommand) prints config's short help, like
         // a bare `vard watch`.
         Some(Command::Config { command: None }) => {
