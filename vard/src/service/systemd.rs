@@ -386,7 +386,9 @@ pub(crate) fn restart(env: &OpEnv, preflight: &PreflightOutcome) -> Result<Vec<S
 mod tests {
     use super::*;
     use crate::service::OpEnv;
-    use crate::service::tests::{FakeLiveness, FakePrompt, FakeRunner, fail, not_spawned, ok};
+    use crate::service::tests::{
+        AlwaysWait, FakeLiveness, FakePrompt, FakeRunner, fail, not_spawned, ok,
+    };
 
     fn env<'a>(
         runner: &'a FakeRunner,
@@ -397,6 +399,8 @@ mod tests {
             runner,
             liveness: live,
             prompt,
+            // systemd flows never bootout→settle; the waiter is never consulted.
+            settle: &AlwaysWait,
         }
     }
 

@@ -182,6 +182,36 @@ fn finish_with_verify(env: &OpEnv, mut lines: Vec<String>) -> Result<Vec<String>
     }
 }
 
+/// Boots out the launchd label and waits for it to actually clear before the
+/// caller re-bootstraps. `launchctl bootout` of a live process is asynchronous:
+/// an immediate `bootstrap` finds the label still registered and fails with EIO
+/// ("Bootstrap failed: 5: Input/output error"). This runs `bootout` (result
+/// ignored — a not-loaded label boots out harmlessly), then polls `launchctl
+/// print` through the shared [`parse_launchctl_print`] until the label is gone
+/// (a ran-and-failed / not-found probe), pacing each wait through the injected
+/// [`SettleWaiter`](super::SettleWaiter) (production `SETTLE_POLL`/`SETTLE_BUDGET`,
+/// instant under test). Budget exhaustion or an unreadable probe both fall
+/// through — the caller bootstraps anyway and lets any real error surface — so
+/// the settle never hangs and never refuses. This is the single place the
+/// bootout→bootstrap discipline lives, shared by `restart`, `start`'s recovery
+/// path, and `install`'s re-install branch so it cannot drift per verb (VRD-59).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bootout_and_settle(env: &OpEnv, target: &str) {
+    let _ = env.runner.run("launchctl", &["bootout", target]);
+    loop {
+        let probe = env.runner.run("launchctl", &["print", target]);
+        if matches!(parse_launchctl_print(&probe), LaunchctlPrint::NotLoaded) {
+            // The label is gone (ran-and-failed / not-found): safe to bootstrap.
+            return;
+        }
+        if !env.settle.keep_waiting() {
+            // Budget spent — the label is still present, or the probe could not
+            // be read. Bootstrap anyway and let its real error surface.
+            return;
+        }
+    }
+}
+
 /// `vard service install`: render and write the plist, bootstrap it into the
 /// login domain (unloading and retrying once for idempotency), and verify the
 /// daemon came up. `--dry-run` prints the plan and touches nothing.
@@ -232,11 +262,10 @@ pub(crate) fn install(
         .runner
         .run("launchctl", &["bootstrap", dom.as_str(), plist_str]);
     if !out.success() {
-        // Already bootstrapped (or a stale prior load): unload and retry once so
-        // a re-install is idempotent.
-        let _ = env
-            .runner
-            .run("launchctl", &["bootout", service_target(uid).as_str()]);
+        // Already bootstrapped (or a stale prior load): boot out, wait for the
+        // label to actually clear, and retry once so a re-install is idempotent
+        // even over a live service (an immediate re-bootstrap would race, VRD-59).
+        bootout_and_settle(env, service_target(uid).as_str());
         let retry = env
             .runner
             .run("launchctl", &["bootstrap", dom.as_str(), plist_str]);
@@ -321,9 +350,8 @@ pub(crate) fn start(
     }
 
     // Any non-running (or unreadable) state: recover with install's proven
-    // bootout → bootstrap sequence, ignoring the bootout result (it fails
-    // harmlessly when nothing is loaded).
-    let _ = env.runner.run("launchctl", &["bootout", target.as_str()]);
+    // bootout → settle → bootstrap sequence, which is race-free from every state.
+    bootout_and_settle(env, target.as_str());
     let dom = domain(uid);
     let plist_str = plist.to_string_lossy();
     let boot = env.runner.run(
@@ -362,10 +390,11 @@ pub(crate) fn stop(env: &OpEnv, uid: u32) -> Result<Vec<String>, CmdError> {
 
 /// `vard service restart`: re-exec the daemon (launchd has no reload signal). A
 /// missing plist advises `vard service install`. Otherwise run `install`'s
-/// proven sequence **unconditionally** — `bootout` (result ignored) →
-/// `bootstrap` → liveness verify — which is correct from every state (running,
-/// stopped, throttled, not loaded) and sidesteps the loaded-state inference that
-/// misfired against a bootstrapped-but-throttled service (VRD-59).
+/// proven sequence **unconditionally** — `bootout` → wait for the label to clear
+/// → `bootstrap` → liveness verify — which is correct from every state (running,
+/// stopped, throttled, not loaded), race-free even over a running daemon, and
+/// sidesteps the loaded-state inference that misfired against a
+/// bootstrapped-but-throttled service (VRD-59).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn restart(
     env: &OpEnv,
@@ -383,9 +412,10 @@ pub(crate) fn restart(
     }
 
     let target = service_target(uid);
-    // Bootout first to clear any prior (possibly throttled) load; a not-loaded
-    // service boots out harmlessly, so the result is deliberately ignored.
-    let _ = env.runner.run("launchctl", &["bootout", target.as_str()]);
+    // Bootout to clear any prior (possibly throttled) load and wait for the label
+    // to actually clear before re-bootstrapping — an immediate bootstrap over a
+    // still-registered label races and fails with EIO (VRD-59).
+    bootout_and_settle(env, &target);
     let dom = domain(uid);
     let plist_str = plist.to_string_lossy();
     let boot = env.runner.run(
@@ -406,7 +436,10 @@ pub(crate) fn restart(
 mod tests {
     use super::*;
     use crate::service::OpEnv;
-    use crate::service::tests::{FakeLiveness, FakePrompt, FakeRunner, fail, ok};
+    use crate::service::SettleWaiter;
+    use crate::service::tests::{
+        AlwaysWait, FakeLiveness, FakePrompt, FakeRunner, FakeSettle, fail, ok,
+    };
 
     fn env<'a>(
         runner: &'a FakeRunner,
@@ -417,6 +450,23 @@ mod tests {
             runner,
             liveness: live,
             prompt,
+            settle: &AlwaysWait,
+        }
+    }
+
+    /// Like [`env`], but with an explicit settle waiter for the bootout→bootstrap
+    /// settle-budget flows.
+    fn env_settle<'a>(
+        runner: &'a FakeRunner,
+        live: &'a FakeLiveness,
+        prompt: &'a FakePrompt,
+        settle: &'a dyn SettleWaiter,
+    ) -> OpEnv<'a> {
+        OpEnv {
+            runner,
+            liveness: live,
+            prompt,
+            settle,
         }
     }
 
@@ -443,6 +493,20 @@ mod tests {
             stderr: String::new(),
             timed_out: false,
         }
+    }
+
+    /// A settle-loop `launchctl print` probe that still sees a live label (a `pid
+    /// = ` line): the booted-out label has not cleared yet, so
+    /// [`bootout_and_settle`] must keep waiting.
+    fn print_present() -> RunOutput {
+        print_ok("com.dbtlr.vard = {\n\tpid = 4242\n\tstate = running\n}\n")
+    }
+
+    /// A settle-loop `launchctl print` probe reporting the label gone (a
+    /// ran-and-failed probe → [`LaunchctlPrint::NotLoaded`]): the cleared state
+    /// [`bootout_and_settle`] waits for, after which it is safe to bootstrap.
+    fn print_cleared() -> RunOutput {
+        fail("Could not find service in domain")
     }
 
     #[test]
@@ -513,8 +577,14 @@ mod tests {
     fn install_reboots_when_already_bootstrapped() {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
-        // First bootstrap fails (already loaded), bootout ok, second bootstrap ok.
-        let runner = FakeRunner::new(vec![fail("service already bootstrapped"), ok(), ok()]);
+        // First bootstrap fails (already loaded), bootout ok, the settle probe
+        // sees the label cleared, second bootstrap ok.
+        let runner = FakeRunner::new(vec![
+            fail("service already bootstrapped"),
+            ok(),
+            print_cleared(),
+            ok(),
+        ]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
@@ -529,9 +599,10 @@ mod tests {
         )
         .unwrap();
         let calls = runner.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(calls[1].starts_with("launchctl bootout gui/501/com.dbtlr.vard"));
-        assert!(calls[2].starts_with("launchctl bootstrap"));
+        assert!(calls[2].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[3].starts_with("launchctl bootstrap"));
     }
 
     #[test]
@@ -559,7 +630,12 @@ mod tests {
     fn install_second_bootstrap_failure_is_operational_error() {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
-        let runner = FakeRunner::new(vec![fail("boom"), ok(), fail("still broken")]);
+        let runner = FakeRunner::new(vec![
+            fail("boom"),
+            ok(),
+            print_cleared(),
+            fail("still broken"),
+        ]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
@@ -743,11 +819,12 @@ mod tests {
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
         // Probe reports a nonzero last exit (throttled/crash-looping), then the
-        // bootout+bootstrap recovery both succeed.
+        // bootout → settle → bootstrap recovery all succeed.
         let runner = FakeRunner::new(vec![
             print_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n"),
-            ok(), // bootout
-            ok(), // bootstrap
+            ok(),            // bootout
+            print_cleared(), // settle probe: label cleared
+            ok(),            // bootstrap
         ]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
@@ -755,10 +832,11 @@ mod tests {
 
         start(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(calls[0].starts_with("launchctl print gui/501/com.dbtlr.vard"));
         assert!(calls[1].starts_with("launchctl bootout gui/501/com.dbtlr.vard"));
-        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
+        assert!(calls[2].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[3].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
@@ -771,6 +849,7 @@ mod tests {
         let runner = FakeRunner::new(vec![
             fail("Could not find service in domain"), // probe -> NotLoaded
             ok(),                                     // bootout
+            print_cleared(),                          // settle probe: label cleared
             ok(),                                     // bootstrap
         ]);
         let live = FakeLiveness(true);
@@ -779,8 +858,8 @@ mod tests {
 
         start(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert_eq!(calls.len(), 3);
-        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
+        assert_eq!(calls.len(), 4);
+        assert!(calls[3].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
@@ -810,18 +889,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
-        // From a bootstrapped-but-throttled state, bootout succeeds then
-        // bootstrap succeeds — the sequence install proved live.
-        let runner = FakeRunner::new(vec![ok(), ok()]);
+        // From a bootstrapped-but-throttled state, bootout succeeds, the settle
+        // probe sees the label cleared, then bootstrap succeeds — the sequence
+        // install proved live.
+        let runner = FakeRunner::new(vec![ok(), print_cleared(), ok()]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
         restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0], "launchctl bootout gui/501/com.dbtlr.vard");
-        assert!(calls[1].starts_with("launchctl bootstrap gui/501"));
+        assert!(calls[1].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
@@ -829,17 +910,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("com.dbtlr.vard.plist");
         fs::write(&plist, "x").unwrap();
-        // bootout fails harmlessly (nothing loaded); its result is ignored and
-        // bootstrap still runs — proving the sequence works from every state.
-        let runner = FakeRunner::new(vec![fail("Boot-out failed: 3: No such process"), ok()]);
+        // bootout fails harmlessly (nothing loaded); its result is ignored, the
+        // settle probe confirms the label is gone, and bootstrap still runs —
+        // proving the sequence works from every state.
+        let runner = FakeRunner::new(vec![
+            fail("Boot-out failed: 3: No such process"),
+            print_cleared(),
+            ok(),
+        ]);
         let live = FakeLiveness(true);
         let prompt = FakePrompt(false);
         let e = env(&runner, &live, &prompt);
 
         restart(&e, 501, &plist, &startable()).unwrap();
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[1].starts_with("launchctl bootstrap gui/501"));
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].starts_with("launchctl bootstrap gui/501"));
     }
 
     #[test]
@@ -869,6 +955,140 @@ mod tests {
         let err = restart(&e, 501, &plist, &refused()).unwrap_err();
         assert!(err.message().contains("vard watch add"));
         assert!(runner.calls().is_empty());
+    }
+
+    // --- bootout → settle → bootstrap (VRD-59) ---------------------------------
+
+    #[test]
+    fn restart_settle_waits_out_probes_that_still_see_the_label() {
+        // The booted-out label lingers for two probes (still `pid = `) before it
+        // finally clears; with an unlimited budget the loop keeps probing and
+        // bootstraps only after the label is gone — after exactly the programmed
+        // probes, never before (an extra probe would exhaust the FakeRunner).
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![
+            ok(),            // bootout
+            print_present(), // settle probe 1: label still live
+            print_present(), // settle probe 2: still live
+            print_cleared(), // settle probe 3: gone
+            ok(),            // bootstrap
+        ]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt); // AlwaysWait: budget never limits
+
+        let lines = restart(&e, 501, &plist, &startable()).unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 5, "bootout, three probes, then bootstrap");
+        assert_eq!(calls[0], "launchctl bootout gui/501/com.dbtlr.vard");
+        assert!(calls[1].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[2].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[3].starts_with("launchctl print gui/501/com.dbtlr.vard"));
+        assert!(calls[4].starts_with("launchctl bootstrap gui/501"));
+        assert!(lines.iter().any(|l| l.contains("Restarted")));
+    }
+
+    #[test]
+    fn restart_bootstraps_after_settle_budget_is_spent_and_surfaces_error() {
+        // The label never clears. After the settle budget is spent (FakeSettle
+        // grants two waits, so three probes see it still present) the flow does
+        // not hang or refuse — it bootstraps anyway and surfaces bootstrap's real
+        // error (the EIO the settle exists to avoid, here unavoidable).
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![
+            ok(),                                            // bootout
+            print_present(),                                 // probe 1 (wait granted)
+            print_present(),                                 // probe 2 (wait granted)
+            print_present(), // probe 3 (budget now spent → fall through)
+            fail("Bootstrap failed: 5: Input/output error"), // bootstrap
+        ]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let settle = FakeSettle::new(2);
+        let e = env_settle(&runner, &live, &prompt, &settle);
+
+        let err = restart(&e, 501, &plist, &startable()).unwrap_err();
+        assert!(err.message().contains("bootstrap failed"));
+        assert!(
+            err.message().contains("Bootstrap failed: 5"),
+            "bootstrap's real error must surface: {}",
+            err.message()
+        );
+        let probes = runner
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("launchctl print"))
+            .count();
+        assert_eq!(probes, 3, "budget of 2 waits allows exactly 3 probes");
+    }
+
+    #[test]
+    fn start_recovery_waits_for_the_bootout_to_settle() {
+        // start's recovery path shares bootout_and_settle: after the initial
+        // state probe reports non-running, the booted-out label lingers for one
+        // probe before clearing, and only then does bootstrap run.
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![
+            print_ok("com.dbtlr.vard = {\n\tlast exit code = 2\n\tstate = not running\n}\n"),
+            ok(),            // bootout
+            print_present(), // settle probe 1: label still live
+            print_cleared(), // settle probe 2: gone
+            ok(),            // bootstrap
+        ]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        start(&e, 501, &plist, &startable()).unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 5);
+        assert!(calls[0].starts_with("launchctl print gui/501")); // initial state probe
+        assert!(calls[1].starts_with("launchctl bootout gui/501"));
+        assert!(calls[2].starts_with("launchctl print gui/501")); // settle probe 1
+        assert!(calls[3].starts_with("launchctl print gui/501")); // settle probe 2
+        assert!(calls[4].starts_with("launchctl bootstrap gui/501"));
+    }
+
+    #[test]
+    fn install_reinstall_waits_for_the_bootout_to_settle() {
+        // install's re-install branch shares bootout_and_settle: the first
+        // bootstrap fails (already loaded), bootout runs, the label lingers for
+        // one probe before clearing, and only then does the retry bootstrap run.
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        let runner = FakeRunner::new(vec![
+            fail("service already bootstrapped"), // first bootstrap
+            ok(),                                 // bootout
+            print_present(),                      // settle probe 1: label still live
+            print_cleared(),                      // settle probe 2: gone
+            ok(),                                 // retry bootstrap
+        ]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        install(
+            &e,
+            501,
+            &plist,
+            Path::new("/usr/local/bin/vard"),
+            false,
+            &startable(),
+        )
+        .unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 5);
+        assert!(calls[0].starts_with("launchctl bootstrap gui/501"));
+        assert!(calls[1].starts_with("launchctl bootout gui/501"));
+        assert!(calls[2].starts_with("launchctl print gui/501")); // settle probe 1
+        assert!(calls[3].starts_with("launchctl print gui/501")); // settle probe 2
+        assert!(calls[4].starts_with("launchctl bootstrap gui/501")); // retry
     }
 
     // --- launchctl print parser (moved from doctor; single source of truth) ---

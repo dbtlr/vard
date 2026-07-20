@@ -63,6 +63,14 @@ const VERIFY_POLL: Duration = Duration::from_millis(100);
 /// Poll interval while waiting for a timed-out subprocess to die.
 const KILL_POLL: Duration = Duration::from_millis(20);
 
+/// Wall-clock cap on the launchd bootout→bootstrap settle wait (VRD-59): how
+/// long to poll for a booted-out label to actually clear before bootstrapping
+/// anyway and letting any real error surface.
+const SETTLE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Interval between `launchctl print` probes while waiting out [`SETTLE_BUDGET`].
+const SETTLE_POLL: Duration = Duration::from_millis(150);
+
 /// Production entry point for `vard service <subcommand>`.
 pub(crate) fn run(cmd: ServiceCommand, color: ColorWhen, format: Option<OutputFormat>) -> ExitCode {
     command::finish(run_inner(cmd, color, format))
@@ -90,6 +98,7 @@ fn run_inner(cmd: ServiceCommand, color: ColorWhen, format: Option<OutputFormat>
         runner: &SystemRunner,
         liveness: &DaemonLiveness,
         prompt: &StdinPrompt,
+        settle: &SystemSettle::new(),
     };
 
     let lines = dispatch(cmd, &env, is_tty)?;
@@ -281,6 +290,7 @@ pub(crate) fn restart_installed() -> Result<Vec<String>, CmdError> {
         runner: &SystemRunner,
         liveness: &DaemonLiveness,
         prompt: &StdinPrompt,
+        settle: &SystemSettle::new(),
     };
     // `is_tty` only gates the Linux linger prompt on install; restart never
     // prompts, so `false` is safe on every platform.
@@ -298,6 +308,9 @@ pub(crate) struct OpEnv<'a> {
     pub(crate) liveness: &'a dyn Liveness,
     /// Asks the user a yes/no question (the Linux linger consent prompt).
     pub(crate) prompt: &'a dyn Prompt,
+    /// Paces the launchd bootout→bootstrap settle poll (VRD-59): sleeps the poll
+    /// interval and reports whether the settle budget still has room.
+    pub(crate) settle: &'a dyn SettleWaiter,
 }
 
 /// The captured result of a service-manager subprocess.
@@ -354,6 +367,19 @@ pub(crate) trait Prompt {
     fn confirm(&self, question: &str) -> bool;
 }
 
+/// Paces the launchd bootout→bootstrap settle loop (VRD-59). `launchctl bootout`
+/// of a live process is asynchronous: an immediate `bootstrap` finds the label
+/// still registered and fails with EIO ("Bootstrap failed: 5"). The settle loop
+/// re-probes until the label clears, sleeping this interval between probes and
+/// stopping when the budget is spent. Injected so the loop is deterministic and
+/// instant under test.
+pub(crate) trait SettleWaiter {
+    /// Called once after each probe that still sees the label. Sleeps the poll
+    /// interval and returns `true` to keep polling, or `false` when the settle
+    /// budget is exhausted (the caller then bootstraps anyway).
+    fn keep_waiting(&self) -> bool;
+}
+
 /// The production [`Runner`]: a timeout-bounded subprocess that drains both
 /// pipes and kills the process group on the deadline (the bounded-probe pattern
 /// vard-core's `git_output_timed` uses).
@@ -385,6 +411,37 @@ impl Liveness for DaemonLiveness {
             }
             std::thread::sleep(VERIFY_POLL);
         }
+    }
+}
+
+/// The production [`SettleWaiter`]: sleeps [`SETTLE_POLL`] between probes and
+/// caps the whole settle at [`SETTLE_BUDGET`]. The deadline is established lazily
+/// on the first call — one `vard service` command runs at most one settle, so a
+/// per-`OpEnv` waiter with a lazily-initialized deadline is correct.
+struct SystemSettle {
+    deadline: std::cell::Cell<Option<Instant>>,
+}
+
+impl SystemSettle {
+    fn new() -> SystemSettle {
+        SystemSettle {
+            deadline: std::cell::Cell::new(None),
+        }
+    }
+}
+
+impl SettleWaiter for SystemSettle {
+    fn keep_waiting(&self) -> bool {
+        let deadline = self.deadline.get().unwrap_or_else(|| {
+            let d = Instant::now() + SETTLE_BUDGET;
+            self.deadline.set(Some(d));
+            d
+        });
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SETTLE_POLL);
+        Instant::now() < deadline
     }
 }
 
@@ -675,6 +732,35 @@ mod tests {
     impl Prompt for FakePrompt {
         fn confirm(&self, _question: &str) -> bool {
             self.0
+        }
+    }
+
+    /// A [`SettleWaiter`] that never runs out of budget — the default for flows
+    /// whose programmed probes reach the cleared state before any real timeout.
+    pub(crate) struct AlwaysWait;
+    impl SettleWaiter for AlwaysWait {
+        fn keep_waiting(&self) -> bool {
+            true
+        }
+    }
+
+    /// A [`SettleWaiter`] that grants `n` waits, then reports the budget spent —
+    /// so a "label never clears" flow deterministically falls through to a
+    /// bootstrap attempt after a known number of probes, with no real sleeping.
+    pub(crate) struct FakeSettle(pub(crate) std::cell::Cell<u32>);
+    impl FakeSettle {
+        pub(crate) fn new(waits: u32) -> FakeSettle {
+            FakeSettle(std::cell::Cell::new(waits))
+        }
+    }
+    impl SettleWaiter for FakeSettle {
+        fn keep_waiting(&self) -> bool {
+            let remaining = self.0.get();
+            if remaining == 0 {
+                return false;
+            }
+            self.0.set(remaining - 1);
+            true
         }
     }
 
