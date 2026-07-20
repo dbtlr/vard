@@ -63,7 +63,7 @@ pub(crate) fn fetch(url: &str) -> Result<DistManifest, String> {
 fn fetch_body(url: &str) -> Result<Vec<u8>, String> {
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        match ureq::get(url).call() {
+        match super::http::agent().get(url).call() {
             Ok(response) => {
                 let mut buf = Vec::new();
                 response

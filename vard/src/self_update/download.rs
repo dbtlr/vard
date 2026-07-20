@@ -27,7 +27,7 @@ const BIN_NAME: &str = match option_env!("CARGO_BIN_NAME") {
 pub(crate) fn download_to(url: &str, dest: &Path) -> Result<(), String> {
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        match ureq::get(url).call() {
+        match super::http::agent().get(url).call() {
             Ok(response) => {
                 let mut reader = response.into_reader();
                 let mut file = fs::File::create(dest)
