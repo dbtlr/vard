@@ -365,13 +365,24 @@ pub(crate) fn stop(env: &OpEnv) -> Result<Vec<String>, CmdError> {
     ])
 }
 
-/// `vard service restart`: `restart` the unit and verify. `systemctl --user
-/// restart` is state-agnostic (it starts a stopped unit and restarts a running
-/// one), so no state inference is needed here — the VRD-59 launchd fix has no
-/// systemd parallel.
+/// `vard service restart`: refuse up front if `vard run` itself could not start
+/// (the VRD-58 pre-flight), then run [`restart_unchecked`].
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn restart(env: &OpEnv, preflight: &PreflightOutcome) -> Result<Vec<String>, CmdError> {
     preflight.require_startable()?;
+    restart_unchecked(env)
+}
+
+/// The `restart` + verify mechanics *without* the VRD-58 config pre-flight.
+/// `systemctl --user restart` is state-agnostic (it starts a stopped unit and
+/// restarts a running one), so no state inference is needed here — the VRD-59
+/// launchd fix has no systemd parallel. `vard service restart` calls this behind
+/// its pre-flight gate; `vard self-update`'s post-swap restart
+/// ([`crate::service::restart_installed`]) calls it directly, because per ADR
+/// 0017 the updater verifies and reports and must never surface a watch-state
+/// refusal.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn restart_unchecked(env: &OpEnv) -> Result<Vec<String>, CmdError> {
     let out = systemctl(env, &["restart", UNIT]);
     if !out.success() {
         return Err(CmdError::err(format!(
@@ -766,6 +777,26 @@ WantedBy=default.target
 
         let err = restart(&e, &startable()).unwrap_err();
         assert!(err.message().contains("did not come up"));
+    }
+
+    #[test]
+    fn restart_unchecked_skips_preflight_and_never_judges_watch_state() {
+        // The post-swap reuse seam (`vard self-update` → restart_installed →
+        // restart_unchecked) restarts *below* the VRD-58 pre-flight gate: it
+        // takes no PreflightOutcome, so no config is consulted and no watch-state
+        // refusal can surface (ADR 0017). Just `systemctl --user restart` + verify.
+        let runner = FakeRunner::new(vec![ok()]);
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = restart_unchecked(&e).unwrap();
+        assert_eq!(runner.calls()[0], "systemctl --user restart vard.service");
+        assert!(lines.iter().any(|l| l.contains("Restarted")));
+        assert!(
+            !lines.iter().any(|l| l.to_lowercase().contains("watch")),
+            "post-swap restart must never judge watch state: {lines:?}"
+        );
     }
 
     #[test]

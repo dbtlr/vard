@@ -388,13 +388,9 @@ pub(crate) fn stop(env: &OpEnv, uid: u32) -> Result<Vec<String>, CmdError> {
     }
 }
 
-/// `vard service restart`: re-exec the daemon (launchd has no reload signal). A
-/// missing plist advises `vard service install`. Otherwise run `install`'s
-/// proven sequence **unconditionally** — `bootout` → wait for the label to clear
-/// → `bootstrap` → liveness verify — which is correct from every state (running,
-/// stopped, throttled, not loaded), race-free even over a running daemon, and
-/// sidesteps the loaded-state inference that misfired against a
-/// bootstrapped-but-throttled service (VRD-59).
+/// `vard service restart`: re-exec the daemon (launchd has no reload signal).
+/// Refuses up front if `vard run` itself could not start (the VRD-58 pre-flight),
+/// then runs [`restart_unchecked`].
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn restart(
     env: &OpEnv,
@@ -402,9 +398,31 @@ pub(crate) fn restart(
     plist: &Path,
     preflight: &PreflightOutcome,
 ) -> Result<Vec<String>, CmdError> {
-    // Refuse before touching launchd if `vard run` itself could not start.
+    // Refuse before touching launchd if `vard run` itself could not start. The
+    // internal reuse seam ([`restart_unchecked`]) deliberately skips this gate —
+    // see its doc — so `vard self-update`'s post-swap restart never judges watch
+    // state (ADR 0017).
     preflight.require_startable()?;
+    restart_unchecked(env, uid, plist)
+}
 
+/// The restart mechanics *without* the VRD-58 config pre-flight: a missing plist
+/// advises `vard service install`, otherwise run `install`'s proven sequence
+/// **unconditionally** — `bootout` → wait for the label to clear → `bootstrap` →
+/// liveness verify — which is correct from every state (running, stopped,
+/// throttled, not loaded), race-free even over a running daemon, and sidesteps
+/// the loaded-state inference that misfired against a bootstrapped-but-throttled
+/// service (VRD-59). `vard service restart` calls this behind its pre-flight
+/// gate; `vard self-update`'s post-swap restart
+/// ([`crate::service::restart_installed`]) calls it directly, because per ADR
+/// 0017 the updater verifies and reports and must never surface a watch-state
+/// refusal.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn restart_unchecked(
+    env: &OpEnv,
+    uid: u32,
+    plist: &Path,
+) -> Result<Vec<String>, CmdError> {
     if !plist.exists() {
         return Err(CmdError::err(
             "no vard service is installed — run `vard service install` first",
@@ -955,6 +973,40 @@ mod tests {
         let err = restart(&e, 501, &plist, &refused()).unwrap_err();
         assert!(err.message().contains("vard watch add"));
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn restart_unchecked_skips_preflight_and_never_judges_watch_state() {
+        // The post-swap reuse seam (`vard self-update` → restart_installed →
+        // restart_unchecked) restarts *below* the VRD-58 pre-flight gate: it
+        // takes no PreflightOutcome, so even when the daemon config has no
+        // watches / is missing — the state the user-facing pre-flight refuses on
+        // — it still runs the bootout → settle → bootstrap sequence and never
+        // surfaces a watch-state reason (ADR 0017: the updater verifies and
+        // reports, it never judges).
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("com.dbtlr.vard.plist");
+        fs::write(&plist, "x").unwrap();
+        let runner = FakeRunner::new(vec![ok(), print_cleared(), ok()]); // bootout, settle, bootstrap
+        let live = FakeLiveness(true);
+        let prompt = FakePrompt(false);
+        let e = env(&runner, &live, &prompt);
+
+        let lines = restart_unchecked(&e, 501, &plist).unwrap();
+        let calls = runner.calls();
+        // The very first launchctl call is the bootout — no refusal precedes it.
+        assert_eq!(calls[0], "launchctl bootout gui/501/com.dbtlr.vard");
+        assert!(
+            calls
+                .last()
+                .unwrap()
+                .starts_with("launchctl bootstrap gui/501")
+        );
+        assert!(lines.iter().any(|l| l.contains("Restarted")));
+        assert!(
+            !lines.iter().any(|l| l.to_lowercase().contains("watch")),
+            "post-swap restart must never judge watch state: {lines:?}"
+        );
     }
 
     // --- bootout → settle → bootstrap (VRD-59) ---------------------------------

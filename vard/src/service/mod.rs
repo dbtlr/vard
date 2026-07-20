@@ -292,9 +292,39 @@ pub(crate) fn restart_installed() -> Result<Vec<String>, CmdError> {
         prompt: &StdinPrompt,
         settle: &SystemSettle::new(),
     };
-    // `is_tty` only gates the Linux linger prompt on install; restart never
-    // prompts, so `false` is safe on every platform.
-    dispatch(ServiceCommand::Restart, &env, false)
+    // Restart *below* the user-facing pre-flight gate: `vard self-update`'s
+    // post-swap restart verifies and reports and must never surface the VRD-58
+    // watch-state refusal (ADR 0017). The user-facing `vard service restart`
+    // (through `dispatch`) keeps the pre-flight exactly as-is.
+    restart_unit(&env)
+}
+
+/// Restarts the installed unit through the platform restart mechanics *without*
+/// the VRD-58 daemon-startup pre-flight — the seam [`restart_installed`] reuses
+/// so `vard self-update`'s post-swap restart never judges watch state (ADR 0017).
+/// The user-facing `vard service restart` reaches the same mechanics through
+/// [`dispatch`], which applies the pre-flight refusal first.
+#[cfg(target_os = "macos")]
+fn restart_unit(env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    let uid = rustix::process::getuid().as_raw();
+    let plist = launchd::plist_path()?;
+    launchd::restart_unchecked(env, uid, &plist)
+}
+
+/// See the macOS variant.
+#[cfg(target_os = "linux")]
+fn restart_unit(env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    systemd::ensure_reachable(env)?;
+    systemd::restart_unchecked(env)
+}
+
+/// See the macOS variant. No supported service manager here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn restart_unit(_env: &OpEnv) -> Result<Vec<String>, CmdError> {
+    Err(CmdError::err(
+        "vard service is supported on macOS (launchd) and Linux (systemd) only; run `vard run` \
+         under your platform's own supervisor",
+    ))
 }
 
 // --- injectable seams -----------------------------------------------------
