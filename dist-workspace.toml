@@ -7,10 +7,6 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# TEMPORARY (VRD-63 verification): run full build-and-upload on this PR so
-# both musl legs actually compile ring/lzma-sys under CI, not just `dist
-# plan`. Revert to the default ("plan") once the run is green.
-pr-run-mode = "upload"
 # Extra steps injected into every generated release-build job (right after
 # checkout, before `dist build`); wires the musl C toolchain the Linux legs
 # need for C-compiled deps (lzma-sys, ring). See .github/build-setup.yml.
