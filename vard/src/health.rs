@@ -126,6 +126,16 @@ use crate::instance::{self, DaemonProbe};
 /// per-watch `[[suppression]]` telemetry table.
 pub(crate) const VERSION: u32 = 2;
 
+/// The running daemon's own binary version (`CARGO_PKG_VERSION`), stamped into
+/// every health document it writes (VRD-25 phase 2) so a post-swap `vard
+/// self-update` can confirm the restarted daemon is the target version. It is an
+/// *additive, optional* field: a document written by an older daemon omits it and
+/// every reader tolerates that (`#[serde(default)]`), so it does **not** move the
+/// schema [`VERSION`] — the module's policy bumps only on a breaking shape change,
+/// and the `collect` gate compares versions exactly (a bump would make a newer
+/// reader reject an older daemon's document, the opposite of what this needs).
+pub(crate) const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// How often the daemon rewrites the health file even when nothing changed, to
 /// refresh `written_at`. `vard notify` uses a multiple of this
 /// ([`STALE_AFTER_SECS`]) to decide the document is stale.
@@ -144,6 +154,13 @@ pub(crate) struct HealthDoc {
     pub version: u32,
     /// Unix seconds at which the daemon last wrote this document.
     pub written_at: u64,
+    /// The version of the daemon binary that wrote this document
+    /// ([`DAEMON_VERSION`]). Additive and optional (VRD-25 phase 2): a document
+    /// written by a daemon too old to stamp it omits the field and it reads as
+    /// `None`. Declared before the array fields so it stays in the top TOML table
+    /// rather than folding into a trailing `[[problem]]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
     /// The current problems, one per troubled watch. Empty when every watch is
     /// healthy. Renamed to `problem` in the TOML so the array reads as
     /// `[[problem]]`.
@@ -443,6 +460,7 @@ pub(crate) fn doc_from_states(
     HealthDoc {
         version: VERSION,
         written_at: now,
+        daemon_version: Some(DAEMON_VERSION.to_string()),
         problems,
         suppressions: Vec::new(),
     }
@@ -586,6 +604,16 @@ pub(crate) fn read(path: &Path) -> Result<Option<HealthDoc>, String> {
     toml::from_str(&text)
         .map(Some)
         .map_err(|e| format!("parsing health file {}: {e}", path.display()))
+}
+
+/// The daemon binary version recorded in the health document at `path`, or
+/// `None` when the file is absent, unparseable, or was written by a daemon too
+/// old to stamp it (VRD-25 phase 2). `vard self-update` polls this after a
+/// service restart to confirm the swap took effect — it reads only the version
+/// stamp, never a watch state, so a pre-existing degradation is never mistaken
+/// for an update failure.
+pub(crate) fn read_daemon_version(path: &Path) -> Option<String> {
+    read(path).ok().flatten().and_then(|doc| doc.daemon_version)
 }
 
 /// The health file's modification time in unix seconds, or `None` when it is
@@ -992,6 +1020,47 @@ mod tests {
         let text = toml::to_string(&doc).unwrap();
         let back: HealthDoc = toml::from_str(&text).unwrap();
         assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn doc_from_states_stamps_the_running_daemon_version() {
+        let doc = doc_from_states(&[status("v", WatchState::Ok, None, "")], &[], 2000);
+        assert_eq!(doc.daemon_version.as_deref(), Some(DAEMON_VERSION));
+        assert_eq!(
+            doc.version, VERSION,
+            "an additive field does not bump the schema"
+        );
+    }
+
+    #[test]
+    fn a_document_with_the_version_stamp_round_trips_through_toml() {
+        let doc = doc_from_states(&[status("v", WatchState::Ok, None, "")], &[], 2000);
+        let text = toml::to_string(&doc).unwrap();
+        let back: HealthDoc = toml::from_str(&text).unwrap();
+        assert_eq!(back, doc);
+        assert_eq!(back.daemon_version.as_deref(), Some(DAEMON_VERSION));
+    }
+
+    #[test]
+    fn a_document_without_the_version_stamp_is_tolerated() {
+        // A document written by a daemon too old to stamp its version (a bare v2
+        // doc) parses with `daemon_version = None`, so every reader keeps working.
+        let doc: HealthDoc = toml::from_str("version = 2\nwritten_at = 1\n").unwrap();
+        assert_eq!(doc.daemon_version, None);
+    }
+
+    #[test]
+    fn read_daemon_version_reads_the_stamp_and_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health");
+        assert_eq!(read_daemon_version(&path), None, "missing file → None");
+
+        std::fs::write(&path, "version = 2\nwritten_at = 1\n").unwrap();
+        assert_eq!(read_daemon_version(&path), None, "no stamp → None");
+
+        let doc = doc_from_states(&[status("v", WatchState::Ok, None, "")], &[], 2000);
+        write(&path, &doc).unwrap();
+        assert_eq!(read_daemon_version(&path).as_deref(), Some(DAEMON_VERSION));
     }
 
     #[test]
