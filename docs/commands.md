@@ -49,6 +49,7 @@ vard commands share a three-value exit convention:
 | [`run`](commands/run.md) | Run the vard daemon in the foreground: watch every active configured directory and snapshot changes until stopped. |
 | [`logs`](commands/logs.md) | Show the vard daemon's own log — the rolling logfile it writes while running. |
 | [`service`](commands/service.md) | Run vard as a login-session service — install, uninstall, start, stop, restart the daemon under launchd or systemd. |
+| [`self-update`](commands/self-update.md) | Update the installed vard binary to the latest release, or a pinned version (downgrades allowed). |
 
 ## Watch and snapshot
 

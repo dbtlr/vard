@@ -242,6 +242,7 @@ pub fn render_parsed_help(cli: &Cli) -> Option<i32> {
         Command::Status(_) => "status",
         Command::Logs(_) => "logs",
         Command::Doctor(_) => "doctor",
+        Command::SelfUpdate(_) => "self-update",
         Command::Config { .. } => "config",
         Command::Service { .. } => "service",
     });
