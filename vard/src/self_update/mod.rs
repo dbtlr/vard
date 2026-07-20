@@ -413,7 +413,10 @@ fn wait_for_version(health_file: &Path, target: &str, timeout: Duration, poll: D
 fn apply(cfg: &RunConfig, target_version: &str, url: &str, sha: &str) -> Result<(), CmdError> {
     let archive =
         download::sibling_temp_path(&cfg.install_path, &format!("{target_version}.tar.xz"));
-    download::download_to(url, &archive).map_err(CmdError::err)?;
+    if let Err(e) = download::download_to(url, &archive) {
+        let _ = std::fs::remove_file(&archive);
+        return Err(CmdError::err(e));
+    }
 
     if let Err(e) = download::verify_sha256(&archive, sha) {
         let _ = std::fs::remove_file(&archive);
@@ -759,6 +762,45 @@ mod tests {
             err.message()
         );
         // The current binary is byte-for-byte untouched, and nothing is staged.
+        assert_eq!(std::fs::read(&cfg.install_path).unwrap(), b"ORIGINAL");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("self-update"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn download_failure_mid_stream_cleans_up_the_partial_archive() {
+        let tarball = tarball_bytes(b"never fully arrives");
+        let sha = sha256_hex(&tarball);
+
+        let mut server = mockito::Server::new();
+        let _m1 = server
+            .mock("GET", "/latest/download/dist-manifest.json")
+            .with_status(200)
+            .with_body(manifest_body("v0.2.0", &sha))
+            .create();
+        // Send a few bytes, then abort the chunked stream mid-body so the
+        // client's streaming copy fails after the temp file already exists.
+        let _m2 = server
+            .mock("GET", "/download/v0.2.0/vard-aarch64-apple-darwin.tar.xz")
+            .with_status(200)
+            .with_chunked_body(|w| {
+                w.write_all(b"partial bytes")?;
+                Err(std::io::Error::other("connection dropped"))
+            })
+            .create();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(tmp.path(), server.url());
+        std::fs::write(&cfg.install_path, b"ORIGINAL").unwrap();
+        cfg.current_version = "0.1.0".to_string();
+
+        let err = perform(&cfg).unwrap_err();
+        assert_eq!(err.code(), 2, "a failed download is an operational error");
+        // The current binary is untouched and the partial archive is removed.
         assert_eq!(std::fs::read(&cfg.install_path).unwrap(), b"ORIGINAL");
         let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
