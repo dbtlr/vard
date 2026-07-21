@@ -389,8 +389,9 @@ nothing.")]
     Logs(LogsArgs),
 
     /// Diagnose the local vard environment read-only: git, inotify limits,
-    /// health-file freshness, request-queue hygiene, a per-watch secret audit,
-    /// systemd linger, and service-context agent reachability.
+    /// health-file freshness, daemon/binary version skew, request-queue
+    /// hygiene, a per-watch secret audit, systemd linger, and service-context
+    /// agent reachability.
     #[command(disable_help_flag = true)]
     #[command(long_about = "\
 Diagnose the local vard environment, read-only.
@@ -414,6 +415,13 @@ probe, which `--offline` skips):
   health-file   whether the daemon's health file is fresh; a running daemon
                 whose file has gone stale `warn`s. A daemon that is not running
                 is a legitimate state, reported `ok` with a note
+  daemon-version whether a running daemon's version matches the installed
+                binary. launchd (and every install path but `vard self-update`)
+                never restarts a service when its binary is swapped, so a stale
+                daemon can run indefinitely. Same version is `ok`; a differing
+                version — or a daemon too old to report one (pre-0.2.0) —
+                `warn`s with `vard service restart`. No running daemon (or a
+                stale/starting one) is `skipped` — nothing to compare
   request-dir   stale files in the request queue; `warn`s with the file names,
                 distinguishing crashed-writer temp files (safe to delete),
                 settled requests piling up unconsumed (usually: no daemon

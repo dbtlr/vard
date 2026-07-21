@@ -158,3 +158,55 @@ fn doctor_is_read_only_and_reports_a_clean_repo_ok() {
         assert_eq!(entries.count(), 0, "doctor must not write a request file");
     }
 }
+
+/// A running daemon whose stamped version differs from the installed binary is
+/// version skew launchd never restarts away on a binary swap (VRD-72): the
+/// `daemon-version` check `warn`s and names `vard service restart`. Fabricated
+/// by spawning the real daemon (so the instance lock is held and `collect`
+/// reports it running) and then overwriting its health file with a differing,
+/// fresh `daemon_version` — the daemon is on a 24h interval, so it sits idle and
+/// never overwrites the injected file.
+#[test]
+fn daemon_version_skew_warns_with_the_restart_hint() {
+    let env = Env::new();
+    let repo = env.root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert!(
+        git_in(&env, &repo, &["init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        git_in(&env, &repo, &["commit", "--allow-empty", "-m", "root"])
+            .status
+            .success()
+    );
+    env.write_config(&format!(
+        "version = 1\n\n[[watch]]\nname = \"vault\"\npath = {repo:?}\ntrigger = \"interval\"\ninterval = \"24h\"\n"
+    ));
+
+    let _daemon = env.spawn_daemon();
+    // Overwrite the health file with a fresh document stamped with a version the
+    // running binary can never be (a differing, older stamp).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        env.health_file(),
+        format!("version = 2\nwritten_at = {now}\ndaemon_version = \"0.0.1\"\n"),
+    )
+    .unwrap();
+
+    let out = env.vard(&["--format", "json", "doctor"]);
+    let json = stdout(&out);
+    assert_eq!(code(&out), 1, "a version-skew warn folds exit 1: {json}");
+    assert!(
+        json.contains(r#""check":"daemon-version","status":"warn""#),
+        "the daemon-version check must warn on skew: {json}"
+    );
+    assert!(
+        json.contains("0.0.1") && json.contains("vard service restart"),
+        "it must name the stamped version and the fix: {json}"
+    );
+}
