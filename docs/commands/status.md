@@ -37,6 +37,8 @@ A list surface (records/json/jsonl). The first line reports the daemon; each wat
 
 The **daemon** line is one of: running, not running, starting, stopping, or — when a running daemon's health file has gone stale — stale.
 
+A running daemon whose version does not match the installed `vard` binary is flagged on this same line: the summary reads `running, but …` and names both versions with the fix (`vard service restart`), and the line counts as attention (exit 1). This is **version skew** — the binary was replaced (`cargo install`, `curl | sh`, a manual copy) without restarting the daemon, so a stale daemon keeps running; only [`vard self-update`](self-update.md) restarts the daemon after a swap. A daemon too old to report a version at all (pre-0.2.0) is flagged the same way. [`vard doctor`](doctor.md) carries the same check as its own `daemon-version` row.
+
 Each **watch** row shows one state (a watch with several problems contributes one such row per problem):
 
 | State | Meaning |

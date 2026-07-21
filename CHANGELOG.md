@@ -13,6 +13,15 @@ Entries here have landed on `main` but have not yet been cut into a tagged
 release. When a release is cut, this section is promoted to
 `## v0.X.0 - YYYY-MM-DD` and a fresh `## [Unreleased]` header is added above it.
 
+### Added
+
+- `vard doctor` gains a `daemon-version` check and `vard status` surfaces the
+  same skew on the daemon line: a running daemon whose version differs from the
+  installed binary (or one too old to report a version) `warn`s with a
+  `vard service restart` hint. Every install path except `vard self-update` —
+  `cargo install`, `curl | sh`, a manual copy — replaces the binary without
+  restarting the daemon, so a stale daemon could otherwise run unnoticed.
+
 ## v0.2.0 - 2026-07-21
 
 ### Added

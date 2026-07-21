@@ -1,6 +1,6 @@
 ---
 title: doctor
-description: Diagnose the local vard environment read-only — git, inotify limits, health-file freshness, request-queue hygiene, a per-watch secret audit, a per-watch remote-auth probe, systemd linger, and service-context agent reachability.
+description: Diagnose the local vard environment read-only — git, inotify limits, health-file freshness, daemon/binary version skew, request-queue hygiene, a per-watch secret audit, a per-watch remote-auth probe, systemd linger, and service-context agent reachability.
 ---
 
 # vard doctor
@@ -29,6 +29,7 @@ Every check but `remote-auth` is local; `remote-auth` is the one that touches th
 | `git` | The `git` executable is on `PATH` and new enough. vard's snapshot log format reads the trigger trailer with `%(trailers:key=…,valueonly)`, which needs **git 2.22+**; an older git `warn`s and a missing git `fail`s. |
 | `inotify` | **Linux only.** The kernel's inotify limits (`max_user_watches`, `max_user_instances`) against how many directories the configured watches would register (the notify backend watches every directory in a tree recursively, one watch descriptor each). It `warn`s once the totals reach 80% of either limit. On macOS this is `skipped` — vard uses FSEvents there, which has no such per-user limit. |
 | `health-file` | Whether the daemon's health file is fresh. A running daemon whose file has gone stale (past the staleness window) `warn`s — it may be wedged or unable to write. A daemon that is **not** running is a legitimate state, reported `ok` with a note (start one with [`vard run`](run.md)). |
+| `daemon-version` | Whether a running daemon's version matches the installed binary. launchd (and every install path but [`vard self-update`](self-update.md)) never restarts a service when its binary is swapped, so a stale daemon can run indefinitely with nothing surfacing it. See [daemon version](#daemon-version) below. |
 | `request-dir` | Stale entries in the request queue, older than the request staleness window. Three distinct cases, all `warn`, all flag-only (doctor never deletes): **crashed-writer leftovers** — files matching vard's own atomic-write temp scheme (`.<name>.tmp-<pid>`) that an interrupted write stranded, safe to delete; **settled requests piling up unconsumed**, which mean no daemon is draining the queue (a running daemon would discard them as stale anyway); and **unrecognized files** — anything else stale that vard did not write, flagged with "investigate before deleting" rather than called safe to remove. A queue directory that cannot be read (short of simply not existing) also `warn`s, naming the I/O error, so a read failure is never reported `ok`. |
 | `secret-audit` | Per configured watch, whether any already-tracked file has a secret-shaped **name**. See [the secret audit](#the-secret-audit) below. |
 | `remote-auth` | Per sync-enabled watch, whether the configured remote is reachable and authenticated. See [the remote-auth probe](#the-remote-auth-probe) below. |
@@ -69,6 +70,19 @@ Per-watch outcomes:
 | The repository cannot be opened | `warn` naming the watch — never a crash, and never a block on the other watches' rows (consistent with the secret audit). |
 
 Pass `--offline` to skip this probe entirely (a dead network, or a deliberately local-only run); the remaining local checks still run and the row reads `skipped`.
+
+## Daemon version
+
+Whether the running daemon's version matches the installed `vard` binary. The daemon stamps its own version into the health file; this check compares that stamp against the binary running `doctor`. They diverge whenever the binary is replaced without restarting the daemon — `cargo install`, `curl | sh`, or a manual copy all swap the binary and leave the old daemon running. Only [`vard self-update`](self-update.md) restarts the daemon itself after a swap; every other path leaves the running daemon stale until someone restarts it. This check is what surfaces that gap.
+
+| Outcome | Row |
+|---|---|
+| A daemon is running and its version matches the installed binary | `ok` — names the shared version. |
+| A daemon is running but its version differs from the installed binary | `warn` — names both versions and the fix (`vard service restart`). |
+| A daemon is running but reports no version at all (it predates version reporting — a pre-0.2.0 daemon writing the schema without the stamp) | `warn` — an older daemon than this binary, same fix (`vard service restart`). |
+| No daemon is running, or one is starting/stopping, or its health file has gone stale | `skipped` — there is no running daemon to compare against (liveness and staleness are the [`health-file`](#checks) check's job). |
+
+The comparison is exact string equality on the version strings; it does not parse or order them, so any difference — an upgrade or a downgrade — is skew worth a restart.
 
 ## Linger
 
@@ -115,6 +129,7 @@ A list surface (records/json/jsonl). On a terminal each check is a glyph line in
 ✓ git: ok — git 2.55.0 (2.22.0 or newer required)
 · inotify: skipped — not applicable on this platform — vard uses FSEvents here, which has no per-user watch-descriptor limit to exhaust
 ✓ health-file: ok — no daemon is running — a legitimate state; start one with `vard run` to watch your directories
+· daemon-version: skipped — no running daemon to compare against the installed binary
 ✓ request-dir: ok — no stale leftovers in the request queue
 ✓ secret-audit: ok — watch "notes": no tracked file has a secret-shaped name
 ✓ remote-auth: ok — watch "notes": remote "origin" is reachable and authenticated
@@ -138,9 +153,9 @@ vard doctor --format json
 | Status | Meaning |
 |---|---|
 | `ok` | The check passed. |
-| `warn` | A soft problem worth a look (an old git, tight inotify headroom, a stale health file, a stranded request leftover, a repository that could not be opened for a per-watch check, lingering disabled, a missing `SSH_AUTH_SOCK` under the service, or a service that is crash-looping or not loaded). |
+| `warn` | A soft problem worth a look (an old git, tight inotify headroom, a stale health file, a running daemon whose version does not match the installed binary, a stranded request leftover, a repository that could not be opened for a per-watch check, lingering disabled, a missing `SSH_AUTH_SOCK` under the service, or a service that is crash-looping or not loaded). |
 | `fail` | A hard problem (git is missing, or a sync-enabled watch's remote is unreachable or refused authentication). |
-| `skipped` | The check does not apply here (inotify or linger on macOS; a non-syncing watch, or remote-auth under `--offline`; `loginctl`/`systemctl`/`launchctl` unreachable or their output unparseable). |
+| `skipped` | The check does not apply here (inotify or linger on macOS; no running daemon to compare a version against; a non-syncing watch, or remote-auth under `--offline`; `loginctl`/`systemctl`/`launchctl` unreachable or their output unparseable). |
 
 ## Exit codes
 
