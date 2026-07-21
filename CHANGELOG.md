@@ -13,7 +13,7 @@ Entries here have landed on `main` but have not yet been cut into a tagged
 release. When a release is cut, this section is promoted to
 `## v0.X.0 - YYYY-MM-DD` and a fresh `## [Unreleased]` header is added above it.
 
-## v0.2.0 - 2026-07-20
+## v0.2.0 - 2026-07-21
 
 ### Added
 
