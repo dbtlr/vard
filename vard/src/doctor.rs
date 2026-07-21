@@ -57,6 +57,7 @@ const CHECKS: &[fn(&Ctx) -> Vec<CheckRow>] = &[
     check_git,
     check_inotify,
     check_health,
+    check_daemon_version,
     check_request_dir,
     check_secret_audit,
     check_remote_auth,
@@ -534,6 +535,93 @@ fn evaluate_health(report: &HealthReport, now: u64) -> CheckRow {
             Status::Ok,
             "no daemon is running — a legitimate state; start one with `vard run` to watch your \
              directories",
+        ),
+    }
+}
+
+// --- check 3b: daemon/binary version skew ----------------------------------
+
+/// The version-skew picture, distilled from the health report so the decision
+/// is unit-testable without a live daemon. Only a running daemon with a fresh
+/// health file can be compared; a stale file, a starting/stopping daemon, or no
+/// daemon at all leaves nothing to compare against (that liveness is the
+/// [`check_health`] row's territory, not this one's).
+enum SkewProbe {
+    /// A daemon is running under a fresh health file. Carries the version stamp
+    /// it wrote, or `None` when the daemon predates version stamping (a
+    /// pre-0.2.0 daemon writing schema v2 without the additive `daemon_version`
+    /// field — the stamp shipped with self-update in 0.2.0).
+    Running { stamp: Option<String> },
+    /// No running, fresh daemon to compare against the installed binary.
+    NoComparison,
+}
+
+/// Compares the running daemon's stamped version against the installed binary.
+/// launchd (and every install path except `vard self-update`) never restarts a
+/// service when its binary is swapped, so a stale daemon can run indefinitely
+/// with nothing surfacing it; this is the row that surfaces it.
+///
+/// A second, cheap read of the health file for the stamp — [`HealthReport`]
+/// deliberately does not carry it (it is the notify/status shared shape), and
+/// re-reading mirrors `self_update`'s own post-swap version poll rather than
+/// widening the shared enum.
+fn check_daemon_version(ctx: &Ctx) -> Vec<CheckRow> {
+    let probe = match health::collect(&ctx.lock_file, &ctx.health_file) {
+        // A running daemon under a *fresh* file is the only comparable state;
+        // align "fresh" with the health-file check's own staleness rule rather
+        // than inventing a second one.
+        Ok(HealthReport::Running { written_at, .. })
+            if ctx.now.saturating_sub(written_at) <= health::STALE_AFTER_SECS =>
+        {
+            SkewProbe::Running {
+                stamp: health::read_daemon_version(&ctx.health_file),
+            }
+        }
+        _ => SkewProbe::NoComparison,
+    };
+    vec![evaluate_daemon_version(&probe, env!("CARGO_PKG_VERSION"))]
+}
+
+/// Decides the version-skew row from the gathered [`SkewProbe`] and the
+/// installed binary's own version, so the decision table tests without a live
+/// daemon.
+///
+/// - Running, stamp present and equal ⇒ `ok`.
+/// - Running, stamp present and different ⇒ `warn` (a stale daemon nothing else
+///   would restart), naming both versions and the fix.
+/// - Running, stamp absent ⇒ `warn`: a running daemon writing schema v2 without
+///   the stamp is definitionally pre-0.2.0, so older than this binary — real
+///   skew, same fix.
+/// - Nothing running/fresh to compare ⇒ `skipped`.
+fn evaluate_daemon_version(probe: &SkewProbe, installed: &str) -> CheckRow {
+    match probe {
+        SkewProbe::NoComparison => row(
+            "daemon-version",
+            Status::Skipped,
+            "no running daemon to compare against the installed binary",
+        ),
+        SkewProbe::Running { stamp: Some(stamp) } if stamp == installed => row(
+            "daemon-version",
+            Status::Ok,
+            format!(
+                "the running daemon and the installed binary are the same version ({installed})"
+            ),
+        ),
+        SkewProbe::Running { stamp: Some(stamp) } => row(
+            "daemon-version",
+            Status::Warn,
+            format!(
+                "the daemon is running {stamp} but the installed binary is {installed}; restart it \
+                 with `vard service restart`"
+            ),
+        ),
+        SkewProbe::Running { stamp: None } => row(
+            "daemon-version",
+            Status::Warn,
+            format!(
+                "the daemon predates version reporting (pre-0.2.0) but the installed binary is \
+                 {installed}; restart it with `vard service restart`"
+            ),
         ),
     }
 }
@@ -1526,6 +1614,75 @@ mod tests {
         assert_eq!(
             evaluate_health(&HealthReport::Starting, 5).status,
             Status::Ok
+        );
+    }
+
+    // --- daemon-version skew ------------------------------------------------
+
+    #[test]
+    fn daemon_version_matching_stamp_is_ok() {
+        let r = evaluate_daemon_version(
+            &SkewProbe::Running {
+                stamp: Some("0.2.0".to_string()),
+            },
+            "0.2.0",
+        );
+        assert_eq!(r.status, Status::Ok);
+        assert!(
+            r.detail.contains("0.2.0"),
+            "names the version: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn daemon_version_differing_stamp_warns_with_both_and_the_fix() {
+        let r = evaluate_daemon_version(
+            &SkewProbe::Running {
+                stamp: Some("0.1.0".to_string()),
+            },
+            "0.3.0",
+        );
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("0.1.0"), "names the stamp: {}", r.detail);
+        assert!(
+            r.detail.contains("0.3.0"),
+            "names the installed: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("vard service restart"),
+            "names the fix: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn daemon_version_absent_stamp_warns_as_predating_reporting() {
+        // A running daemon writing schema v2 with no stamp is pre-0.2.0, so
+        // older than any binary that has this check — real skew, same fix.
+        let r = evaluate_daemon_version(&SkewProbe::Running { stamp: None }, "0.3.0");
+        assert_eq!(r.status, Status::Warn);
+        assert!(
+            r.detail.contains("predates"),
+            "explains the absent stamp: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("vard service restart"),
+            "names the fix: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn daemon_version_no_running_daemon_is_skipped() {
+        let r = evaluate_daemon_version(&SkewProbe::NoComparison, "0.3.0");
+        assert_eq!(r.status, Status::Skipped);
+        assert!(
+            r.detail.contains("no running daemon"),
+            "explains the skip: {}",
+            r.detail
         );
     }
 

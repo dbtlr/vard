@@ -157,3 +157,53 @@ fn symlink(target: &Path, link: &Path) {
     #[cfg(not(unix))]
     panic!("symlink test requires a unix platform");
 }
+
+/// A running daemon stamped with a version other than the installed binary is
+/// version skew (VRD-72): `status` folds it into the daemon row's summary and
+/// makes it attention (exit 1), pointing at `vard service restart`. Fabricated
+/// like the notify/doctor daemon tests — spawn the real daemon (holding the
+/// lock) on a 24h interval so it sits idle, then overwrite its health file with
+/// a fresh, differing `daemon_version`.
+#[test]
+fn daemon_version_skew_surfaces_on_the_daemon_row() {
+    let env = Env::new();
+    let repo = env.root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let path = repo.to_str().unwrap();
+    assert!(
+        env.run_git(&["-C", path, "init", "-b", "main"])
+            .status
+            .success()
+    );
+    assert!(
+        env.run_git(&["-C", path, "commit", "--allow-empty", "-m", "root"])
+            .status
+            .success()
+    );
+    env.write_config(&format!(
+        "version = 1\n\n[[watch]]\nname = \"vault\"\npath = {repo:?}\ntrigger = \"interval\"\ninterval = \"24h\"\n"
+    ));
+
+    let _daemon = env.spawn_daemon();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        env.health_file(),
+        format!("version = 2\nwritten_at = {now}\ndaemon_version = \"0.0.1\"\n"),
+    )
+    .unwrap();
+
+    let out = env.vard(&["status"]);
+    let s = stdout(&out);
+    assert_eq!(code(&out), 1, "version skew is attention → exit 1: {s}");
+    assert!(
+        s.contains("running, but") && s.contains("0.0.1"),
+        "the daemon row must surface the skew and the stamped version: {s}"
+    );
+    assert!(
+        s.contains("vard service restart"),
+        "the daemon row must point at the fix: {s}"
+    );
+}

@@ -94,7 +94,12 @@ fn report(
     // Probe the daemon and read its health projection. An unsupported health
     // schema is the one operational error `collect` surfaces (exit 2).
     let report = health::collect(lock_file, health_file).map_err(CmdError::err)?;
-    let daemon = DaemonStatus::from_report(&report, now);
+    // A second, cheap read for the daemon's version stamp: HealthReport does not
+    // carry it (it is the notify/status shared shape). A stamp that disagrees
+    // with this binary is version skew launchd never restarts away on a swap.
+    let stamp = health::read_daemon_version(health_file);
+    let daemon =
+        DaemonStatus::from_report(&report, now, env!("CARGO_PKG_VERSION"), stamp.as_deref());
 
     // The watch list is the config's, in config order; a missing config file is
     // simply an empty list. A present-but-invalid config is an operational error.
@@ -285,8 +290,33 @@ struct DaemonStatus {
     attention: bool,
 }
 
+/// The version-skew clause for a running daemon's line, or `None` when the
+/// daemon matches the installed binary. launchd (and every install path but
+/// `vard self-update`) never restarts a service on a binary swap, so a running
+/// daemon whose version disagrees with the installed binary — or one too old to
+/// stamp a version at all (pre-0.2.0) — is a stale daemon nothing else surfaces.
+/// The returned clause reads after "running, but ".
+fn version_skew(stamp: Option<&str>, installed: &str) -> Option<String> {
+    match stamp {
+        Some(v) if v == installed => None,
+        Some(v) => Some(format!(
+            "the daemon reports {v} while the installed binary is {installed}; restart it with \
+             `vard service restart`"
+        )),
+        None => Some(format!(
+            "the daemon predates version reporting (pre-0.2.0) while the installed binary is \
+             {installed}; restart it with `vard service restart`"
+        )),
+    }
+}
+
 impl DaemonStatus {
-    fn from_report(report: &HealthReport, now: u64) -> DaemonStatus {
+    fn from_report(
+        report: &HealthReport,
+        now: u64,
+        installed: &str,
+        stamp: Option<&str>,
+    ) -> DaemonStatus {
         match report {
             HealthReport::Running { written_at, .. } => {
                 let age = now.saturating_sub(*written_at);
@@ -298,6 +328,16 @@ impl DaemonStatus {
                              or unable to write",
                             format_duration(Duration::from_secs(age))
                         ),
+                        since: Some(*written_at),
+                        attention: true,
+                    }
+                } else if let Some(skew) = version_skew(stamp, installed) {
+                    // A fresh, running daemon whose version disagrees with the
+                    // installed binary: real skew launchd will not fix on a
+                    // swap. Folds into attention, same as a stale file.
+                    DaemonStatus {
+                        state: "running",
+                        summary: format!("running, but {skew}"),
                         since: Some(*written_at),
                         attention: true,
                     }
@@ -802,9 +842,54 @@ mod tests {
             suppressions: vec![],
             written_at: 1000,
         };
-        let d = DaemonStatus::from_report(&report, 1000 + 5);
+        let d = DaemonStatus::from_report(&report, 1000 + 5, "0.2.0", Some("0.2.0"));
         assert_eq!(d.state, "running");
         assert!(!d.attention);
+    }
+
+    #[test]
+    fn daemon_running_with_version_skew_is_attention_and_names_the_fix() {
+        let report = HealthReport::Running {
+            problems: vec![],
+            suppressions: vec![],
+            written_at: 1000,
+        };
+        let d = DaemonStatus::from_report(&report, 1000 + 5, "0.3.0", Some("0.1.0"));
+        assert_eq!(d.state, "running");
+        assert!(d.attention);
+        assert!(
+            d.summary.contains("0.1.0"),
+            "names the daemon: {}",
+            d.summary
+        );
+        assert!(
+            d.summary.contains("0.3.0"),
+            "names the installed: {}",
+            d.summary
+        );
+        assert!(
+            d.summary.contains("vard service restart"),
+            "names the fix: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn daemon_running_with_absent_stamp_is_attention_as_predating() {
+        let report = HealthReport::Running {
+            problems: vec![],
+            suppressions: vec![],
+            written_at: 1000,
+        };
+        let d = DaemonStatus::from_report(&report, 1000 + 5, "0.3.0", None);
+        assert_eq!(d.state, "running");
+        assert!(d.attention);
+        assert!(d.summary.contains("predates"), "got: {}", d.summary);
+    }
+
+    #[test]
+    fn version_skew_matching_is_none() {
+        assert!(version_skew(Some("0.2.0"), "0.2.0").is_none());
     }
 
     #[test]
@@ -814,7 +899,12 @@ mod tests {
             suppressions: vec![],
             written_at: 1000,
         };
-        let d = DaemonStatus::from_report(&report, 1000 + health::STALE_AFTER_SECS + 1);
+        let d = DaemonStatus::from_report(
+            &report,
+            1000 + health::STALE_AFTER_SECS + 1,
+            "0.2.0",
+            Some("0.2.0"),
+        );
         assert_eq!(d.state, "stale");
         assert!(d.attention);
         assert!(d.summary.contains("stale"), "got: {}", d.summary);
@@ -822,7 +912,12 @@ mod tests {
 
     #[test]
     fn daemon_not_running_is_attention_and_names_the_fix() {
-        let d = DaemonStatus::from_report(&HealthReport::NotRunning { last_write: None }, 5);
+        let d = DaemonStatus::from_report(
+            &HealthReport::NotRunning { last_write: None },
+            5,
+            "0.2.0",
+            None,
+        );
         assert_eq!(d.state, "not-running");
         assert!(d.attention);
         assert!(d.summary.contains("vard run"), "got: {}", d.summary);
@@ -830,7 +925,7 @@ mod tests {
 
     #[test]
     fn daemon_starting_is_attention() {
-        let d = DaemonStatus::from_report(&HealthReport::Starting, 5);
+        let d = DaemonStatus::from_report(&HealthReport::Starting, 5, "0.2.0", None);
         assert_eq!(d.state, "starting");
         assert!(d.attention);
     }
@@ -875,7 +970,12 @@ mod tests {
 
     #[test]
     fn machine_records_lead_with_the_daemon_row_and_stable_fields() {
-        let daemon = DaemonStatus::from_report(&HealthReport::NotRunning { last_write: None }, 5);
+        let daemon = DaemonStatus::from_report(
+            &HealthReport::NotRunning { last_write: None },
+            5,
+            "0.2.0",
+            None,
+        );
         let rows = vec![WatchRow::plain("vault".to_string(), "ok")];
         let recs = records(&daemon, &rows, 5);
         let mut out = Vec::new();
@@ -894,7 +994,7 @@ mod tests {
 
     #[test]
     fn empty_watch_list_still_reports_the_daemon() {
-        let daemon = DaemonStatus::from_report(&HealthReport::Starting, 5);
+        let daemon = DaemonStatus::from_report(&HealthReport::Starting, 5, "0.2.0", None);
         let recs = records(&daemon, &[], 5);
         assert_eq!(recs.len(), 1, "just the daemon row");
     }

@@ -213,6 +213,11 @@ printf '%s\n' "$doctor_json" | grep -q '"check":"git"' \
   || fail "vard doctor --format json did not emit the git check row"
 printf '%s\n' "$doctor_json" | grep -q '"check":"health-file"' \
   || fail "vard doctor --format json did not emit the health-file check row"
+# daemon-version (VRD-72): with no daemon running there is nothing to compare, so
+# it is skipped here; only assert the row exists with a documented status.
+printf '%s\n' "$doctor_json" \
+  | grep -Eq '"check":"daemon-version","status":"(ok|warn|fail|skipped)"' \
+  || fail "vard doctor --format json daemon-version row is missing or has an unrecognized status"
 printf '%s\n' "$doctor_json" | grep -q '"check":"secret-audit"' \
   || fail "vard doctor --format json did not emit the per-watch secret-audit row"
 printf '%s\n' "$doctor_json" | grep -q '"check":"remote-auth"' \
